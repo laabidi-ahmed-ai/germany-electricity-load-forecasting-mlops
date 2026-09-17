@@ -1,23 +1,23 @@
 """Database layer: SQLAlchemy models, engine factory, idempotent upserts, readers.
 
-Conventions
------------
-* **All timestamps are stored in UTC.** ``UTCDateTime`` guarantees that whatever
+* All timestamps are stored in UTC. ``UTCDateTime`` guarantees that whatever
   goes in is converted to UTC and whatever comes out is tz-aware UTC - on both
   Postgres (``timestamptz``) and SQLite (naive text, interpreted as UTC). Conversion
   to ``Europe/Berlin`` happens only in feature engineering (calendar features).
-* **Upserts are idempotent.** Re-running any ingestion never creates duplicates:
+* Upserts are idempotent. Re-running any ingestion never creates duplicates:
   every table has a natural primary key and ``upsert_dataframe`` uses
   ``INSERT ... ON CONFLICT DO UPDATE`` on both dialects.
-* Postgres / TimescaleDB is the production store (README §10); SQLite is the
-  zero-config local fallback that the default ``DATABASE_URL`` points at.
+* Postgres is the production store (README §10), with TimescaleDB hypertables when
+  the extension is available; SQLite is the zero-config local fallback that the
+  default ``DATABASE_URL`` points at.
 """
 
 from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -30,13 +30,18 @@ from sqlalchemy import (
     String,
     Text,
     create_engine,
+    delete,
     func,
+    insert,
+    or_,
     select,
+    text,
+    update,
 )
 from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.engine import Dialect, Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
-from sqlalchemy.sql import ColumnElement
+from sqlalchemy.sql import ColumnElement, Executable
 from sqlalchemy.types import TypeDecorator
 
 from config.settings import get_settings
@@ -45,10 +50,23 @@ log = logging.getLogger(__name__)
 
 UPSERT_CHUNK_ROWS = 500
 
+DateLike = date | datetime | str | pd.Timestamp
 
-# --------------------------------------------------------------------------- #
-# UTC-safe timestamp type
-# --------------------------------------------------------------------------- #
+# ``source`` values of the load tables. SMARD is keyless, so it is the default for both
+# the actual load and the official benchmark; ENTSO-E rows sit beside it once a token is set.
+SOURCE_SMARD = "smard"
+SOURCE_ENTSOE = "entsoe"
+LOAD_SOURCE = SOURCE_SMARD
+OFFICIAL_SOURCE = SOURCE_SMARD
+
+
+# --- UTC handling ---
+def to_utc(value: DateLike) -> pd.Timestamp:
+    """Coerce a date-like value to a tz-aware UTC ``pd.Timestamp``; naive input counts as UTC."""
+    ts = pd.Timestamp(value)
+    return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+
+
 class UTCDateTime(TypeDecorator[datetime]):
     """Timestamp column that is always UTC, on every backend.
 
@@ -89,9 +107,7 @@ class UTCDateTime(TypeDecorator[datetime]):
         return value.astimezone(UTC)
 
 
-# --------------------------------------------------------------------------- #
-# Models
-# --------------------------------------------------------------------------- #
+# --- Models ---
 class Base(DeclarativeBase):
     pass
 
@@ -176,13 +192,9 @@ class MonitoringEvent(Base):
 
 
 class ModelArtifact(Base):
-    """A registered model version exported for serving: zipped MLflow pyfunc bundle + metadata.
+    """A model version exported for serving: zipped MLflow pyfunc bundle + metadata.
 
-    This is what makes the champion survive ephemeral GitHub Actions runners: the
-    MLflow registry keeps lineage (metrics, params, aliases) in the same Postgres,
-    but the *files* of a logged model live on whichever runner trained it. On
-    ``promote`` the pyfunc directory is zipped into ``bundle`` here, and serving
-    loads the row flagged ``is_champion`` - nothing but ``DATABASE_URL`` needed.
+    Written by ``registry.promote``; exactly one row per ``name`` is ``is_champion``.
     """
 
     __tablename__ = "model_artifacts"
@@ -211,9 +223,7 @@ TIME_SERIES_TABLES: tuple[type[Base], ...] = (
 )
 
 
-# --------------------------------------------------------------------------- #
-# Engine / schema
-# --------------------------------------------------------------------------- #
+# --- Engine / schema ---
 def get_engine(database_url: str | None = None, **kwargs: Any) -> Engine:
     """Create an engine for ``database_url`` (default: ``settings.database_url``).
 
@@ -221,8 +231,6 @@ def get_engine(database_url: str | None = None, **kwargs: Any) -> Engine:
     """
     url = normalize_database_url(database_url or get_settings().database_url)
     if url.startswith("sqlite:///") and not url.endswith(":memory:"):
-        from pathlib import Path
-
         Path(url.removeprefix("sqlite:///")).parent.mkdir(parents=True, exist_ok=True)
     elif url.startswith("postgresql"):
         # Cloud Postgres (Neon / Supabase) closes idle connections; re-check before use.
@@ -248,8 +256,6 @@ def init_db(engine: Engine) -> None:
 
 def _maybe_enable_timescale(engine: Engine) -> None:
     """Best effort: turn the time-series tables into hypertables if TimescaleDB exists."""
-    from sqlalchemy import text
-
     try:
         with engine.begin() as conn:
             conn.execute(text("CREATE EXTENSION IF NOT EXISTS timescaledb"))
@@ -270,13 +276,16 @@ def _maybe_enable_timescale(engine: Engine) -> None:
             log.warning("could not create hypertable for %s: %s", model.__tablename__, err)
 
 
-# --------------------------------------------------------------------------- #
-# Upsert
-# --------------------------------------------------------------------------- #
+# --- Upsert ---
 UpdateWhere = Callable[[Any, Any], ColumnElement[bool]]
 
 
-def _build_upsert(dialect_name: str, model: type[Base], rows: Sequence[dict[str, Any]], where):
+def _build_upsert(
+    dialect_name: str,
+    model: type[Base],
+    rows: Sequence[dict[str, Any]],
+    where: UpdateWhere | None,
+) -> Executable:
     table = model.__table__
     pk_cols = [c.name for c in table.primary_key.columns]
     update_cols = [c.name for c in table.columns if c.name not in pk_cols]
@@ -350,14 +359,10 @@ def upsert_dataframe(
 
 def weather_update_where(existing: Any, excluded: Any) -> ColumnElement[bool]:
     """Archive rows always win; forecast rows only fill in / refresh forecast rows."""
-    from sqlalchemy import or_
-
     return or_(excluded.source == "archive", existing.source == "forecast")
 
 
-# --------------------------------------------------------------------------- #
-# Readers
-# --------------------------------------------------------------------------- #
+# --- Readers ---
 def latest_timestamp(engine: Engine, model: type[Base], **filters: Any) -> pd.Timestamp | None:
     """Most recent ``timestamp_utc`` in the table (optionally filtered), UTC, or None."""
     stmt = select(func.max(model.timestamp_utc))
@@ -367,7 +372,7 @@ def latest_timestamp(engine: Engine, model: type[Base], **filters: Any) -> pd.Ti
         value = conn.execute(stmt).scalar()
     if value is None:
         return None
-    return pd.Timestamp(value).tz_convert("UTC")
+    return to_utc(value)
 
 
 def count_rows(engine: Engine, model: type[Base], **filters: Any) -> int:
@@ -409,7 +414,7 @@ def read_table(
 def read_load(
     engine: Engine,
     *,
-    source: str = "smard",
+    source: str = LOAD_SOURCE,
     start: pd.Timestamp | None = None,
     end: pd.Timestamp | None = None,
 ) -> pd.DataFrame:
@@ -424,18 +429,11 @@ def read_latest_model_forecast(engine: Engine) -> pd.DataFrame:
         latest = conn.execute(select(func.max(LoadForecastModel.issued_at))).scalar()
     if latest is None:
         return pd.DataFrame(columns=[c.name for c in LoadForecastModel.__table__.columns])
-    latest_ts = pd.Timestamp(latest)
-    latest_ts = (
-        latest_ts.tz_localize("UTC") if latest_ts.tzinfo is None else latest_ts.tz_convert("UTC")
-    )
-    df = read_table(engine, LoadForecastModel)
-    return df[df["issued_at"] == latest_ts].reset_index(drop=True)
+    return read_table(engine, LoadForecastModel, issued_at=latest)
 
 
 def insert_monitoring_event(engine: Engine, **fields: Any) -> int:
     """Append one monitoring event; returns its id."""
-    from sqlalchemy import insert
-
     fields.setdefault("created_at", datetime.now(UTC))
     with engine.begin() as conn:
         result = conn.execute(insert(MonitoringEvent).values(**fields))
@@ -457,9 +455,7 @@ def read_monitoring_events(engine: Engine, *, limit: int = 100) -> pd.DataFrame:
     return df
 
 
-# --------------------------------------------------------------------------- #
-# Model artifacts (champion persistence)
-# --------------------------------------------------------------------------- #
+# --- Model artifacts (champion persistence) ---
 def store_model_artifact(engine: Engine, **fields: Any) -> None:
     """Insert-or-replace one exported model version (keyed by name + version)."""
     fields.setdefault("created_at", datetime.now(UTC))
@@ -472,8 +468,6 @@ def store_model_artifact(engine: Engine, **fields: Any) -> None:
 
 def set_champion(engine: Engine, name: str, version: str) -> None:
     """Point the champion flag of ``name`` at ``version`` (exactly one row flagged)."""
-    from sqlalchemy import update
-
     with engine.begin() as conn:  # one transaction: an unknown version changes nothing
         result = conn.execute(
             update(ModelArtifact)
@@ -529,8 +523,6 @@ def list_model_artifacts(engine: Engine, name: str) -> pd.DataFrame:
 
 def prune_model_artifacts(engine: Engine, name: str, *, keep: int = 5) -> int:
     """Delete the oldest exported versions beyond ``keep``; the champion is never deleted."""
-    from sqlalchemy import delete
-
     df = list_model_artifacts(engine, name)
     if len(df) <= keep:
         return 0

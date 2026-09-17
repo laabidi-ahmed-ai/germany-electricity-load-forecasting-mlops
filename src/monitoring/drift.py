@@ -1,38 +1,27 @@
 """Data / prediction / target drift with Evidently (>= 0.7 API).
 
-What is compared
-----------------
-* **current**   : the last ``window_days`` of the feature frame (built from the DB),
-                  plus the champion's predictions on it and the actual target.
-* **reference** : the *same season* of the training data - rows whose day-of-year
-                  falls inside the current window (± ``pad_days``) in every training
-                  year. Comparing a September window against a five-year mixture
-                  would flag "drift" every day purely because of seasonality.
-* **columns**   : load lags + weather (the model's non-calendar inputs), the
-                  ``prediction`` column and the target. Calendar features are
-                  deterministic functions of the date and are excluded - their
-                  "drift" between any two windows is by construction.
+Current = the last ``window_days`` of the feature frame plus the champion's
+predictions on it and the actual target. Reference = the same season of the
+champion's training data: rows whose day-of-year falls inside the current window
+(± ``pad_days``) in every training year - comparing a September window against a
+five-year mixture would flag "drift" every day purely because of seasonality.
+Monitored columns are the load lags and weather features; calendar features are
+deterministic functions of the date and are excluded.
 
-Evidently 0.7
--------------
-``Report([DataDriftPreset(columns=..., num_method="wasserstein", num_threshold=...)])
-.run(current, reference)`` returns a snapshot; ``snapshot.dict()["metrics"]`` is a
-list of ``{"config": {"type", "column", "threshold", ...}, "value": ...}``.
-Per-column metrics carry a drift *score* (normed Wasserstein distance = shift in
-units of the reference standard deviation) and the threshold used; a column
-drifts when ``score > threshold``. The ``runner`` argument lets tests inject a
+``Report([DataDriftPreset(...)]).run(current, reference)`` returns a snapshot whose
+``dict()["metrics"]`` lists per-column entries with a drift score (normed Wasserstein
+distance = shift in units of the reference standard deviation) and the threshold used;
+a column drifts when ``score > threshold``. The ``runner`` argument lets tests inject a
 fake instead of Evidently.
 
-Thresholds (calibrated on this data)
-------------------------------------
-Evidently's default numeric threshold (0.1) flags 5-8 of the 8 monitored
-features in *every* 30-day window of every year - it detects ordinary
-year-to-year weather / demand variation. Replaying the seasonal comparison over
-2022-2026 shows normal windows scoring 0.05-0.25 per feature, while the genuine
-regime shifts (Sep 2022 energy crisis, its 2023 aftermath) score 0.25-0.5 on the
-load lags. Defaults are therefore ``column_threshold = 0.25`` and
-``drift_share = 0.5`` (half of the monitored features must move). Both are
-CLI / config knobs.
+Thresholds (calibrated on this data): Evidently's default numeric threshold (0.1)
+flags 5-8 of the 8 monitored features in every 30-day window of every year - it
+detects ordinary year-to-year weather / demand variation. Replaying the seasonal
+comparison over 2022-2026 shows normal windows scoring 0.05-0.25 per feature, while
+the genuine regime shifts (Sep 2022 energy crisis, its 2023 aftermath) score 0.25-0.5
+on the load lags. Defaults are therefore ``column_threshold = 0.25`` and
+``drift_share = 0.5`` (half of the monitored features must move). Both are CLI /
+config knobs.
 
 CLI::
 
@@ -51,9 +40,8 @@ from typing import Any
 import pandas as pd
 from sqlalchemy.engine import Engine
 
-from config.settings import get_settings
+from config.log import configure_logging
 from src.data import db
-from src.features.build_features import DEFAULT_OUTPUT as FEATURES_PARQUET
 from src.features.build_features import TARGET, build_features
 from src.features.horizons import DAY_AHEAD, most_recent_load_lag, select_features
 from src.models.registry import LoadedModel
@@ -70,9 +58,7 @@ MIN_CURRENT_ROWS = 24 * 3
 Runner = Callable[[pd.DataFrame, pd.DataFrame, list[str], float], list[dict[str, Any]]]
 
 
-# --------------------------------------------------------------------------- #
-# Column selection + seasonal reference
-# --------------------------------------------------------------------------- #
+# --- Column selection + seasonal reference ---
 def drift_columns(feature_columns: list[str]) -> list[str]:
     """Load-derived + weather features of the day-ahead set (calendar excluded)."""
     return [
@@ -97,9 +83,7 @@ def seasonal_reference(
     return training[mask]
 
 
-# --------------------------------------------------------------------------- #
-# Evidently runner
-# --------------------------------------------------------------------------- #
+# --- Evidently runner ---
 def run_evidently(
     reference: pd.DataFrame,
     current: pd.DataFrame,
@@ -121,9 +105,7 @@ def run_evidently(
     return snapshot.dict()["metrics"]
 
 
-# --------------------------------------------------------------------------- #
-# Summaries
-# --------------------------------------------------------------------------- #
+# --- Summaries ---
 @dataclass
 class ColumnDrift:
     column: str
@@ -247,9 +229,7 @@ def summarize_metrics(metrics: list[dict[str, Any]]) -> dict[str, ColumnDrift]:
     return out
 
 
-# --------------------------------------------------------------------------- #
-# Main entry
-# --------------------------------------------------------------------------- #
+# --- Main entry ---
 def compute_drift(
     engine: Engine,
     model: LoadedModel | None = None,
@@ -263,17 +243,27 @@ def compute_drift(
     frame: pd.DataFrame | None = None,
     runner: Runner = run_evidently,
 ) -> DriftReport:
-    """Data + prediction + target drift of the last ``window_days`` vs the training season."""
+    """Data + prediction + target drift of the last ``window_days`` vs the training season.
+
+    ``training`` defaults to the rows of ``frame`` up to the champion's ``train_end``.
+    """
     frame = frame if frame is not None else build_features(engine, output=None)
-    as_of = _utc(as_of) if as_of is not None else frame.index.max()
+    as_of = db.to_utc(as_of) if as_of is not None else frame.index.max()
     current = frame[(frame.index > as_of - pd.Timedelta(days=window_days)) & (frame.index <= as_of)]
     if len(current) < MIN_CURRENT_ROWS:
         raise ValueError(f"only {len(current)} current rows (< {MIN_CURRENT_ROWS})")
 
-    if training is None:
-        training = pd.read_parquet(FEATURES_PARQUET) if FEATURES_PARQUET.exists() else frame
-    reference = seasonal_reference(training, current.index, pad_days=pad_days)
     notes: list[str] = []
+    if training is None:
+        # The champion's training window, so "drift" means "moved away from what the
+        # model learned", not "differs from last month".
+        train_end = model.train_end if model is not None else None
+        if train_end is not None:
+            training = frame[frame.index <= train_end]
+        else:
+            training = frame
+            notes.append("champion has no recorded train_end - reference drawn from all rows")
+    reference = seasonal_reference(training, current.index, pad_days=pad_days)
     if len(reference) < MIN_CURRENT_ROWS:
         notes.append("seasonal reference too small - falling back to all past training rows")
         reference = training[training.index < current.index.min()]
@@ -308,22 +298,11 @@ def compute_drift(
     return report
 
 
-def _utc(value: Any) -> pd.Timestamp:
-    ts = pd.Timestamp(value)
-    return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
-
-
-# --------------------------------------------------------------------------- #
-# CLI
-# --------------------------------------------------------------------------- #
+# --- CLI ---
 def main(argv: list[str] | None = None) -> int:
     from src.models.registry import load_champion
 
-    logging.basicConfig(
-        level=get_settings().log_level,
-        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    configure_logging()
     p = argparse.ArgumentParser(prog="python -m src.monitoring.drift")
     p.add_argument("--as-of", default=None)
     p.add_argument("--window-days", type=int, default=DEFAULT_WINDOW_DAYS)

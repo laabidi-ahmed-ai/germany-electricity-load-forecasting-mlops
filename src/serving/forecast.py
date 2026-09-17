@@ -1,27 +1,19 @@
 """Day-ahead forecast generation shared by the API and the batch job.
 
-Serving-time features are produced by **the same code path as training**:
-``build_feature_frame`` (lags, rolling stats, calendar, weather join) followed by
-``select_features(DAY_AHEAD)``. The only difference is the *content* of the weather
-columns - Open-Meteo *forecast* values for hours that have no reanalysis yet -
-which is the intended, documented train/serve skew.
+Serving-time features come from the same code path as training - ``build_feature_frame``
+followed by ``select_features(DAY_AHEAD)`` - so train/serve parity is checked by name
+and order before every prediction. The only difference is the content of the weather
+columns (Open-Meteo forecast values where no reanalysis exists yet).
 
-Forecast window
----------------
-With a 24-hour information cutoff (``src.features.horizons``), every target hour
-*t* needs load observed at *t-24h*. Given the latest stored actual load at *L*,
-the honest day-ahead window is ``(L, L + 24h]``: all 24 rows have fully observed
-``load_lag_24 / 48 / 168``. We deliberately do **not** feed predictions back in
-as lags to reach further (that would be a second, unintended skew).
+The target window is ``(L, L + 24h]`` for the latest stored actual load L: with the
+24-hour information cutoff of ``src.features.horizons`` those are exactly the hours
+whose day-ahead lags are fully observed. Predictions are never fed back in as lags
+to reach further.
 
-Pipeline per request / batch run:
-
-1. read the last ``HISTORY_HOURS`` of actual load from the DB (enough for lag_168)
-2. make sure per-city weather covers the target hours (fetch the Open-Meteo forecast
-   and upsert it - archive rows always win - if not)
-3. append the 24 target hours with NaN load, run ``build_feature_frame(dropna=False)``
-4. keep the target rows, ``select_features(DAY_AHEAD)``, check they equal the
-   model's training features **exactly**, predict.
+Per request / batch run: read the last ``HISTORY_HOURS`` of load, make sure per-city
+weather covers the target hours (fetching the Open-Meteo forecast if not; archive rows
+always win), append the target hours with NaN load, build the frame with
+``dropna=False``, select the day-ahead features and predict.
 """
 
 from __future__ import annotations
@@ -35,6 +27,7 @@ import pandas as pd
 from sqlalchemy.engine import Engine
 
 from src.data import db
+from src.data.db import LOAD_SOURCE
 from src.data.weather_client import WeatherClient, national_average
 from src.features.build_features import TARGET, build_feature_frame
 from src.features.horizons import DAY_AHEAD, most_recent_load_lag, select_features
@@ -44,7 +37,6 @@ log = logging.getLogger(__name__)
 
 DAY_AHEAD_HOURS = 24
 HISTORY_HOURS = 24 * 10  # lag_168 for the last target hour needs L + 24 - 168 = L - 144h
-LOAD_SOURCE = "smard"
 
 
 class NoDataError(RuntimeError):
@@ -74,9 +66,7 @@ class ForecastResult:
         ]
 
 
-# --------------------------------------------------------------------------- #
-# Feature reconstruction
-# --------------------------------------------------------------------------- #
+# --- Feature reconstruction ---
 def forecast_window(last_actual: pd.Timestamp, hours: int = DAY_AHEAD_HOURS) -> pd.DatetimeIndex:
     """Target hours ``(last_actual, last_actual + hours]``; capped at the horizon cutoff."""
     if hours < 1 or hours > DAY_AHEAD.min_lag_hours:
@@ -135,9 +125,7 @@ def build_serving_features(
     if last_actual is None:
         raise NoDataError("no actual load in the database - run the ingestion first")
     if as_of is not None:
-        as_of = pd.Timestamp(as_of)
-        as_of = as_of.tz_localize("UTC") if as_of.tzinfo is None else as_of.tz_convert("UTC")
-        last_actual = min(last_actual, as_of.floor("h"))
+        last_actual = min(last_actual, db.to_utc(as_of).floor("h"))
 
     target = forecast_window(last_actual, hours)
     hist_start = last_actual - pd.Timedelta(hours=HISTORY_HOURS)
@@ -169,9 +157,7 @@ def build_serving_features(
     return served, last_actual
 
 
-# --------------------------------------------------------------------------- #
-# Forecast
-# --------------------------------------------------------------------------- #
+# --- Forecast ---
 def make_day_ahead_forecast(
     engine: Engine,
     model: LoadedModel,

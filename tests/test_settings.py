@@ -1,32 +1,10 @@
-"""Tests for config/settings.py.
-
-These build ``Settings`` with ``_env_file=None`` so a developer's real ``.env``
-never leaks into the test run, and clear the relevant env vars explicitly.
-"""
+"""Tests for config/settings.py (env isolation comes from the autouse fixture in conftest)."""
 
 from datetime import date
 
 import pytest
 
 from config.settings import Settings, get_settings
-
-_ENV_KEYS = [
-    "ENTSOE_API_TOKEN",
-    "DATABASE_URL",
-    "OPEN_METEO_BASE_URL",
-    "MLFLOW_TRACKING_URI",
-    "BIDDING_ZONE",
-    "SMARD_REGION",
-    "DATA_START_DATE",
-    "LOG_LEVEL",
-]
-
-
-@pytest.fixture(autouse=True)
-def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    for key in _ENV_KEYS:
-        monkeypatch.delenv(key, raising=False)
-    get_settings.cache_clear()
 
 
 def test_runs_without_any_secrets() -> None:
@@ -35,7 +13,6 @@ def test_runs_without_any_secrets() -> None:
     assert s.entsoe_api_token is None
     assert s.has_entsoe_token is False
     assert s.database_url.startswith("sqlite:///")
-    assert s.is_postgres is False
 
 
 def test_target_geography_and_start_date_defaults() -> None:
@@ -58,7 +35,7 @@ def test_env_vars_override_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert s.has_entsoe_token is True
     assert s.entsoe_api_token is not None
     assert s.entsoe_api_token.get_secret_value() == "abc-123"
-    assert s.is_postgres is True
+    assert s.database_url.startswith("postgresql://")
     assert s.bidding_zone == "DE_LU"  # normalised to upper-case
     assert s.data_start_date == date(2022, 1, 1)
     assert s.log_level == "DEBUG"

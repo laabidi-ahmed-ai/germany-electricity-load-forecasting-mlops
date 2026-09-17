@@ -1,15 +1,11 @@
-"""Time-series cross-validation + metrics.
+"""Time-series cross-validation and the CV report.
 
-Evaluation protocol
--------------------
-* **Expanding-window CV** (``src.features.build_features.expanding_window_splits``):
-  the last ``n_splits`` blocks of ``val_hours`` are validation folds, oldest
-  first; each fold trains on *everything* before it. Never a random split.
-* Every model in a run sees exactly the same folds and the same horizon-valid
-  feature columns (``src.features.horizons``).
-* Metrics per fold and averaged across folds: **MAE**, **RMSE**, **MAPE** (%).
-* The report states explicitly whether LightGBM beats *both* seasonal-naive
-  baselines on mean MAE.
+Expanding-window CV (``src.features.build_features.expanding_window_splits``): the
+last ``n_splits`` blocks of ``val_hours`` are validation folds, oldest first, and each
+fold trains on everything before it - never a random split. Every model in a run sees
+the same folds and the same horizon-valid columns (``src.features.horizons``). MAE,
+RMSE and MAPE are reported per fold and averaged, and the report states whether
+LightGBM beats both seasonal-naive baselines on mean MAE.
 
 CLI (``make evaluate``)::
 
@@ -29,11 +25,12 @@ from typing import Any, Protocol
 import numpy as np
 import pandas as pd
 
-from config.settings import get_settings
+from config.log import configure_logging
 from src.features.build_features import DEFAULT_OUTPUT as FEATURES_PARQUET
 from src.features.build_features import TARGET, expanding_window_splits
 from src.features.horizons import DAY_AHEAD, HORIZONS, Horizon, select_features
 from src.models.tracking import DEFAULT_EXPERIMENT, setup_mlflow
+from src.monitoring.metrics import compute_metrics
 
 log = logging.getLogger(__name__)
 
@@ -58,32 +55,7 @@ class Model(Protocol):
 ModelFactory = Callable[[], Model]
 
 
-# --------------------------------------------------------------------------- #
-# Metrics
-# --------------------------------------------------------------------------- #
-def compute_metrics(
-    y_true: np.ndarray | pd.Series, y_pred: np.ndarray | pd.Series
-) -> dict[str, float]:
-    """MAE, RMSE (MW) and MAPE (%) of a point forecast."""
-    yt = np.asarray(y_true, dtype="float64")
-    yp = np.asarray(y_pred, dtype="float64")
-    if yt.shape != yp.shape:
-        raise ValueError(f"shape mismatch: {yt.shape} vs {yp.shape}")
-    if len(yt) == 0:
-        raise ValueError("cannot compute metrics on empty arrays")
-    if np.isnan(yp).any():
-        raise ValueError("predictions contain NaN")
-    err = yp - yt
-    return {
-        "mae": float(np.mean(np.abs(err))),
-        "rmse": float(np.sqrt(np.mean(err**2))),
-        "mape": float(np.mean(np.abs(err) / np.abs(yt)) * 100.0),
-    }
-
-
-# --------------------------------------------------------------------------- #
-# Cross-validation
-# --------------------------------------------------------------------------- #
+# --- Cross-validation ---
 @dataclass
 class CVResult:
     horizon: str
@@ -189,9 +161,7 @@ def cross_validate(
     return CVResult(horizon.name, features, config, pd.DataFrame(rows))
 
 
-# --------------------------------------------------------------------------- #
-# Reporting
-# --------------------------------------------------------------------------- #
+# --- Reporting ---
 def format_report(cv: CVResult) -> str:
     """Markdown: per-fold table, mean ± std per model, and the baseline verdict."""
     lines = [
@@ -257,7 +227,7 @@ def log_cv_run(
 
     setup_mlflow(experiment)
     with mlflow.start_run(run_name=run_name or f"cv_{cv.horizon}") as run:
-        mlflow.set_tags({"stage": "evaluation", "horizon": cv.horizon, "phase": "3"})
+        mlflow.set_tags({"stage": "evaluation", "horizon": cv.horizon})
         mlflow.log_params({"horizon": cv.horizon, "n_features": len(cv.features), **cv.config})
         mlflow.log_dict({"features": cv.features}, "features.json")
         log_cv_metrics(cv)
@@ -266,18 +236,12 @@ def log_cv_run(
         return run.info.run_id
 
 
-# --------------------------------------------------------------------------- #
-# CLI
-# --------------------------------------------------------------------------- #
+# --- CLI ---
 def main(argv: list[str] | None = None) -> int:
     from src.models.baselines import BASELINE_FACTORIES
     from src.models.train import lightgbm_factory, load_feature_frame
 
-    logging.basicConfig(
-        level=get_settings().log_level,
-        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    configure_logging()
     p = argparse.ArgumentParser(prog="python -m src.models.evaluate")
     p.add_argument("--features", type=Path, default=FEATURES_PARQUET)
     p.add_argument("--horizon", choices=sorted(HORIZONS), default=DAY_AHEAD.name)

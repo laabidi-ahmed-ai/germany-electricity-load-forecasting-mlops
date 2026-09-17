@@ -12,13 +12,10 @@ No scaler: tree models are invariant to monotone feature transforms. If a linear
 model is ever added, fit its scaler on the training split only - fitting it on
 the full frame would leak validation statistics into training.
 
-CLI (``make train``)::
+CLI (``make train``): expanding-window CV (baselines + LightGBM), final fit on all
+data, everything logged to MLflow::
 
     python -m src.models.train [--features PATH] [--n-splits 12] [--val-hours 720]
-
-runs the expanding-window CV (baselines + LightGBM), fits the final model on all
-data, and logs params / per-fold metrics / feature importances / the model to
-MLflow.
 """
 
 from __future__ import annotations
@@ -26,13 +23,14 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
-from config.settings import get_settings
+from config.log import configure_logging
 from src.features.build_features import DEFAULT_OUTPUT as FEATURES_PARQUET
 from src.features.build_features import TARGET
 from src.features.horizons import DAY_AHEAD, HORIZONS, Horizon, excluded_features, select_features
@@ -42,7 +40,7 @@ from src.models.tracking import DEFAULT_EXPERIMENT, setup_mlflow
 
 log = logging.getLogger(__name__)
 
-MODEL_NAME = "lightgbm"
+MODEL_NAME = evaluate.CHALLENGER_NAME
 
 DEFAULT_LGBM_PARAMS: dict[str, Any] = {
     "objective": "regression",  # L2; MAE is reported but L2 trains more stably
@@ -96,8 +94,7 @@ class LightGBMForecaster:
             model.fit(
                 X_fit,
                 y_fit,
-                eval_X=X_es,
-                eval_y=y_es,
+                eval_set=[(X_es, y_es)],
                 eval_metric="l1",
                 callbacks=[lgb.early_stopping(self.early_stopping_rounds, verbose=False)],
             )
@@ -132,7 +129,7 @@ class LightGBMForecaster:
         )
 
 
-def lightgbm_factory(params: dict[str, Any] | None = None):
+def lightgbm_factory(params: dict[str, Any] | None = None) -> Callable[[], LightGBMForecaster]:
     def _make() -> LightGBMForecaster:
         return LightGBMForecaster(params)
 
@@ -164,9 +161,7 @@ def load_feature_frame(path: Path = FEATURES_PARQUET) -> pd.DataFrame:
     return df.sort_index()
 
 
-# --------------------------------------------------------------------------- #
-# MLflow
-# --------------------------------------------------------------------------- #
+# --- MLflow ---
 def log_training_run(
     model: LightGBMForecaster,
     feature_cols: list[str],
@@ -183,9 +178,7 @@ def log_training_run(
 
     setup_mlflow(experiment)
     with mlflow.start_run(run_name=run_name or f"{MODEL_NAME}_{horizon.name}") as run:
-        mlflow.set_tags(
-            {"model": MODEL_NAME, "horizon": horizon.name, "stage": "training", "phase": "3"}
-        )
+        mlflow.set_tags({"model": MODEL_NAME, "horizon": horizon.name, "stage": "training"})
         mlflow.log_params({f"lgbm_{k}": v for k, v in model.get_params().items()})
         mlflow.log_params(
             {
@@ -219,9 +212,7 @@ def log_training_run(
         return run.info.run_id
 
 
-# --------------------------------------------------------------------------- #
-# CLI
-# --------------------------------------------------------------------------- #
+# --- CLI ---
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python -m src.models.train")
     p.add_argument("--features", type=Path, default=FEATURES_PARQUET)
@@ -235,11 +226,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    logging.basicConfig(
-        level=get_settings().log_level,
-        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    configure_logging()
     args = build_parser().parse_args(argv)
     horizon = HORIZONS[args.horizon]
     df = load_feature_frame(args.features)

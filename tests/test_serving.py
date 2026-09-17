@@ -29,9 +29,7 @@ N_DAYS = 30
 LAST_ACTUAL = pd.Timestamp("2024-01-30T23:00Z")  # 30 full days from 2024-01-01
 
 
-# --------------------------------------------------------------------------- #
-# Fixtures
-# --------------------------------------------------------------------------- #
+# --- Fixtures ---
 def _weather_rows(ts: pd.DatetimeIndex, source: str) -> pd.DataFrame:
     frames = []
     for city in CITIES:
@@ -113,9 +111,7 @@ def day_ahead_features(seeded) -> list[str]:
     return select_features(served.columns, DAY_AHEAD)
 
 
-# --------------------------------------------------------------------------- #
-# Forecast window
-# --------------------------------------------------------------------------- #
+# --- Forecast window ---
 def test_forecast_window_is_the_24_hours_after_the_last_actual() -> None:
     w = forecast_window(LAST_ACTUAL)
     assert len(w) == 24
@@ -128,9 +124,7 @@ def test_forecast_window_is_the_24_hours_after_the_last_actual() -> None:
             forecast_window(LAST_ACTUAL, hours=bad)
 
 
-# --------------------------------------------------------------------------- #
-# Train / serve parity - the key guarantee of this phase
-# --------------------------------------------------------------------------- #
+# --- Train / serve parity ---
 def test_served_features_equal_training_features_exactly(seeded) -> None:
     """Serve 'as of' a past hour; the same hours in the training frame must match bit-for-bit."""
     as_of = pd.Timestamp("2024-01-20T23:00Z")
@@ -191,9 +185,7 @@ def test_empty_db_raises(engine) -> None:
         build_serving_features(engine)
 
 
-# --------------------------------------------------------------------------- #
-# Weather at serving time
-# --------------------------------------------------------------------------- #
+# --- Weather at serving time ---
 def test_ensure_weather_fetches_forecast_only_when_missing(seeded) -> None:
     target = forecast_window(LAST_ACTUAL)  # beyond the archive -> missing
     client = FakeWeatherClient(start=LAST_ACTUAL)
@@ -230,9 +222,7 @@ def test_missing_weather_without_client_gives_nan_weather_not_an_error(seeded) -
     assert served[["load_lag_24", "load_lag_168", "hour"]].notna().all().all()
 
 
-# --------------------------------------------------------------------------- #
-# Forecast + batch storage
-# --------------------------------------------------------------------------- #
+# --- Forecast + batch storage ---
 def test_make_day_ahead_forecast_uses_champion_and_served_features(
     seeded, day_ahead_features
 ) -> None:
@@ -301,9 +291,7 @@ def test_batch_cli_dry_run_and_write(
     assert db.count_rows(seeded, db.LoadForecastModel) == 12
 
 
-# --------------------------------------------------------------------------- #
-# API
-# --------------------------------------------------------------------------- #
+# --- API ---
 @pytest.fixture
 def client(seeded, day_ahead_features):
     def loader() -> api.AppState:

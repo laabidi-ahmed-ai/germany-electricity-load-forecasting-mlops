@@ -23,9 +23,7 @@ START = pd.Timestamp("2024-01-01T00:00Z")
 AS_OF = START + pd.Timedelta(days=N_DAYS) - pd.Timedelta(hours=1)  # last hour of the data
 
 
-# --------------------------------------------------------------------------- #
-# Helpers
-# --------------------------------------------------------------------------- #
+# --- Helpers ---
 def synthetic_load(n_hours: int, seed: int = 0) -> np.ndarray:
     rng = np.random.default_rng(seed)
     h = np.arange(n_hours)
@@ -138,9 +136,7 @@ def fake_runner(drifted: set[str], *, score_ok: float = 0.02, score_bad: float =
     return _run
 
 
-# --------------------------------------------------------------------------- #
-# Performance
-# --------------------------------------------------------------------------- #
+# --- Performance ---
 def test_aligned_frame_inner_joins_on_common_hours(engine) -> None:
     seed_db(engine)
     # remove some official rows -> those hours must vanish from the alignment
@@ -251,9 +247,7 @@ def test_backtest_needs_a_year_of_training(engine) -> None:
         perf.backtest_vs_official(engine, days=7, frame=feature_frame(load), params=FAST_LGBM)
 
 
-# --------------------------------------------------------------------------- #
-# Drift
-# --------------------------------------------------------------------------- #
+# --- Drift ---
 def test_drift_columns_exclude_calendar_and_nowcast_features() -> None:
     frame = feature_frame(
         pd.DataFrame(
@@ -381,6 +375,27 @@ def test_compute_drift_flags_and_prediction_drift(engine) -> None:
     assert r.prediction is None
 
 
+def test_drift_reference_defaults_to_the_champions_training_window(engine) -> None:
+    load = seed_db(engine, days=120, with_model=False)
+    frame = feature_frame(load)
+    champ = fake_champion(select_features(frame.columns, DAY_AHEAD))
+    champ.train_end = frame.index.max() - pd.Timedelta(days=40)
+    seen: dict[str, pd.DataFrame] = {}
+
+    def spy(reference, current, columns, threshold=0.25):
+        seen["reference"] = reference
+        return fake_runner(set())(reference, current, columns, threshold)
+
+    r = drift_mod.compute_drift(engine, champ, window_days=30, frame=frame, runner=spy)
+    assert seen["reference"].index.max() <= champ.train_end
+    assert r.reference_rows == len(seen["reference"])
+    assert not any("train_end" in n for n in r.notes)
+
+    champ.train_end = None  # nothing recorded -> whole frame, and say so
+    r = drift_mod.compute_drift(engine, champ, window_days=30, frame=frame, runner=spy)
+    assert any("no recorded train_end" in n for n in r.notes)
+
+
 def test_compute_drift_with_real_evidently(engine) -> None:
     """Pin the Evidently 0.7 API contract on a tiny frame (offline)."""
     load = seed_db(engine, days=60, with_model=False)
@@ -402,9 +417,7 @@ def test_compute_drift_with_real_evidently(engine) -> None:
     assert r.target is not None
 
 
-# --------------------------------------------------------------------------- #
-# Triggers
-# --------------------------------------------------------------------------- #
+# --- Triggers ---
 @pytest.fixture
 def cfg() -> retrain.RetrainConfig:
     return retrain.RetrainConfig(
@@ -486,9 +499,7 @@ def test_drift_trigger_fires_and_drift_errors_are_contained(engine, cfg) -> None
     assert d.drift is None and d.drift_error == "evidently exploded"
 
 
-# --------------------------------------------------------------------------- #
-# Champion / challenger
-# --------------------------------------------------------------------------- #
+# --- Champion / challenger ---
 def test_challenger_skipped_without_fresh_data(engine, cfg, monkeypatch) -> None:
     load = seed_db(engine, days=60, with_model=False)
     frame = feature_frame(load)
@@ -569,9 +580,7 @@ def test_challenger_kept_when_margin_not_met(engine, cfg, monkeypatch) -> None:
     assert out.challenger_version is None
 
 
-# --------------------------------------------------------------------------- #
-# Logging + CLI
-# --------------------------------------------------------------------------- #
+# --- Logging + CLI ---
 def test_decisions_are_logged_to_mlflow_and_db(engine, cfg, tmp_path, monkeypatch) -> None:
     import mlflow
 
@@ -611,8 +620,8 @@ def test_decisions_are_logged_to_mlflow_and_db(engine, cfg, tmp_path, monkeypatc
     artifacts = {a.path for a in mlflow.MlflowClient().list_artifacts(run_id)}
     assert {"trigger_decision.json", "challenger_outcome.json"} <= artifacts
 
-    retrain.record_event(engine, d, out)
-    retrain.record_event(engine, d, None)
+    retrain.record_event(engine, d, out, cfg)
+    retrain.record_event(engine, d, None, cfg)
     events = db.read_monitoring_events(engine)
     assert len(events) == 2
     assert list(events["kind"]) == ["check", "retrain"]  # newest first, id breaks ties

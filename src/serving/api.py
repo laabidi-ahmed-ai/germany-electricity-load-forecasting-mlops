@@ -1,16 +1,14 @@
 """FastAPI serving app.
 
-Endpoints
----------
-* ``GET /health``          - liveness + which champion is loaded + DB freshness
-* ``GET /forecast``        - compute the day-ahead forecast *now* with the champion
-                             model and the training feature pipeline (``?hours=24``)
+* ``GET /health``          - liveness, which champion is loaded, DB freshness
+* ``GET /forecast``        - compute the day-ahead forecast now with the champion
+                             and the training feature pipeline (``?hours=24``)
 * ``GET /forecast/latest`` - the most recently issued batch forecast from the DB
                              (instant; what the dashboard reads)
 
-The champion is loaded once at startup from the database export
-(``model_artifacts``, see ``src.models.registry``) - the API needs only ``DATABASE_URL``. ``create_app(state_loader=...)`` lets tests
-inject a fake model / SQLite engine without touching MLflow or the network.
+The champion is loaded once at startup from the database export (``model_artifacts``,
+see ``src.models.registry``), so the API needs only ``DATABASE_URL``.
+``create_app(state_loader=...)`` lets tests inject a fake model and a SQLite engine.
 
 Run locally: ``uvicorn src.serving.api:app --reload`` (``make serve``).
 """
@@ -28,8 +26,9 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.engine import Engine
 
-from config.settings import get_settings
+from config.log import configure_logging
 from src.data import db
+from src.data.db import LOAD_SOURCE
 from src.data.weather_client import WeatherClient
 from src.models.registry import LoadedModel, load_champion
 from src.serving.forecast import DAY_AHEAD_HOURS, NoDataError, make_day_ahead_forecast
@@ -39,9 +38,7 @@ log = logging.getLogger(__name__)
 API_VERSION = "0.1.0"
 
 
-# --------------------------------------------------------------------------- #
-# State
-# --------------------------------------------------------------------------- #
+# --- State ---
 @dataclass
 class AppState:
     engine: Engine
@@ -51,6 +48,7 @@ class AppState:
 
 
 def default_state_loader() -> AppState:
+    configure_logging()
     engine = db.get_engine()
     db.init_db(engine)
     model = load_champion(engine)
@@ -69,9 +67,7 @@ def get_state(request: Request) -> AppState:
     return state
 
 
-# --------------------------------------------------------------------------- #
-# Schemas
-# --------------------------------------------------------------------------- #
+# --- Schemas ---
 class ModelInfo(BaseModel):
     name: str
     version: str
@@ -106,9 +102,7 @@ class ForecastResponse(BaseModel):
     forecast: list[ForecastPoint]
 
 
-# --------------------------------------------------------------------------- #
-# App factory
-# --------------------------------------------------------------------------- #
+# --- App factory ---
 def create_app(state_loader: Callable[[], AppState] = default_state_loader) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -135,7 +129,7 @@ def create_app(state_loader: Callable[[], AppState] = default_state_loader) -> F
 
     @app.get("/health", response_model=HealthResponse)
     def health(state: AppState = Depends(get_state)) -> HealthResponse:
-        last_actual = db.latest_timestamp(state.engine, db.LoadActual)
+        last_actual = db.latest_timestamp(state.engine, db.LoadActual, source=LOAD_SOURCE)
         latest_fc = db.read_latest_model_forecast(state.engine)
         issued = None if latest_fc.empty else latest_fc["issued_at"].iloc[0].to_pydatetime()
         return HealthResponse(
@@ -177,7 +171,9 @@ def create_app(state_loader: Callable[[], AppState] = default_state_loader) -> F
         latest = db.read_latest_model_forecast(state.engine)
         if latest.empty:
             raise HTTPException(status_code=404, detail="no batch forecast stored yet")
-        last_actual = db.latest_timestamp(state.engine, db.LoadActual) or pd.Timestamp(0, tz="UTC")
+        last_actual = db.latest_timestamp(
+            state.engine, db.LoadActual, source=LOAD_SOURCE
+        ) or pd.Timestamp(0, tz="UTC")
         version = str(latest["model_version"].iloc[0])
         info = model_info(state.model)
         if version != state.model.version:
@@ -201,5 +197,4 @@ def create_app(state_loader: Callable[[], AppState] = default_state_loader) -> F
     return app
 
 
-logging.basicConfig(level=get_settings().log_level)
 app = create_app()

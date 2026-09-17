@@ -6,7 +6,8 @@ import pandas as pd
 import pytest
 
 from src.data._http import get_json
-from src.data.smard_client import SmardClient, to_utc_timestamp
+from src.data.db import to_utc
+from src.data.smard_client import SmardClient
 from tests.conftest import (
     DST_WEEK_STARTS_MS,
     MS_PER_HOUR,
@@ -86,10 +87,10 @@ def test_end_before_start_raises() -> None:
         client.fetch_load("2021-04-01", "2021-03-01")
 
 
-def test_to_utc_timestamp_treats_naive_as_utc_and_converts_aware() -> None:
-    assert to_utc_timestamp("2021-03-01") == pd.Timestamp("2021-03-01T00:00Z")
+def test_to_utc_treats_naive_as_utc_and_converts_aware() -> None:
+    assert to_utc("2021-03-01") == pd.Timestamp("2021-03-01T00:00Z")
     berlin = pd.Timestamp("2021-03-01T00:00", tz="Europe/Berlin")
-    assert to_utc_timestamp(berlin) == pd.Timestamp("2021-02-28T23:00Z")
+    assert to_utc(berlin) == pd.Timestamp("2021-02-28T23:00Z")
 
 
 def test_get_json_retries_then_succeeds() -> None:
@@ -107,6 +108,14 @@ def test_get_json_gives_up_after_retries() -> None:
     with pytest.raises(RuntimeError, match="giving up"):
         get_json(session, url, retries=3, sleep=lambda _: None)
     assert len(session.calls) == 3
+
+
+def test_get_json_does_not_retry_client_errors() -> None:
+    url = f"{BASE}/missing.json"
+    session = FakeSession(routes={url: [FakeResponse({}, status_code=404)] * 3})
+    with pytest.raises(RuntimeError, match="HTTP 404"):
+        get_json(session, url, retries=3, sleep=lambda _: None)
+    assert len(session.calls) == 1
 
 
 def test_week_overlap_math() -> None:

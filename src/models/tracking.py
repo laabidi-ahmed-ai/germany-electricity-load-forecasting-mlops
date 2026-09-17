@@ -7,7 +7,7 @@
   entry point (CLI, tests, GitHub Actions) writes to the same file.
 * a plain directory such as ``./mlruns`` - the legacy filesystem store. MLflow 3
   keeps it in maintenance mode behind ``MLFLOW_ALLOW_FILE_STORE=true``; we set that
-  flag so the README §12 example keeps working.
+  flag so the plain-directory form still works.
 * ``postgresql://…`` - a Postgres backend store (the cloud setup: the same
   Neon/Supabase database that holds the data tables; MLflow adds its own tables).
   Re-routed to the psycopg 3 driver like ``DATABASE_URL``.

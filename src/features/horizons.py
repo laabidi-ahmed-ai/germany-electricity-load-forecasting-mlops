@@ -1,27 +1,24 @@
-"""Horizon-aware feature selection.
+"""Horizon-aware feature selection: which columns a model may see for a given lead time.
 
-Forecast setup (the headline task)
-----------------------------------
-**Day-ahead**: the forecast for every hour of day D+1 is issued once day D is
-complete, i.e. the most recent *observed* load is at the end of day D. For a
-target hour *t* on D+1 that means load is known only up to *t-24h* (for 00:00)
-and *t-47h* (for 23:00). We adopt the standard simplification of a fixed
-**24-hour information cutoff**: a load-derived feature is day-ahead valid only
-if the most recent observation it uses is at least 24 hours before *t*.
+Day-ahead: the forecast for every hour of day D+1 is issued once day D is complete,
+so for a target hour t on D+1 the load is known only up to t-24h (for 00:00) and
+t-47h (for 23:00). We use the standard simplification of a fixed 24-hour
+information cutoff: a load-derived feature is day-ahead valid only if the most
+recent observation it uses is at least 24 hours before t.
 
-Consequences for the feature frame built in ``build_features``:
+For the frame built in ``build_features`` that means:
 
-* ``load_lag_24 / 48 / 168``            -> valid (most recent observation >= 24h old)
-* ``load_lag_1``                        -> **excluded** (unobserved at issue time)
-* ``load_roll_*_24`` and ``load_roll_*_168`` -> **excluded**: both windows end at
-  *t-1*, so they contain the unobserved last 24 hours (the 168h window is not
-  "sub-24h" in length, but its *most recent* value is).
+* ``load_lag_24 / 48 / 168``            -> valid
+* ``load_lag_1``                        -> excluded (unobserved at issue time)
+* ``load_roll_*_24`` and ``load_roll_*_168`` -> excluded: both windows end at t-1,
+  so they contain the unobserved last 24 hours (the 168h window is long, but its
+  most recent value is not)
 * calendar features                     -> always valid (known for any future hour)
-* weather features                      -> valid (weather *forecasts* for *t* are
-  available at issue time; train/serve skew is handled in the serving phase)
+* weather features                      -> valid; at serving time they are weather
+  forecasts for t, which is a train/serve skew (forecast error), not leakage
 
-**Nowcast** (a future model): information cutoff of 1 hour - the full feature
-set, including ``load_lag_1`` and all rolling stats, is valid.
+Nowcast (a possible future model): information cutoff of 1 hour, the full feature
+set is valid.
 
 The frame keeps every column; selection happens here, by column-name contract:
 ``load_lag_{k}`` and ``load_roll_{stat}_{w}`` are the load-derived names.

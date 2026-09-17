@@ -147,7 +147,7 @@ The project is organized around the canonical MLOps loop; each stage maps to a f
 | **Storage** | Postgres as the single source of truth for data, the model registry, and model artifacts; idempotent upserts. | Postgres |
 | **Feature engineering** | Lag, rolling, calendar/holiday, and weather features, computed leakage-safe on a complete hourly index; horizon-aware selection for day-ahead validity. | `pandas`, `holidays` |
 | **Training & experimentation** | Naive baselines → LightGBM; strict time-series cross-validation; every run logged. | LightGBM, MLflow |
-| **Evaluation** | MAE/RMSE/MAPE, error sliced by hour/weekday/season, and out-of-sample comparison against the official forecast. | `scikit-learn` |
+| **Evaluation** | MAE/RMSE/MAPE, error sliced by hour/weekday/season, and out-of-sample comparison against the official forecast. | `numpy`, `pandas` |
 | **Registry & versioning** | Champion/challenger via MLflow aliases; promotion rules; one-step rollback. | MLflow Model Registry |
 | **Serving** | Batch day-ahead job + real-time FastAPI endpoint; Dockerized. | FastAPI, Docker |
 | **Monitoring** | Accuracy vs. fresh actuals and vs. the official forecast; data drift; logging. | Evidently |
@@ -183,7 +183,7 @@ Day-ahead load forecasting is a **supervised** problem. The model progresses fro
 1. **Naive baselines** — "same hour yesterday" and "same hour last week" (seasonal naive). These set the bar every other model must beat.
 2. **Gradient boosting** — **LightGBM** on lag, calendar, and weather features. This is a genuinely strong baseline for load forecasting.
 
-**Horizon-aware features.** For an honest day-ahead forecast, a feature may only use information available at forecast-issue time. The model therefore uses lags of 24h and longer, calendar features, and weather (available as a forecast), and deliberately excludes features that depend on the most recent, still-unobserved hours — which keeps the comparison against the official day-ahead forecast fair.
+**Horizon-aware features.** For an honest day-ahead forecast, a feature may only use information available at forecast-issue time. The model therefore uses lags of 24h and longer, calendar features, and weather (available as a forecast), and deliberately excludes features that depend on the most recent, still-unobserved hours — which keeps the *load information* on par with the official day-ahead forecast. One caveat: the batch job forecasts the 24 hours after the latest published actual (lead times of 1–24 h, with a same-morning weather forecast), whereas the official forecast is issued the previous day for the whole calendar day (roughly 12–36 h ahead); the comparison is therefore favourable to the model on lead time and weather freshness.
 
 **Validation.** Strict **time-series cross-validation** (expanding window) — never random splits, which would leak the future into the past. Early stopping is done on a chronological tail of the training data, never on the evaluation fold.
 
@@ -213,9 +213,9 @@ This loop is why the system is designed to run continuously: a retraining trigge
 |---|---|
 | Language | Python 3.11+ |
 | Data ingestion | `entsoe-py`, `requests` (SMARD, ENTSO-E, Open-Meteo) |
-| Storage | Postgres (Neon / Supabase free tier); SQLite for local dev |
+| Storage | Postgres (Neon / Supabase free tier), TimescaleDB hypertables when the extension is available; SQLite for local dev |
 | Feature engineering | pandas, `holidays` |
-| Modeling | LightGBM, scikit-learn |
+| Modeling | LightGBM |
 | Experiment tracking + registry | MLflow (Postgres-backed) |
 | Serving | FastAPI (real-time) + scheduled batch job |
 | Containerization | Docker / docker-compose |
@@ -232,12 +232,15 @@ This loop is why the system is designed to run continuously: a retraining trigge
 ```
 germany-electricity-load-forecasting-mlops/
 ├── README.md
+├── LICENSE
 ├── pyproject.toml                 # dependencies & tooling config
 ├── Makefile                       # common commands (setup, test, data, train, serve, …)
-├── docker-compose.yml
+├── Dockerfile                     # serving image (API + batch job)
+├── docker-compose.yml             # local Postgres + API + dashboard
 ├── .env.example                   # template for secrets (no real values)
 ├── requirements/                  # lean per-job dependency sets (e.g. ingest)
 ├── docs/                          # design notes (e.g. cloud setup)
+├── notebooks/                     # exploration only, never the source of truth
 ├── .github/workflows/
 │   ├── ci.yml                     # tests + lint on push
 │   ├── ingest.yml                 # hourly ingestion (cron)
@@ -253,7 +256,9 @@ germany-electricity-load-forecasting-mlops/
 │   ├── serving/                   # api (FastAPI), forecast, batch_forecast
 │   └── monitoring/                # drift, performance, retrain
 ├── dashboard/
-│   └── app.py                     # Streamlit dashboard
+│   ├── app.py                     # Streamlit dashboard
+│   ├── queries.py                 # read-only queries behind it
+│   └── requirements.txt           # lean deps for Streamlit Community Cloud
 └── tests/                         # pytest unit + integration tests
 ```
 
@@ -264,12 +269,15 @@ germany-electricity-load-forecasting-mlops/
 Secrets are **never** committed. For local use, copy `.env.example` to `.env` (gitignored); for the cloud jobs, add the same keys as **GitHub Secrets**.
 
 ```dotenv
-# .env.example
+# .env.example (abridged)
 ENTSOE_API_TOKEN=your_entsoe_security_token_here   # optional
-DATABASE_URL=postgresql://user:password@host:5432/dbname
+# DATABASE_URL=postgresql://user:password@host:5432/dbname   # unset = local SQLite
 OPEN_METEO_BASE_URL=https://api.open-meteo.com/v1
-MLFLOW_TRACKING_URI=sqlite:///mlruns/mlflow.db     # defaults to DATABASE_URL in the cloud
-BIDDING_ZONE=DE_LU
+MLFLOW_TRACKING_URI=sqlite:///mlruns/mlflow.db     # the cloud jobs point this at DATABASE_URL
+BIDDING_ZONE=DE_LU                                 # ENTSO-E bidding zone
+SMARD_REGION=DE                                    # SMARD region code
+DATA_START_DATE=2021-03-01                         # post-COVID cutoff
+LOG_LEVEL=INFO
 ```
 
 - `DATABASE_URL` — connection string from a free Postgres provider (Neon / Supabase).
@@ -287,15 +295,17 @@ cd germany-electricity-load-forecasting-mlops
 # 2. Install (Python 3.11+)
 pip install -e ".[dev]"          # or: make setup
 
-# 3. Configure (SQLite is used by default if DATABASE_URL is unset)
+# 3. Configure (SQLite is used by default while DATABASE_URL stays commented out)
 cp .env.example .env
 
-# 4. Backfill historical data, build features, train
+# 4. Backfill historical data, build features, train, promote the first champion
 make data
 make features
 make train
+make register     # export the trained model as the serving champion
 
-# 5. Serve
+# 5. Forecast and serve
+make forecast     # batch day-ahead forecast -> database
 make serve        # FastAPI at http://localhost:8000
 make dashboard    # Streamlit at http://localhost:8501
 ```
@@ -326,7 +336,7 @@ Measured with expanding-window time-series cross-validation and out-of-sample da
 | Official TSO day-ahead forecast | — | 3.85 |
 
 - LightGBM reduces MAE by ~56% vs. the best naive baseline and wins on every cross-validation fold.
-- In an out-of-sample day-ahead backtest, the model beats the **official grid-operator forecast in 12 of 12 monthly windows** (2.43% vs. 3.85% MAPE).
+- In an out-of-sample day-ahead backtest, the model beats the **official grid-operator forecast in 12 of 12 monthly windows** (2.43% vs. 3.85% MAPE). Read with the caveat in §8: the model's window starts right after the latest published actual and uses fresher weather than a true previous-day issue would have.
 
 *Live accuracy against fresh actuals, uptime, and retraining events accumulate as the deployed system runs, and are surfaced on the dashboard.*
 

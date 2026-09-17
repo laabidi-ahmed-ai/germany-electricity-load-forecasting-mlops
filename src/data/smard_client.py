@@ -7,7 +7,7 @@ SMARD publishes hourly data as one JSON file per week::
     {base}/{filter}/{region}/{filter}_{region}_{resolution}_{week_start_ms}.json
         -> {"meta_data": ..., "series": [[<epoch ms>, <value|null>], ...]}
 
-Timestamps are epoch milliseconds, i.e. **UTC and DST-unambiguous**. Week files
+Timestamps are epoch milliseconds, i.e. UTC and DST-unambiguous. Week files
 start at Monday 00:00 *local* time, so their UTC start drifts between 22:00 and
 23:00 across DST; we only ever filter by epoch and never reason in local time.
 
@@ -21,13 +21,13 @@ tokenless by SMARD (it is the same series ENTSO-E exposes as "Forecasted Load").
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime
 
 import pandas as pd
 import requests
 
 from config.settings import get_settings
 from src.data._http import get_json, make_session
+from src.data.db import DateLike, to_utc
 
 log = logging.getLogger(__name__)
 
@@ -36,22 +36,8 @@ FILTER_ACTUAL_LOAD = 410  # Realisierter Stromverbrauch: Gesamt (Netzlast)
 FILTER_FORECAST_LOAD = 411  # Prognostizierter Stromverbrauch: Gesamt (Netzlast) - day-ahead
 RESOLUTION_HOUR = "hour"
 
-LOAD_COLUMNS = ["timestamp_utc", "load_mw"]
-FORECAST_COLUMNS = ["timestamp_utc", "forecast_mw"]
-
 _MS_PER_HOUR = 3_600_000
 _WEEK_MS = 7 * 24 * _MS_PER_HOUR
-
-DateLike = date | datetime | str | pd.Timestamp
-
-
-def to_utc_timestamp(value: DateLike) -> pd.Timestamp:
-    """Coerce a date-like value to a tz-aware UTC ``pd.Timestamp``.
-
-    Naive inputs are *assumed* to be UTC (never local time).
-    """
-    ts = pd.Timestamp(value)
-    return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
 
 
 def empty_load_frame(value_col: str = "load_mw") -> pd.DataFrame:
@@ -115,8 +101,8 @@ class SmardClient:
     def _fetch_series(
         self, filter_id: int, value_col: str, start: DateLike, end: DateLike | None
     ) -> pd.DataFrame:
-        start_ts = to_utc_timestamp(start)
-        end_ts = to_utc_timestamp(end) if end is not None else pd.Timestamp.now(tz="UTC")
+        start_ts = to_utc(start)
+        end_ts = to_utc(end) if end is not None else pd.Timestamp.now(tz="UTC")
         if end_ts < start_ts:
             raise ValueError(f"end ({end_ts}) is before start ({start_ts})")
 

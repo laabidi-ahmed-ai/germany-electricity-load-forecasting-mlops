@@ -42,7 +42,4 @@ jobs:
           ruff format --check .
 
       - name: Test (pytest)
-        env:
-          # No secrets in CI: the suite must pass without them.
-          MLFLOW_TRACKING_URI: ./mlruns
         run: pytest -m "not integration"

@@ -4,25 +4,23 @@ Input: hourly actual load (``db.read_load``) and national-average weather.
 Output: one row per hour, indexed by ``timestamp_utc``, with the target ``load_mw``
 plus the feature columns listed in ``feature_columns()``.
 
-Leakage rules - every feature for hour *t* uses only information
-available strictly before *t*:
+Leakage rules - every feature for hour t uses only information available strictly
+before t:
 
-* **Lags** ``load_lag_{k}`` = load at *t-k* hours (k in 1, 24, 48, 168). Computed on a
-  *complete* hourly index, so a lag is always a true time offset, never "k rows ago"
+* Lags ``load_lag_{k}`` = load at t-k hours (k in 1, 24, 48, 168). Computed on a
+  complete hourly index, so a lag is always a true time offset, never "k rows ago"
   across a data gap.
-* **Rolling stats** over the previous 24h / 168h are computed on ``load.shift(1)``,
-  so the window ends at *t-1* and never contains hour *t* itself.
-* **Calendar** features are derived from the timestamp only (Europe/Berlin local
-  time, because demand follows the local clock). Public holidays are the
-  *nationwide* German ones; holidays vary by Bundesland (e.g. Fronleichnam,
-  Reformationstag) and those regional ones are deliberately not included.
-* **Weather** at hour *t* is joined as-is. In training these are reanalysis
-  actuals; at serving time they will be *weather forecasts* for *t*. That is a
-  train/serve skew (forecast error) to be handled in the serving phase, not
-  target leakage: a forecast for *t* is available before *t*.
+* Rolling stats over the previous 24h / 168h are computed on ``load.shift(1)``,
+  so the window ends at t-1 and never contains hour t itself.
+* Calendar features come from the Europe/Berlin clock (demand follows local time).
+  Public holidays are the nationwide German ones only; Bundesland-specific days
+  (Fronleichnam, Reformationstag, ...) are deliberately left out.
+* Weather at hour t is joined as-is (reanalysis in training, a forecast for t at
+  serving time - see ``src.features.horizons`` for why that is not leakage).
 
-No scaler or other fitted transform lives here: scaling belongs to the modeling
-phase and must be fit on the training split only.
+Which columns a model may use for a given lead time is decided in
+``src.features.horizons``, not here. No scaler or other fitted transform lives here
+either; if one is ever needed it must be fit on the training split only.
 """
 
 from __future__ import annotations
@@ -31,9 +29,7 @@ import argparse
 import logging
 import sys
 from collections.abc import Iterator
-from dataclasses import dataclass
 from datetime import date
-from itertools import pairwise
 from pathlib import Path
 
 import holidays
@@ -41,6 +37,7 @@ import numpy as np
 import pandas as pd
 from sqlalchemy.engine import Engine
 
+from config.log import configure_logging
 from config.settings import PROJECT_ROOT, get_settings
 from src.data import db
 from src.data.weather_client import WEATHER_VARS, national_average
@@ -61,9 +58,7 @@ WEATHER_COLUMNS: tuple[str, ...] = tuple(f"{v}_de_avg" for v in WEATHER_VARS)
 DEFAULT_OUTPUT = PROJECT_ROOT / "data" / "processed" / "features.parquet"
 
 
-# --------------------------------------------------------------------------- #
-# Building blocks (each takes a complete hourly UTC index)
-# --------------------------------------------------------------------------- #
+# --- Building blocks (each takes a complete hourly UTC index) ---
 def complete_hourly_index(index: pd.DatetimeIndex) -> pd.DatetimeIndex:
     """Full hourly UTC range spanning ``index`` (so lags are true time offsets)."""
     if index.tz is None or str(index.tz) != "UTC":
@@ -134,9 +129,7 @@ def make_weather_features(
     return w.reindex(index)[cols]
 
 
-# --------------------------------------------------------------------------- #
-# Assembly
-# --------------------------------------------------------------------------- #
+# --- Assembly ---
 def build_feature_frame(
     load: pd.DataFrame,
     weather_avg: pd.DataFrame | None = None,
@@ -193,36 +186,7 @@ def feature_columns(df: pd.DataFrame) -> list[str]:
     return [c for c in df.columns if c != TARGET]
 
 
-# --------------------------------------------------------------------------- #
-# Time-based splits (never random - a random split leaks future information into the past)
-# --------------------------------------------------------------------------- #
-@dataclass(frozen=True)
-class Split:
-    train: pd.DataFrame
-    val: pd.DataFrame
-    test: pd.DataFrame
-
-
-def time_split(
-    df: pd.DataFrame,
-    train_end: date | str | pd.Timestamp,
-    val_end: date | str | pd.Timestamp,
-) -> Split:
-    """Chronological train / val / test: ``[.., train_end)``, ``[train_end, val_end)``, ``[val_end, ..)``."""
-    t_end = _utc(train_end)
-    v_end = _utc(val_end)
-    if not t_end < v_end:
-        raise ValueError("train_end must be before val_end")
-    idx = df.index
-    split = Split(
-        train=df[idx < t_end],
-        val=df[(idx >= t_end) & (idx < v_end)],
-        test=df[idx >= v_end],
-    )
-    _assert_chronological(split)
-    return split
-
-
+# --- Time-based splits (never random - a random split leaks future information into the past) ---
 def expanding_window_splits(
     df: pd.DataFrame,
     *,
@@ -248,25 +212,12 @@ def expanding_window_splits(
             raise ValueError(
                 f"fold starting {start} has only {len(train)} training hours (< {min_train_hours})"
             )
-        assert train.index.max() < val.index.min()
+        if not train.index.max() < val.index.min():
+            raise ValueError(f"fold starting {start} overlaps its training data")
         yield train, val
 
 
-def _utc(value: date | str | pd.Timestamp) -> pd.Timestamp:
-    ts = pd.Timestamp(value)
-    return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
-
-
-def _assert_chronological(split: Split) -> None:
-    parts = [p for p in (split.train, split.val, split.test) if not p.empty]
-    for earlier, later in pairwise(parts):
-        if not earlier.index.max() < later.index.min():
-            raise AssertionError("splits overlap in time")
-
-
-# --------------------------------------------------------------------------- #
-# I/O
-# --------------------------------------------------------------------------- #
+# --- I/O ---
 def load_inputs(
     engine: Engine,
     *,
@@ -296,8 +247,8 @@ def build_features(
 ) -> pd.DataFrame:
     """Full pipeline: DB -> feature frame (-> parquet if ``output`` is given)."""
     engine = engine or db.get_engine()
-    start_ts = _utc(start) if start is not None else _utc(get_settings().data_start_date)
-    end_ts = _utc(end) if end is not None else None
+    start_ts = db.to_utc(start) if start is not None else db.to_utc(get_settings().data_start_date)
+    end_ts = db.to_utc(end) if end is not None else None
     load, weather_avg = load_inputs(engine, start=start_ts, end=end_ts)
     df = build_feature_frame(load, weather_avg)
     if output is not None:
@@ -308,11 +259,7 @@ def build_features(
 
 
 def main(argv: list[str] | None = None) -> int:
-    logging.basicConfig(
-        level=get_settings().log_level,
-        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    configure_logging()
     p = argparse.ArgumentParser(prog="python -m src.features.build_features")
     p.add_argument("--start", default=None, help="YYYY-MM-DD (default DATA_START_DATE)")
     p.add_argument("--end", default=None, help="YYYY-MM-DD (default: everything)")

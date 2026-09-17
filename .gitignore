@@ -3,7 +3,7 @@
 .env.*
 !.env.example
 
-# --- data & ML artifacts (data/ is tracked via DVC, not git) ---------------
+# --- data & ML artifacts (generated locally, never committed) --------------
 data/*
 !data/.gitkeep
 mlruns/

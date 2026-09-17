@@ -190,15 +190,7 @@ def seeded(engine: Engine) -> Engine:
     return engine
 
 
-# --------------------------------------------------------------------------- #
-# Headline
-# --------------------------------------------------------------------------- #
-def test_model_name_matches_the_registry() -> None:
-    from src.models.registry import REGISTERED_MODEL_NAME
-
-    assert q.MODEL_NAME == REGISTERED_MODEL_NAME
-
-
+# --- Headline ---
 def test_champion_and_versions(seeded: Engine) -> None:
     champ = q.champion(seeded)
     assert champ is not None
@@ -236,9 +228,7 @@ def test_coverage_counts_gaps(seeded: Engine) -> None:
     assert cov["completeness_pct"] == pytest.approx(100 * (24 * DAYS - 1) / (24 * DAYS))
 
 
-# --------------------------------------------------------------------------- #
-# Latest forecast
-# --------------------------------------------------------------------------- #
+# --- Latest forecast ---
 def test_latest_forecast_frame_is_the_latest_issue_with_context(seeded: Engine) -> None:
     frame = q.latest_forecast_frame(seeded, context_hours=48)
     assert len(frame) == 48 + 72  # context + the v2 issue (3 days)
@@ -251,9 +241,7 @@ def test_latest_forecast_frame_is_the_latest_issue_with_context(seeded: Engine) 
     assert frame["issued_at"].notna().all()
 
 
-# --------------------------------------------------------------------------- #
-# Accuracy
-# --------------------------------------------------------------------------- #
+# --- Accuracy ---
 def test_aligned_frame_scores_only_observed_hours_with_the_latest_issue(seeded: Engine) -> None:
     as_of = START + pd.Timedelta(days=DAYS)
     aligned = q.aligned_frame(seeded, days=30, as_of=as_of)
@@ -268,8 +256,9 @@ def test_aligned_frame_scores_only_observed_hours_with_the_latest_issue(seeded: 
 
 
 def test_window_summary_matches_the_training_metrics(seeded: Engine) -> None:
-    aligned = q.aligned_frame(seeded, days=30, as_of=START + pd.Timedelta(days=DAYS))
-    w = q.window_summary(aligned, days=7)
+    as_of = START + pd.Timedelta(days=DAYS, hours=-1)  # "now" = the last observed hour
+    aligned = q.aligned_frame(seeded, days=30, as_of=as_of)
+    w = q.window_summary(aligned, days=7, as_of=as_of)
     assert w["judged"] and w["n_hours"] == 24 * 7
     ref = compute_metrics(aligned["actual_mw"], aligned["model_mw"])
     assert w["model_mae"] == pytest.approx(ref["mae"]) and w["model_mape"] == pytest.approx(
@@ -282,7 +271,7 @@ def test_window_summary_matches_the_training_metrics(seeded: Engine) -> None:
     )
     assert w["model_beats_official"] is False  # v1's +3 GW bias dominates the week
 
-    w2 = q.window_summary(aligned, days=2)  # only the accurate v2 days
+    w2 = q.window_summary(aligned, days=2, as_of=as_of)  # only the accurate v2 days
     assert w2["judged"] and w2["model_beats_official"] is True
 
 
@@ -296,9 +285,14 @@ def test_window_summary_refuses_to_judge_on_too_few_hours() -> None:
             "model_version": "1",
         }
     )
-    w = q.window_summary(small, days=7)
+    as_of = START + pd.Timedelta(hours=4)
+    w = q.window_summary(small, days=7, as_of=as_of)
     assert w == {"days": 7, "n_hours": 5, "judged": False}
-    assert q.window_summary(small.iloc[0:0], days=7) == {"days": 7, "n_hours": 0, "judged": False}
+    assert q.window_summary(small.iloc[0:0], days=7, as_of=as_of) == {
+        "days": 7,
+        "n_hours": 0,
+        "judged": False,
+    }
 
 
 def test_daily_accuracy(seeded: Engine) -> None:
@@ -330,9 +324,7 @@ def test_official_only_summary_works_before_any_model_forecast(engine: Engine) -
     assert q.aligned_frame(engine, days=30, as_of=ts[-1]).empty
 
 
-# --------------------------------------------------------------------------- #
-# Monitoring
-# --------------------------------------------------------------------------- #
+# --- Monitoring ---
 def test_latest_check_parses_triggers_and_drift(seeded: Engine) -> None:
     events = q.monitoring_events(seeded)
     assert len(events) == 3 and events["created_at"].is_monotonic_decreasing
@@ -368,9 +360,7 @@ def test_latest_check_survives_unparseable_details(engine: Engine) -> None:
     assert check is not None and check["checks"].empty and check["drift"] is None
 
 
-# --------------------------------------------------------------------------- #
-# Empty database + engine
-# --------------------------------------------------------------------------- #
+# --- Empty database + engine ---
 def test_everything_handles_an_empty_database(engine: Engine) -> None:
     assert q.champion(engine) is None
     assert q.model_versions(engine).empty
@@ -407,9 +397,7 @@ def test_describe_database_never_leaks_credentials() -> None:
     assert q.describe_database("sqlite:///data/x.db").startswith("SQLite")
 
 
-# --------------------------------------------------------------------------- #
-# The page itself
-# --------------------------------------------------------------------------- #
+# --- The page itself ---
 def test_app_renders_every_panel(seeded: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
     from streamlit.testing.v1 import AppTest
 

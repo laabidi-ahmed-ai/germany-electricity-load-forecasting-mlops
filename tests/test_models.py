@@ -42,9 +42,7 @@ def frame() -> pd.DataFrame:
     return synthetic_frame()
 
 
-# --------------------------------------------------------------------------- #
-# Baselines
-# --------------------------------------------------------------------------- #
+# --- Baselines ---
 def test_seasonal_naive_predicts_the_lag_column(frame) -> None:
     X = frame[select_features(frame.columns, DAY_AHEAD)]
     for lag in (24, 168):
@@ -69,9 +67,7 @@ def test_seasonal_naive_requires_its_column() -> None:
         SeasonalNaive(168).fit(pd.DataFrame({"hour": [1, 2]}))
 
 
-# --------------------------------------------------------------------------- #
-# Metrics
-# --------------------------------------------------------------------------- #
+# --- Metrics ---
 def test_metrics_exact_values() -> None:
     y = np.array([100.0, 200.0, 400.0])
     p = np.array([110.0, 180.0, 400.0])
@@ -90,9 +86,7 @@ def test_metrics_reject_bad_inputs() -> None:
         compute_metrics([1.0], [np.nan])
 
 
-# --------------------------------------------------------------------------- #
-# LightGBM wrapper
-# --------------------------------------------------------------------------- #
+# --- LightGBM wrapper ---
 def test_lightgbm_forecaster_fits_predicts_and_reports_importances(frame) -> None:
     cols = select_features(frame.columns, DAY_AHEAD)
     model = train.LightGBMForecaster(FAST_LGBM).fit(frame[cols], frame[TARGET])
@@ -123,7 +117,7 @@ def test_lightgbm_early_stopping_uses_chronological_tail(frame, monkeypatch) -> 
 
     def spy(self, X, y, *args, **kwargs):
         seen["fit"] = X
-        seen["es"] = kwargs.get("eval_X")
+        seen["es"] = kwargs["eval_set"][0][0]
         return original_fit(self, X, y, *args, **kwargs)
 
     monkeypatch.setattr(lgb.LGBMRegressor, "fit", spy)
@@ -148,9 +142,7 @@ def test_train_final_model_uses_only_horizon_valid_features(frame) -> None:
     assert not any(c.startswith("load_roll_") for c in model.feature_names_)
 
 
-# --------------------------------------------------------------------------- #
-# Cross-validation
-# --------------------------------------------------------------------------- #
+# --- Cross-validation ---
 @pytest.fixture(scope="module")
 def cv(frame) -> evaluate.CVResult:
     factories = {**BASELINE_FACTORIES, "lightgbm": train.lightgbm_factory(FAST_LGBM)}
@@ -226,9 +218,7 @@ def test_cv_every_model_sees_the_same_horizon_valid_columns(frame) -> None:
     assert "load_lag_1" in seen["cols"]
 
 
-# --------------------------------------------------------------------------- #
-# MLflow
-# --------------------------------------------------------------------------- #
+# --- MLflow ---
 def test_tracking_uri_resolution(monkeypatch, tmp_path) -> None:
     from config.settings import PROJECT_ROOT
 
@@ -308,9 +298,7 @@ def test_standalone_cv_run_is_logged(cv, tmp_path, monkeypatch) -> None:
     assert "lightgbm_vs_seasonal_naive_168_improvement_pct" in run.data.metrics
 
 
-# --------------------------------------------------------------------------- #
-# CLI
-# --------------------------------------------------------------------------- #
+# --- CLI ---
 def test_train_cli_end_to_end(frame, tmp_path, monkeypatch, capsys) -> None:
     path = tmp_path / "features.parquet"
     frame.to_parquet(path)

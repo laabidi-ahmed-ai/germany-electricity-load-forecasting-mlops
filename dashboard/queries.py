@@ -12,25 +12,23 @@ numbers on the dashboard agree with the training reports and monitoring events.
 from __future__ import annotations
 
 import json
+from dataclasses import asdict
 from pathlib import PurePosixPath
 from typing import Any
 
-import numpy as np
 import pandas as pd
 from sqlalchemy.engine import Engine
 
 from src.data import db
+from src.data.db import LOAD_SOURCE, OFFICIAL_SOURCE
+from src.models.registry import REGISTERED_MODEL_NAME as MODEL_NAME
+from src.monitoring import metrics
+from src.monitoring.metrics import MIN_WINDOW_HOURS, compute_metrics
 
-# Registered model name - the same value ``src.models.registry`` promotes under.
-MODEL_NAME = "germany-load-day-ahead"
-LOAD_SOURCE = "smard"
-OFFICIAL_SOURCE = "smard"
-MIN_WINDOW_HOURS = 24  # fewer scored hours than this -> a window is not judged
+__all__ = ["MIN_WINDOW_HOURS", "MODEL_NAME", "compute_metrics"]
 
 
-# --------------------------------------------------------------------------- #
-# Engine
-# --------------------------------------------------------------------------- #
+# --- Engine ---
 def make_engine(database_url: str | None = None) -> Engine:
     """Engine for the dashboard: on Postgres every transaction is opened read-only."""
     url = db.normalize_database_url(database_url) if database_url else None
@@ -51,21 +49,7 @@ def describe_database(database_url: str) -> str:
     return f"{u.drivername.split('+')[0]} · {host}/{u.database}"
 
 
-# --------------------------------------------------------------------------- #
-# Metrics
-# --------------------------------------------------------------------------- #
-def mae(actual: pd.Series, forecast: pd.Series) -> float:
-    return float(np.mean(np.abs(forecast.to_numpy() - actual.to_numpy())))
-
-
-def mape(actual: pd.Series, forecast: pd.Series) -> float:
-    yt = actual.to_numpy(dtype="float64")
-    return float(np.mean(np.abs(forecast.to_numpy() - yt) / np.abs(yt)) * 100.0)
-
-
-# --------------------------------------------------------------------------- #
-# Champion + coverage (headline KPIs)
-# --------------------------------------------------------------------------- #
+# --- Champion + coverage (headline KPIs) ---
 def champion(engine: Engine, name: str = MODEL_NAME) -> dict[str, Any] | None:
     """The exported champion version with its parsed CV metrics, or None before bootstrap."""
     versions = db.list_model_artifacts(engine, name)
@@ -124,13 +108,10 @@ def _min_timestamp(engine: Engine, model: type[db.Base], **filters: Any) -> pd.T
         value = conn.execute(stmt).scalar()
     if value is None:
         return None
-    ts = pd.Timestamp(value)
-    return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+    return db.to_utc(value)
 
 
-# --------------------------------------------------------------------------- #
-# Latest day-ahead forecast vs actuals
-# --------------------------------------------------------------------------- #
+# --- Latest day-ahead forecast vs actuals ---
 def latest_forecast_frame(engine: Engine, *, context_hours: int = 48) -> pd.DataFrame:
     """The most recently issued forecast with actuals and the official forecast on the same hours.
 
@@ -166,105 +147,40 @@ def latest_forecast_frame(engine: Engine, *, context_hours: int = 48) -> pd.Data
     return out[cols]
 
 
-# --------------------------------------------------------------------------- #
-# Accuracy over time: model vs the official forecast
-# --------------------------------------------------------------------------- #
+# --- Accuracy over time: model vs the official forecast (shared with monitoring) ---
 def aligned_frame(engine: Engine, *, days: int, as_of: pd.Timestamp | None = None) -> pd.DataFrame:
-    """Hours in the last ``days`` where actual, model and official forecast all exist.
-
-    When a forecast hour was issued more than once (re-runs, a new champion), the
-    most recently issued value counts - exactly what the monitoring job scores.
-    """
+    """Hours in the last ``days`` where actual, model and official forecast all exist."""
     as_of = as_of if as_of is not None else pd.Timestamp.now(tz="UTC").floor("h")
-    start = as_of - pd.Timedelta(days=days)
-    cols = ["timestamp_utc", "actual_mw", "model_mw", "official_mw", "model_version"]
-    model = db.read_table(engine, db.LoadForecastModel, start=start, end=as_of)
-    if model.empty:
-        return pd.DataFrame(columns=cols)
-    actual = db.read_load(engine, source=LOAD_SOURCE, start=start, end=as_of).rename(
-        columns={"load_mw": "actual_mw"}
-    )
-    official = db.read_table(
-        engine, db.LoadForecastOfficial, start=start, end=as_of, source=OFFICIAL_SOURCE
-    ).rename(columns={"forecast_mw": "official_mw"})[["timestamp_utc", "official_mw"]]
-    model = (
-        model.sort_values(["timestamp_utc", "issued_at"])
-        .drop_duplicates("timestamp_utc", keep="last")
-        .rename(columns={"forecast_mw": "model_mw"})[["timestamp_utc", "model_mw", "model_version"]]
-    )
-    out = actual.merge(model, on="timestamp_utc").merge(official, on="timestamp_utc")
-    return out.sort_values("timestamp_utc").reset_index(drop=True)[cols]
+    return metrics.aligned_frame(engine, start=as_of - pd.Timedelta(days=days), end=as_of)
 
 
-def window_summary(aligned: pd.DataFrame, *, days: int) -> dict[str, Any]:
-    """Head-to-head over the last ``days`` of the aligned frame (None metrics if too few hours)."""
-    if aligned.empty:
-        win = aligned
-    else:
-        start = aligned["timestamp_utc"].max() - pd.Timedelta(days=days)
-        win = aligned[aligned["timestamp_utc"] > start]
-    out: dict[str, Any] = {"days": days, "n_hours": len(win), "judged": False}
-    if len(win) < MIN_WINDOW_HOURS:
-        return out
-    m_mae, o_mae = mae(win["actual_mw"], win["model_mw"]), mae(win["actual_mw"], win["official_mw"])
-    out.update(
-        judged=True,
-        model_mae=m_mae,
-        official_mae=o_mae,
-        model_mape=mape(win["actual_mw"], win["model_mw"]),
-        official_mape=mape(win["actual_mw"], win["official_mw"]),
-        model_beats_official=bool(m_mae < o_mae),
-        improvement_pct=float((o_mae - m_mae) / o_mae * 100.0),
-    )
+def window_summary(
+    aligned: pd.DataFrame, *, days: int, as_of: pd.Timestamp | None = None
+) -> dict[str, Any]:
+    """Head-to-head over ``(as_of - days, as_of]`` - the window the monitoring job scores."""
+    as_of = as_of if as_of is not None else pd.Timestamp.now(tz="UTC").floor("h")
+    wm = metrics.window_metrics(aligned, as_of, days)
+    out: dict[str, Any] = {"days": days, "n_hours": wm.n_hours, "judged": wm.judged}
+    if wm.judged:
+        skip = {"window_days", "start", "end", "n_hours"}
+        out.update({k: v for k, v in asdict(wm).items() if k not in skip})
     return out
 
 
 def daily_accuracy(aligned: pd.DataFrame) -> pd.DataFrame:
     """Per UTC day: MAE / MAPE of model and official forecast plus hours scored."""
-    cols = ["date", "n_hours", "model_mae", "model_mape", "official_mae", "official_mape"]
-    if aligned.empty:
-        return pd.DataFrame(columns=cols)
-    rows = []
-    for date, g in aligned.groupby(aligned["timestamp_utc"].dt.floor("D"), sort=True):
-        rows.append(
-            {
-                "date": date,
-                "n_hours": len(g),
-                "model_mae": mae(g["actual_mw"], g["model_mw"]),
-                "model_mape": mape(g["actual_mw"], g["model_mw"]),
-                "official_mae": mae(g["actual_mw"], g["official_mw"]),
-                "official_mape": mape(g["actual_mw"], g["official_mw"]),
-            }
-        )
-    return pd.DataFrame(rows, columns=cols)
+    return metrics.daily_metrics(aligned)
 
 
-def official_only_summary(engine: Engine, *, days: int, as_of: pd.Timestamp | None = None) -> dict:
-    """The official forecast scored alone over the last ``days`` - the bar to beat.
-
-    Available from day one because the official forecast is ingested with the
-    actuals, long before the model's live history exists.
-    """
+def official_only_summary(
+    engine: Engine, *, days: int, as_of: pd.Timestamp | None = None
+) -> dict[str, Any]:
+    """The official forecast scored alone over the last ``days`` - the bar to beat."""
     as_of = as_of if as_of is not None else pd.Timestamp.now(tz="UTC").floor("h")
-    start = as_of - pd.Timedelta(days=days)
-    actual = db.read_load(engine, source=LOAD_SOURCE, start=start, end=as_of)
-    official = db.read_table(
-        engine, db.LoadForecastOfficial, start=start, end=as_of, source=OFFICIAL_SOURCE
-    )
-    joined = actual.merge(official[["timestamp_utc", "forecast_mw"]], on="timestamp_utc")
-    if len(joined) < MIN_WINDOW_HOURS:
-        return {"days": days, "n_hours": len(joined), "mape": None, "mae": None}
-    return {
-        "days": days,
-        "n_hours": len(joined),
-        "mae": mae(joined["load_mw"], joined["forecast_mw"]),
-        "mape": mape(joined["load_mw"], joined["forecast_mw"]),
-    }
+    return {"days": days, **metrics.official_accuracy(engine, as_of, days)}
 
 
-# --------------------------------------------------------------------------- #
-# Monitoring events: drift signals + retraining timeline
-# --------------------------------------------------------------------------- #
+# --- Monitoring events: drift signals + retraining timeline ---
 def monitoring_events(engine: Engine, *, limit: int = 200) -> pd.DataFrame:
     """Monitoring / retraining events, newest first, with the JSON ``details`` parsed."""
     events = db.read_monitoring_events(engine, limit=limit)

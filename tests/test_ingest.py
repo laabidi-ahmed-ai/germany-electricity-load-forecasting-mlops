@@ -48,9 +48,7 @@ def by_source(results: list[ingest.IngestResult]) -> dict[str, ingest.IngestResu
     return {r.source: r for r in results}
 
 
-# --------------------------------------------------------------------------- #
-# backfill
-# --------------------------------------------------------------------------- #
+# --- backfill ---
 def test_backfill_without_token_loads_smard_and_weather_and_skips_entsoe(engine) -> None:
     clients, _ = make_clients()
     results = by_source(ingest.run_backfill(engine, clients, start="2021-03-21", end="2021-04-05"))
@@ -140,9 +138,7 @@ def test_network_failure_is_contained(engine, monkeypatch) -> None:
     assert results["weather_archive"].status == "ok"
 
 
-# --------------------------------------------------------------------------- #
-# incremental
-# --------------------------------------------------------------------------- #
+# --- incremental ---
 def test_incremental_fetches_only_new_hours_without_duplicates(engine) -> None:
     # Backfill first week only.
     first_week = {DST_WEEK_STARTS_MS[0]: 167}
@@ -213,9 +209,7 @@ def test_incremental_with_token_queries_entsoe_from_latest(engine) -> None:
     assert latest_fc == now + pd.Timedelta(days=2) - pd.Timedelta(hours=1)
 
 
-# --------------------------------------------------------------------------- #
-# CLI
-# --------------------------------------------------------------------------- #
+# --- CLI ---
 def test_cli_backfill_smard_only(tmp_path, monkeypatch) -> None:
     clients, _ = make_clients()
     monkeypatch.setattr(ingest, "Clients", lambda: clients)

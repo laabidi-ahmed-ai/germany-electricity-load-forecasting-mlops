@@ -71,10 +71,6 @@ class Settings(BaseSettings):
             "such as ./mlruns selects MLflow's legacy file store."
         ),
     )
-    data_dir: Path = Field(
-        default=PROJECT_ROOT / "data",
-        description="Local data directory (gitignored, DVC-tracked).",
-    )
 
     # --- target geography & time window ------------------------------------
     bidding_zone: str = Field(
@@ -114,10 +110,6 @@ class Settings(BaseSettings):
     def has_entsoe_token(self) -> bool:
         """True when a real ENTSO-E token is configured (live ingestion available)."""
         return self.entsoe_api_token is not None
-
-    @property
-    def is_postgres(self) -> bool:
-        return self.database_url.startswith(("postgresql", "postgres"))
 
 
 @lru_cache(maxsize=1)

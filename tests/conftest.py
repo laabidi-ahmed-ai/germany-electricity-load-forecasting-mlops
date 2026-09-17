@@ -15,6 +15,7 @@ from urllib.parse import urlencode
 import numpy as np
 import pandas as pd
 import pytest
+import requests
 from sqlalchemy.engine import Engine
 
 from config.settings import Settings, get_settings
@@ -44,9 +45,7 @@ def _isolated_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     get_settings.cache_clear()
 
 
-# --------------------------------------------------------------------------- #
-# Fake HTTP
-# --------------------------------------------------------------------------- #
+# --- Fake HTTP ---
 @dataclass
 class FakeResponse:
     payload: Any
@@ -54,7 +53,7 @@ class FakeResponse:
 
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
-            raise RuntimeError(f"HTTP {self.status_code}")
+            raise requests.HTTPError(f"HTTP {self.status_code}", response=self)
 
     def json(self) -> Any:
         return self.payload
@@ -89,9 +88,7 @@ class FakeSession:
         return FakeResponse(route)
 
 
-# --------------------------------------------------------------------------- #
-# Synthetic SMARD data (modelled on the real DST week of 2021-03-28)
-# --------------------------------------------------------------------------- #
+# --- Synthetic SMARD data (modelled on the real DST week of 2021-03-28) ---
 MS_PER_HOUR = 3_600_000
 
 # Real week-file starts from SMARD around the spring DST switch:
@@ -141,9 +138,7 @@ def smard_routes(
     return routes
 
 
-# --------------------------------------------------------------------------- #
-# Synthetic Open-Meteo data
-# --------------------------------------------------------------------------- #
+# --- Synthetic Open-Meteo data ---
 def open_meteo_payload(start: str, end: str, *, lat: float = 0.0) -> dict:
     times = pd.date_range(start, end, freq="h", tz="UTC")
     n = len(times)
@@ -174,9 +169,7 @@ def open_meteo_route(start: str, end: str) -> Callable[[str, dict[str, Any] | No
     return _route
 
 
-# --------------------------------------------------------------------------- #
-# Database
-# --------------------------------------------------------------------------- #
+# --- Database ---
 @pytest.fixture
 def engine(tmp_path) -> Engine:
     eng = db.get_engine(f"sqlite:///{(tmp_path / 'test.db').as_posix()}")

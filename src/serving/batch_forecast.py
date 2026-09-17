@@ -18,7 +18,7 @@ import sys
 
 import pandas as pd
 
-from config.settings import get_settings
+from config.log import configure_logging
 from src.data import db
 from src.data.weather_client import WeatherClient
 from src.models.registry import load_champion
@@ -54,11 +54,7 @@ def run(
 
 
 def main(argv: list[str] | None = None) -> int:
-    logging.basicConfig(
-        level=get_settings().log_level,
-        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    configure_logging()
     p = argparse.ArgumentParser(prog="python -m src.serving.batch_forecast")
     p.add_argument("--hours", type=int, default=DAY_AHEAD_HOURS)
     p.add_argument("--as-of", default=None, help="pretend the latest actual is at this UTC time")

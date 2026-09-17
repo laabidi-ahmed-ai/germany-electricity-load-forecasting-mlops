@@ -4,10 +4,8 @@ Uses ``entsoe-py`` and requires ``ENTSOE_API_TOKEN``. **Without a token the clie
 never raises**: every fetch logs a notice and returns an empty, correctly-typed
 frame, so the whole pipeline keeps running on SMARD until the token arrives.
 
-Time handling
--------------
 ``entsoe-py`` returns a tz-aware index in the bidding zone's local time at 15-minute
-resolution for ``DE_LU``. We convert to **UTC first** and only then resample to
+resolution for ``DE_LU``. We convert to UTC first and only then resample to
 hourly means, so the DST transitions (23h / 25h local days) are handled by the
 tz-aware arithmetic and never by hand.
 """
@@ -16,23 +14,18 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from datetime import date, datetime
 from typing import Any, Protocol
 
 import pandas as pd
 
 from config.settings import get_settings
+from src.data.db import DateLike, to_utc
 
 log = logging.getLogger(__name__)
-
-DateLike = date | datetime | str | pd.Timestamp
 
 # Column names used by entsoe-py for the two load series.
 _ACTUAL_COL = "Actual Load"
 _FORECAST_COL = "Forecasted Load"
-
-LOAD_COLUMNS = ["timestamp_utc", "load_mw"]
-FORECAST_COLUMNS = ["timestamp_utc", "forecast_mw"]
 
 
 class _PandasClient(Protocol):
@@ -59,11 +52,6 @@ def _empty(columns: list[str]) -> pd.DataFrame:
             columns[1]: pd.Series(dtype="float64"),
         }
     )
-
-
-def _to_utc(value: DateLike) -> pd.Timestamp:
-    ts = pd.Timestamp(value)
-    return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
 
 
 def _to_hourly_utc(raw: Any, column: str, value_name: str) -> pd.DataFrame:
@@ -127,10 +115,10 @@ class EntsoeClient:
             )
             return _empty(["timestamp_utc", value_name])
 
-        start_ts = _to_utc(start)
-        end_ts = _to_utc(end) if end is not None else pd.Timestamp.now(tz="UTC")
-        if end_ts <= start_ts:
-            raise ValueError(f"end ({end_ts}) must be after start ({start_ts})")
+        start_ts = to_utc(start)
+        end_ts = to_utc(end) if end is not None else pd.Timestamp.now(tz="UTC")
+        if end_ts < start_ts:
+            raise ValueError(f"end ({end_ts}) is before start ({start_ts})")
 
         from entsoe.exceptions import NoMatchingDataError
 

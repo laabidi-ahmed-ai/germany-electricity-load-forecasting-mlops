@@ -1,22 +1,11 @@
-"""Model registry: MLflow for lineage, the database for the champion serving needs.
+"""Model registry: MLflow keeps the lineage, the database keeps the serving copy.
 
-Two stores, one rule
---------------------
-* **MLflow Model Registry** (``germany-load-day-ahead``, alias ``champion``) keeps
-  lineage: every version links to its training run (params, CV metrics, feature
-  list, report). With ``MLFLOW_TRACKING_URI`` pointing at Postgres this survives
-  ephemeral runners - but the logged model *files* only live on the runner that
-  trained them.
-* **``model_artifacts`` table** (``src.data.db.ModelArtifact``) holds, per exported
-  version, the zipped MLflow pyfunc bundle (~3-4 MB) plus the metadata serving
-  needs (features in model order, horizon, train window, CV metrics). Exactly one
-  row per model is flagged ``is_champion``.
-
-``promote(version)`` does both: move the MLflow alias **and** export + flag the
-version in the DB. ``load_champion(engine)`` reads only the DB, so the forecast
-job, the API and the monitor work on a fresh GitHub Actions runner (or in
-Docker) with nothing but ``DATABASE_URL``. Rollback is still one call:
-``promote(<old version>)``.
+The MLflow Model Registry (``germany-load-day-ahead``, alias ``champion``) links every
+version to its training run. Its model files, however, live on whichever runner
+trained them, so ``promote(version)`` also zips the pyfunc bundle into the
+``model_artifacts`` table and flags it ``is_champion``. ``load_champion(engine)`` reads
+only that table, which is why the forecast job, the API and the monitor need nothing
+but ``DATABASE_URL`` (see docs/cloud-setup.md). Rollback is ``promote(<old version>)``.
 
 CLI (``make register``)::
 
@@ -34,7 +23,6 @@ import io
 import json
 import logging
 import sys
-import tempfile
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,7 +32,8 @@ import numpy as np
 import pandas as pd
 from sqlalchemy.engine import Engine
 
-from config.settings import PROJECT_ROOT, get_settings
+from config.log import configure_logging
+from config.settings import PROJECT_ROOT
 from src.data import db
 from src.features.horizons import DAY_AHEAD, HORIZONS, Horizon, select_features
 from src.models.tracking import DEFAULT_EXPERIMENT, setup_mlflow
@@ -103,9 +92,7 @@ class LoadedModel:
             )
 
 
-# --------------------------------------------------------------------------- #
-# MLflow side: register / alias / load a version
-# --------------------------------------------------------------------------- #
+# --- MLflow side: register / alias / load a version ---
 def register_run_model(
     run_id: str, *, name: str = REGISTERED_MODEL_NAME, experiment: str = DEFAULT_EXPERIMENT
 ) -> Any:
@@ -144,59 +131,7 @@ def latest_training_run_id(experiment: str = DEFAULT_EXPERIMENT) -> str:
     return runs[0].info.run_id
 
 
-def champion_version(
-    *,
-    name: str = REGISTERED_MODEL_NAME,
-    alias: str = CHAMPION_ALIAS,
-    experiment: str = DEFAULT_EXPERIMENT,
-) -> Any | None:
-    """The MLflow ModelVersion behind ``name@alias``, or None if nothing is promoted yet."""
-    import mlflow
-    from mlflow.exceptions import MlflowException
-
-    setup_mlflow(experiment)
-    try:
-        return mlflow.MlflowClient().get_model_version_by_alias(name, alias)
-    except MlflowException:
-        return None
-
-
-def load_model_version(
-    version: str | int,
-    *,
-    name: str = REGISTERED_MODEL_NAME,
-    alias: str | None = None,
-    experiment: str = DEFAULT_EXPERIMENT,
-) -> LoadedModel:
-    """Load a version from MLflow (needs its artifact files - i.e. the runner that trained it)."""
-    import mlflow
-
-    setup_mlflow(experiment)
-    client = mlflow.MlflowClient()
-    mv = client.get_model_version(name, str(version))
-    pyfunc = mlflow.pyfunc.load_model(f"models:/{name}/{mv.version}")
-    features = _features_from_signature(pyfunc, f"{name} v{mv.version}")
-    horizon = HORIZONS.get(mv.tags.get("horizon", DAY_AHEAD.name), DAY_AHEAD)
-    train_start, train_end, metrics = _run_metadata(mv.run_id)
-    log.info("loaded %s v%s from MLflow with %d features", name, mv.version, len(features))
-    return LoadedModel(
-        name=name,
-        version=str(mv.version),
-        alias=alias,
-        run_id=mv.run_id,
-        features=features,
-        horizon=horizon,
-        pyfunc=pyfunc,
-        train_start=train_start,
-        train_end=train_end,
-        metrics=metrics,
-        source="mlflow",
-    )
-
-
-# --------------------------------------------------------------------------- #
-# DB side: export / champion pointer / load
-# --------------------------------------------------------------------------- #
+# --- DB side: export / champion pointer / load ---
 def export_model_version(
     engine: Engine,
     version: str | int,
@@ -326,9 +261,7 @@ def training_window(
     return start, end
 
 
-# --------------------------------------------------------------------------- #
-# helpers
-# --------------------------------------------------------------------------- #
+# --- helpers ---
 def _features_from_signature(pyfunc: Any, label: str) -> list[str]:
     schema = pyfunc.metadata.get_input_schema()
     if schema is None or not schema.input_names():
@@ -356,8 +289,7 @@ def _run_metadata(
 def _utc_or_none(value: Any) -> pd.Timestamp | None:
     if value is None or value == "" or (isinstance(value, float) and np.isnan(value)):
         return None
-    ts = pd.Timestamp(value)
-    return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+    return db.to_utc(value)
 
 
 def _zip_dir(directory: Path) -> bytes:
@@ -369,22 +301,9 @@ def _zip_dir(directory: Path) -> bytes:
     return buf.getvalue()
 
 
-def _unzip_to_temp(bundle: bytes) -> Path:  # used by tests / ad-hoc inspection
-    target = Path(tempfile.mkdtemp(prefix="champion-"))
-    with zipfile.ZipFile(io.BytesIO(bundle)) as zf:
-        zf.extractall(target)
-    return target
-
-
-# --------------------------------------------------------------------------- #
-# CLI
-# --------------------------------------------------------------------------- #
+# --- CLI ---
 def main(argv: list[str] | None = None) -> int:
-    logging.basicConfig(
-        level=get_settings().log_level,
-        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    configure_logging()
     p = argparse.ArgumentParser(prog="python -m src.models.registry")
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument(

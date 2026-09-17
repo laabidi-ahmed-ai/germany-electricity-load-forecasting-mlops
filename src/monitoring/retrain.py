@@ -1,28 +1,22 @@
 """Retraining trigger + champion / challenger promotion (README §9).
 
-Triggers (any one fires -> retrain)
------------------------------------
-1. **error**   : rolling 7-day MAPE of the champion's live forecasts > ``mape_threshold_pct``
-2. **official**: over 30 days the official forecast beats the model by more than
-                 ``official_gap_pct`` (we exist to beat the benchmark)
-3. **drift**   : Evidently dataset or prediction drift (``src.monitoring.drift``)
+Any one of three triggers fires a retrain: the champion's rolling 7-day MAPE on its
+live forecasts exceeds ``mape_threshold_pct``; over 30 days the official forecast beats
+the model by more than ``official_gap_pct``; or ``src.monitoring.drift`` flags dataset
+or prediction drift.
 
-Champion / challenger (fair by construction)
---------------------------------------------
-* **holdout**    = data that arrived *after* the champion's ``train_end`` (never seen
-                   by the champion), capped at the last ``holdout_days``. If fewer
-                   than ``min_holdout_hours`` exist the comparison is skipped - a
-                   champion cannot be dethroned on data it was trained on.
-* **candidate**  = LightGBM trained on everything strictly before the holdout, with
-                   the same day-ahead features; scored on the holdout vs the champion.
-* **promotion**  only if the candidate's holdout MAE is at least ``min_improvement_pct``
-                   lower than the champion's (the anti-churn margin). The winner is
-                   then refitted on *all* data, logged with the standard CV report,
-                   registered, and the ``champion`` alias moved. Otherwise: keep.
-* **rollback**   = ``python -m src.models.registry --promote <old version>``.
+Champion / challenger, fair by construction: the holdout is data that arrived after
+the champion's ``train_end`` (capped at ``holdout_days``); with fewer than
+``min_holdout_hours`` the comparison is skipped, because a champion cannot be
+dethroned on data it was trained on. The candidate is a LightGBM trained on everything
+before the holdout with the same day-ahead features. It is promoted only if its
+holdout MAE is at least ``min_improvement_pct`` lower than the champion's (the
+anti-churn margin), in which case it is refitted on all data, logged with the standard
+CV report, registered and aliased. Rollback:
+``python -m src.models.registry --promote <old version>``.
 
-Every decision (trigger evaluation and outcome) is logged to MLflow (tags
-``stage=retrain``, ``decision``, ``reason``) and to the ``monitoring_events`` table.
+Every decision is logged to MLflow (tags ``stage=retrain``, ``decision``, ``reason``)
+and to the ``monitoring_events`` table.
 
 CLI::
 
@@ -43,7 +37,7 @@ from typing import Any
 import pandas as pd
 from sqlalchemy.engine import Engine
 
-from config.settings import get_settings
+from config.log import configure_logging
 from src.data import db
 from src.features.build_features import TARGET, build_features
 from src.features.horizons import DAY_AHEAD, select_features
@@ -135,9 +129,7 @@ class TriggerDecision:
         }
 
 
-# --------------------------------------------------------------------------- #
-# Trigger evaluation
-# --------------------------------------------------------------------------- #
+# --- Trigger evaluation ---
 def evaluate_triggers(
     engine: Engine,
     champion: LoadedModel,
@@ -147,7 +139,7 @@ def evaluate_triggers(
     frame: pd.DataFrame | None = None,
     drift_runner: drift_mod.Runner = drift_mod.run_evidently,
 ) -> TriggerDecision:
-    as_of = _utc(as_of) if as_of is not None else pd.Timestamp.now(tz="UTC").floor("h")
+    as_of = db.to_utc(as_of) if as_of is not None else pd.Timestamp.now(tz="UTC").floor("h")
     checks: list[Check] = []
 
     # 1 + 2: live performance of the champion's stored forecasts
@@ -244,9 +236,7 @@ def evaluate_triggers(
     return decision
 
 
-# --------------------------------------------------------------------------- #
-# Champion / challenger
-# --------------------------------------------------------------------------- #
+# --- Champion / challenger ---
 @dataclass
 class ChallengerOutcome:
     decision: str  # promoted | kept | skipped
@@ -300,7 +290,7 @@ def run_champion_challenger(
     dry_run: bool = False,
 ) -> ChallengerOutcome:
     frame = frame if frame is not None else build_features(engine, output=None)
-    as_of = _utc(as_of) if as_of is not None else frame.index.max()
+    as_of = db.to_utc(as_of) if as_of is not None else frame.index.max()
     frame = frame[frame.index <= as_of]
     cols = select_features(frame.columns, DAY_AHEAD)
     champion.check_features(list(frame.columns))
@@ -378,9 +368,7 @@ def run_champion_challenger(
     return outcome
 
 
-# --------------------------------------------------------------------------- #
-# Logging of decisions
-# --------------------------------------------------------------------------- #
+# --- Logging of decisions ---
 def log_decision(
     decision: TriggerDecision,
     outcome: ChallengerOutcome | None,
@@ -398,7 +386,6 @@ def log_decision(
             {
                 "stage": "retrain",
                 "kind": kind,
-                "phase": "5",
                 "champion_version": decision.champion_version,
                 "triggered": str(decision.triggered),
                 "decision": outcome.decision if outcome else "check-only",
@@ -440,9 +427,12 @@ def log_decision(
 
 
 def record_event(
-    engine: Engine, decision: TriggerDecision, outcome: ChallengerOutcome | None
+    engine: Engine,
+    decision: TriggerDecision,
+    outcome: ChallengerOutcome | None,
+    cfg: RetrainConfig = DEFAULT_CONFIG,
 ) -> int:
-    w7 = decision.performance.window(7) if decision.performance else None
+    w7 = decision.performance.window(cfg.error_window_days) if decision.performance else None
     return db.insert_monitoring_event(
         engine,
         as_of=decision.as_of.to_pydatetime(),
@@ -461,20 +451,9 @@ def record_event(
     )
 
 
-def _utc(value: Any) -> pd.Timestamp:
-    ts = pd.Timestamp(value)
-    return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
-
-
-# --------------------------------------------------------------------------- #
-# CLI
-# --------------------------------------------------------------------------- #
+# --- CLI ---
 def main(argv: list[str] | None = None) -> int:
-    logging.basicConfig(
-        level=get_settings().log_level,
-        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    configure_logging()
     p = argparse.ArgumentParser(prog="python -m src.monitoring.retrain")
     p.add_argument("--check-only", action="store_true", help="evaluate triggers, never retrain")
     p.add_argument(
@@ -531,7 +510,7 @@ def main(argv: list[str] | None = None) -> int:
     elif not args.check_only:
         print("\nNo trigger fired - champion kept, nothing retrained.")
 
-    record_event(engine, decision, outcome)
+    record_event(engine, decision, outcome, cfg)
     if not args.no_mlflow:
         print(f"\nMLflow run: {log_decision(decision, outcome, cfg)}")
     return 0

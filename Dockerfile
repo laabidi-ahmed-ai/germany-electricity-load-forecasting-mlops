@@ -2,11 +2,11 @@
 # Serving image: FastAPI day-ahead forecast API (also runs the batch job).
 #
 #   docker build -t germany-load-api .
-#   docker run --rm -p 8000:8000 --env-file .env \
-#       -v "$PWD/mlruns:/app/mlruns" -v "$PWD/data:/app/data" germany-load-api
+#   docker run --rm -p 8000:8000 --env-file .env -v "$PWD/data:/app/data" germany-load-api
 #
-# The MLflow store (model registry) and the local SQLite DB live in mounted
-# volumes; in the cloud they are replaced by DATABASE_URL / MLFLOW_TRACKING_URI.
+# The champion is loaded from the database (model_artifacts table), so the container
+# needs only DATABASE_URL. The data/ mount holds the local SQLite DB and the unpacked
+# model cache; nothing depends on an MLflow store at runtime.
 # ---------------------------------------------------------------------------
 FROM python:3.11-slim AS base
 
@@ -30,9 +30,9 @@ COPY config ./config
 COPY dashboard ./dashboard
 RUN pip install --upgrade pip && pip install .
 
-# Non-root runtime user; data/ and mlruns/ are mounted volumes.
+# Non-root runtime user; data/ is a mounted volume.
 RUN useradd --create-home --uid 1000 app \
-    && mkdir -p /app/data /app/mlruns \
+    && mkdir -p /app/data \
     && chown -R app:app /app
 USER app
 

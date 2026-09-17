@@ -114,7 +114,7 @@ def test_no_matching_data_returns_empty(caplog: pytest.LogCaptureFixture) -> Non
     assert "no data" in caplog.text
 
 
-def test_end_not_after_start_raises() -> None:
+def test_end_before_start_raises() -> None:
     client = EntsoeClient(token="t", client_factory=lambda _: FakePandasClient())
-    with pytest.raises(ValueError, match="must be after"):
+    with pytest.raises(ValueError, match="before start"):
         client.fetch_actual_load("2024-01-02", "2024-01-01")

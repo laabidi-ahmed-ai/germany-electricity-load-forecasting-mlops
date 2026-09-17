@@ -1,16 +1,14 @@
 """Ingestion pipeline + CLI.
 
-Modes
------
-* ``--backfill``  pull the full history from ``DATA_START_DATE`` (or ``--start``)
-                  for every requested source and upsert it into the database.
-* *(default)*     incremental: pull only what is new since the latest stored hour
-                  (re-fetching a small overlap window - upserts make that safe).
+``--backfill`` pulls the full history from ``DATA_START_DATE`` (or ``--start``) for
+every requested source; the default, incremental mode pulls only what is new since the
+latest stored hour, re-fetching a small overlap window (upserts make that safe).
 
-Sources: ``smard`` (actual load **and** the official day-ahead load forecast, both
+Sources: ``smard`` (actual load and the official day-ahead load forecast, both
 keyless), ``weather`` (Open-Meteo, keyless) and ``entsoe`` (actual load + official
-forecast as a second source; silently skipped without a token). Each source is validated before it is written and runs independently, so
-one failing source never blocks the others.
+forecast as a second source; silently skipped without a token). Each source is
+validated before it is written and runs independently, so one failing source never
+blocks the others.
 
 Examples::
 
@@ -24,26 +22,28 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import date
+from typing import Any
 
 import pandas as pd
 from sqlalchemy.engine import Engine
 
+from config.log import configure_logging
 from config.settings import get_settings
 from src.data import db
 from src.data.entsoe_client import EntsoeClient
-from src.data.smard_client import SmardClient, to_utc_timestamp
+from src.data.smard_client import SmardClient
 from src.data.validation import DataValidationError, validate_load, validate_weather
 from src.data.weather_client import SOURCE_ARCHIVE, WeatherClient
 
 log = logging.getLogger(__name__)
 
-ALL_SOURCES: tuple[str, ...] = ("smard", "weather", "entsoe")
-
-SOURCE_SMARD = "smard"
-SOURCE_ENTSOE = "entsoe"
+SOURCE_SMARD = db.SOURCE_SMARD
+SOURCE_ENTSOE = db.SOURCE_ENTSOE
+SOURCE_WEATHER = "weather"
+ALL_SOURCES: tuple[str, ...] = (SOURCE_SMARD, SOURCE_WEATHER, SOURCE_ENTSOE)
 
 # How far back an incremental run re-fetches, to pick up late corrections.
 LOAD_OVERLAP = pd.Timedelta(hours=48)
@@ -79,9 +79,7 @@ def _span(df: pd.DataFrame) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
     return df["timestamp_utc"].min(), df["timestamp_utc"].max()
 
 
-# --------------------------------------------------------------------------- #
-# Per-source ingestion steps
-# --------------------------------------------------------------------------- #
+# --- Per-source ingestion steps ---
 def ingest_smard(
     engine: Engine, client: SmardClient, start: pd.Timestamp, end: pd.Timestamp | None = None
 ) -> IngestResult:
@@ -175,10 +173,10 @@ def ingest_entsoe(
     return results
 
 
-# --------------------------------------------------------------------------- #
-# Modes
-# --------------------------------------------------------------------------- #
-def _guard(source: str, fn, *args, **kwargs) -> list[IngestResult]:
+# --- Modes ---
+def _guard(
+    source: str, fn: Callable[..., IngestResult | list[IngestResult]], *args: Any, **kwargs: Any
+) -> list[IngestResult]:
     """Run one ingestion step; convert any failure into a ``failed`` result."""
     try:
         out = fn(*args, **kwargs)
@@ -201,23 +199,23 @@ def run_backfill(
 ) -> list[IngestResult]:
     """Pull full history from ``start`` (default ``DATA_START_DATE``) for ``sources``."""
     settings = get_settings()
-    start_ts = to_utc_timestamp(start or settings.data_start_date)
-    end_ts = to_utc_timestamp(end) if end is not None else None
+    start_ts = db.to_utc(start or settings.data_start_date)
+    end_ts = db.to_utc(end) if end is not None else None
     log.info("=== backfill %s -> %s | sources=%s", start_ts, end_ts or "now", ",".join(sources))
 
     db.init_db(engine)
     results: list[IngestResult] = []
-    if "smard" in sources:
+    if SOURCE_SMARD in sources:
         results += _guard("smard", ingest_smard, engine, clients.smard, start_ts, end_ts)
         fc_end = end_ts if end_ts is not None else pd.Timestamp.now(tz="UTC") + pd.Timedelta(days=2)
         results += _guard(
             "smard_forecast", ingest_smard_forecast, engine, clients.smard, start_ts, fc_end
         )
-    if "weather" in sources:
+    if SOURCE_WEATHER in sources:
         results += _guard(
             "weather_archive", ingest_weather_history, engine, clients.weather, start_ts, end_ts
         )
-    if "entsoe" in sources:
+    if SOURCE_ENTSOE in sources:
         results += _guard("entsoe", ingest_entsoe, engine, clients.entsoe, start_ts, end_ts)
     return results
 
@@ -232,13 +230,13 @@ def run_incremental(
     """Pull only new hours since the latest stored timestamp per source."""
     settings = get_settings()
     now_ts = now or pd.Timestamp.now(tz="UTC")
-    default_start = to_utc_timestamp(settings.data_start_date)
+    default_start = db.to_utc(settings.data_start_date)
     log.info("=== incremental ingestion at %s | sources=%s", now_ts, ",".join(sources))
 
     db.init_db(engine)
     results: list[IngestResult] = []
 
-    if "smard" in sources:
+    if SOURCE_SMARD in sources:
         latest = db.latest_timestamp(engine, db.LoadActual, source=SOURCE_SMARD)
         start = (latest - LOAD_OVERLAP) if latest is not None else default_start
         results += _guard("smard", ingest_smard, engine, clients.smard, start, now_ts)
@@ -253,7 +251,7 @@ def run_incremental(
             now_ts + pd.Timedelta(days=2),  # tomorrow's forecast is already published
         )
 
-    if "weather" in sources:
+    if SOURCE_WEATHER in sources:
         latest = db.latest_timestamp(engine, db.WeatherHourly, source=SOURCE_ARCHIVE)
         start = (latest - WEATHER_ARCHIVE_OVERLAP) if latest is not None else default_start
         results += _guard(
@@ -261,7 +259,7 @@ def run_incremental(
         )
         results += _guard("weather_forecast", ingest_weather_forecast, engine, clients.weather)
 
-    if "entsoe" in sources:
+    if SOURCE_ENTSOE in sources:
         latest_actual = db.latest_timestamp(engine, db.LoadActual, source=SOURCE_ENTSOE)
         latest_fc = db.latest_timestamp(engine, db.LoadForecastOfficial, source=SOURCE_ENTSOE)
         a_start = (latest_actual - LOAD_OVERLAP) if latest_actual is not None else default_start
@@ -287,9 +285,7 @@ def summarize(results: Sequence[IngestResult]) -> str:
     return "\n".join(lines)
 
 
-# --------------------------------------------------------------------------- #
-# CLI
-# --------------------------------------------------------------------------- #
+# --- CLI ---
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="python -m src.data.ingest",
@@ -309,12 +305,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    settings = get_settings()
-    logging.basicConfig(
-        level=settings.log_level,
-        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    configure_logging()
     args = build_parser().parse_args(argv)
 
     sources = tuple(s.strip().lower() for s in args.sources.split(",") if s.strip())

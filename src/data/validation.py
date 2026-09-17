@@ -10,7 +10,7 @@ Checks on hourly load frames (``[timestamp_utc, load_mw]``):
 * time gaps > 1 hour are reported (as warnings: SMARD publishes with a lag and
   occasionally misses hours; gaps are handled downstream in feature engineering)
 
-Gaps are measured on the **UTC** axis, so the 23-hour / 25-hour local DST days
+Gaps are measured on the UTC axis, so the 23-hour / 25-hour local DST days
 are *not* gaps or duplicates - only genuinely missing hours are.
 """
 

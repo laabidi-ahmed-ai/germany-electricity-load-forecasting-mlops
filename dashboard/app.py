@@ -17,11 +17,11 @@ from typing import Any
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from sqlalchemy.engine import Engine
 
+# `streamlit run dashboard/app.py` puts only dashboard/ on the path.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-if (
-    str(PROJECT_ROOT) not in sys.path
-):  # `streamlit run dashboard/app.py` puts only dashboard/ on the path
+if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from config.settings import get_settings  # noqa: E402
@@ -39,9 +39,7 @@ PLOT_TEMPLATE = "plotly_white"
 NA = "–"  # noqa: RUF001 - en dash shown for missing values
 
 
-# --------------------------------------------------------------------------- #
-# Data access (cached per database URL)
-# --------------------------------------------------------------------------- #
+# --- Data access (cached per database URL) ---
 def resolve_database_url() -> str:
     """Streamlit secret first (Community Cloud), then the environment / ``.env`` / default."""
     try:
@@ -52,7 +50,7 @@ def resolve_database_url() -> str:
 
 
 @st.cache_resource(show_spinner=False)
-def engine_for(url: str):
+def engine_for(url: str) -> Engine:
     return q.make_engine(url)
 
 
@@ -70,12 +68,13 @@ def load_latest_forecast(url: str) -> pd.DataFrame:
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def load_accuracy(url: str, days: int) -> dict[str, Any]:
     eng = engine_for(url)
-    aligned = q.aligned_frame(eng, days=days)
+    as_of = pd.Timestamp.now(tz="UTC").floor("h")
+    aligned = q.aligned_frame(eng, days=days, as_of=as_of)
     return {
         "aligned": aligned,
         "daily": q.daily_accuracy(aligned),
-        "windows": [q.window_summary(aligned, days=d) for d in (7, 30)],
-        "official_only": q.official_only_summary(eng, days=30),
+        "windows": [q.window_summary(aligned, days=d, as_of=as_of) for d in (7, 30)],
+        "official_only": q.official_only_summary(eng, days=30, as_of=as_of),
     }
 
 
@@ -90,9 +89,7 @@ def load_monitoring(url: str) -> dict[str, Any]:
     }
 
 
-# --------------------------------------------------------------------------- #
-# Formatting helpers
-# --------------------------------------------------------------------------- #
+# --- Formatting helpers ---
 def fmt_ts(ts: pd.Timestamp | None, tz: str, fmt: str = "%Y-%m-%d %H:%M") -> str:
     if ts is None or pd.isna(ts):
         return NA
@@ -120,9 +117,7 @@ def to_tz(series: pd.Series, tz: str) -> pd.Series:
     return series.dt.tz_convert(tz)
 
 
-# --------------------------------------------------------------------------- #
-# Panels
-# --------------------------------------------------------------------------- #
+# --- Panels ---
 def panel_headline(head: dict[str, Any], acc: dict[str, Any], tz: str) -> None:
     champ, cov = head["champion"], head["coverage"]
     w7 = next(w for w in acc["windows"] if w["days"] == 7)
@@ -235,10 +230,9 @@ def panel_forecast(frame: pd.DataFrame, tz: str) -> None:
         f"Issued {fmt_ts(issued, tz)} · {len(window)} hours · {len(scored)} already have actuals"
     ]
     if len(scored) >= 1:
-        parts.append(
-            f"so far: model MAE {fmt_mw(q.mae(scored['actual_mw'], scored['model_mw']))} · "
-            f"official MAE {fmt_mw(q.mae(scored['actual_mw'], scored['official_mw']))}"
-        )
+        model_mae = q.compute_metrics(scored["actual_mw"], scored["model_mw"])["mae"]
+        official_mae = q.compute_metrics(scored["actual_mw"], scored["official_mw"])["mae"]
+        parts.append(f"so far: model MAE {fmt_mw(model_mae)} · official MAE {fmt_mw(official_mae)}")
     st.caption(" — ".join(parts))
 
 
@@ -482,9 +476,7 @@ def panel_monitoring(mon: dict[str, Any], tz: str) -> None:
         )
 
 
-# --------------------------------------------------------------------------- #
-# Page
-# --------------------------------------------------------------------------- #
+# --- Page ---
 def main() -> None:
     st.set_page_config(page_title="Germany load forecast", page_icon="⚡", layout="wide")
     url = resolve_database_url()
@@ -505,12 +497,11 @@ def main() -> None:
             st.cache_data.clear()
         st.caption(f"Source: {q.describe_database(url)} · cached {CACHE_TTL_SECONDS // 60} min")
 
+    # A broken URL or unreachable host should read as a message, not a traceback.
     try:
         head = load_headline(url)
         acc = load_accuracy(url, days)
-    except (
-        Exception
-    ) as exc:  # a broken URL / unreachable host should read as a message, not a traceback
+    except Exception as exc:
         st.error(f"Could not read the database: {exc}")
         st.stop()
 

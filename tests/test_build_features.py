@@ -20,7 +20,6 @@ from src.features.build_features import (
     expanding_window_splits,
     feature_columns,
     make_calendar_features,
-    time_split,
 )
 
 N_HOURS = 24 * 30  # 30 days
@@ -52,9 +51,7 @@ def weather(load) -> pd.DataFrame:
     return synthetic_weather(load)
 
 
-# --------------------------------------------------------------------------- #
-# Lags & rolling
-# --------------------------------------------------------------------------- #
+# --- Lags & rolling ---
 def test_lags_are_exact_time_offsets(load) -> None:
     df = build_feature_frame(load, dropna=False)
     s = load.set_index("timestamp_utc")[TARGET]
@@ -114,9 +111,7 @@ def test_dropna_removes_rows_without_full_history(load, weather) -> None:
     assert not df[[TARGET, *bf.lag_and_rolling_columns()]].isna().any().any()
 
 
-# --------------------------------------------------------------------------- #
-# Calendar
-# --------------------------------------------------------------------------- #
+# --- Calendar ---
 def test_calendar_uses_berlin_local_time_across_dst() -> None:
     idx = pd.DatetimeIndex(
         [
@@ -178,9 +173,7 @@ def test_cyclical_encodings_are_unit_circle_and_wrap() -> None:
     )
 
 
-# --------------------------------------------------------------------------- #
-# Weather
-# --------------------------------------------------------------------------- #
+# --- Weather ---
 def test_weather_is_joined_on_timestamp_and_missing_hours_are_nan(load, weather) -> None:
     partial = weather.iloc[:-48]  # last two days have no weather
     df = build_feature_frame(load, partial)
@@ -197,9 +190,7 @@ def test_no_weather_gives_nan_columns(load) -> None:
     assert df[list(WEATHER_COLUMNS)].isna().all().all()
 
 
-# --------------------------------------------------------------------------- #
-# LEAKAGE: every feature at hour t depends only on data strictly before t
-# --------------------------------------------------------------------------- #
+# --- LEAKAGE: every feature at hour t depends only on data strictly before t ---
 def _assert_rows_unchanged(a: pd.DataFrame, b: pd.DataFrame, upto: pd.Timestamp, cols) -> None:
     left, right = a.loc[:upto, cols], b.loc[:upto, cols]
     assert left.shape == right.shape
@@ -265,25 +256,7 @@ def test_no_fitted_transform_in_feature_frame(load, weather) -> None:
     pd.testing.assert_frame_equal(full.loc[common], half, check_like=True)
 
 
-# --------------------------------------------------------------------------- #
-# Time-based splits
-# --------------------------------------------------------------------------- #
-def test_time_split_is_chronological_and_disjoint(load, weather) -> None:
-    df = build_feature_frame(load, weather)
-    split = time_split(df, train_end="2024-03-20", val_end="2024-03-25")
-
-    assert len(split.train) + len(split.val) + len(split.test) == len(df)
-    assert split.train.index.max() < split.val.index.min()
-    assert split.val.index.max() < split.test.index.min()
-    assert split.train.index.max() < pd.Timestamp("2024-03-20T00:00Z")
-    assert split.val.index.min() == pd.Timestamp("2024-03-20T00:00Z")
-    assert split.test.index.min() == pd.Timestamp("2024-03-25T00:00Z")
-    assert split.train.index.is_monotonic_increasing
-
-    with pytest.raises(ValueError, match="before val_end"):
-        time_split(df, "2024-03-25", "2024-03-20")
-
-
+# --- Time-based splits ---
 def test_expanding_window_folds_grow_and_never_overlap(load, weather) -> None:
     df = build_feature_frame(load, weather)
     folds = list(
@@ -308,9 +281,7 @@ def test_expanding_window_refuses_too_little_training_data(load, weather) -> Non
         list(expanding_window_splits(df, n_splits=2, val_hours=24, min_train_hours=10_000))
 
 
-# --------------------------------------------------------------------------- #
-# End-to-end from the database + parquet
-# --------------------------------------------------------------------------- #
+# --- End-to-end from the database + parquet ---
 def test_build_features_from_db_and_persist(engine, tmp_path, load) -> None:
     db.upsert_dataframe(engine, db.LoadActual, load.assign(source="smard"))
     per_city = []

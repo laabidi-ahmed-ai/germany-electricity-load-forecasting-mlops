@@ -2,9 +2,9 @@
 
 Two endpoints are used:
 
-* **archive** (``archive-api.open-meteo.com/v1/archive``) - reanalysis history,
+* archive (``archive-api.open-meteo.com/v1/archive``) - reanalysis history,
   available from 1940 up to a few days ago. Used for the backfill.
-* **forecast** (``api.open-meteo.com/v1/forecast``) - recent observations plus the
+* forecast (``api.open-meteo.com/v1/forecast``) - recent observations plus the
   next days' forecast (``past_days`` / ``forecast_days``). Used for incremental
   updates and for building the day-ahead feature rows.
 
@@ -18,13 +18,13 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import date, datetime
 
 import pandas as pd
 import requests
 
 from config.settings import get_settings
 from src.data._http import get_json, make_session
+from src.data.db import DateLike
 
 log = logging.getLogger(__name__)
 
@@ -58,8 +58,6 @@ WEATHER_COLUMNS = ["timestamp_utc", "city", "source", *WEATHER_VARS]
 
 SOURCE_ARCHIVE = "archive"
 SOURCE_FORECAST = "forecast"
-
-DateLike = date | datetime | str | pd.Timestamp
 
 
 def empty_weather_frame() -> pd.DataFrame:

@@ -1,21 +1,15 @@
 """Performance monitoring: model vs actuals vs the official day-ahead forecast.
 
-Live report (``compute_report``)
---------------------------------
-Once actuals for a forecast hour arrive, the model's stored day-ahead forecast
-(``load_forecast_model``) and the official forecast (``load_forecast_official``)
-are scored against ``load_actual`` on **exactly the same aligned hours** (inner
-join of the three tables), over rolling 7-day and 30-day windows ending at
-``as_of``. MAE / MAPE for both, and whether the model beats the official
-forecast. Also a per-day series for the dashboard.
+``compute_report`` scores the model's stored day-ahead forecast and the official
+forecast against the actuals on exactly the same hours (inner join of the three
+tables) over rolling 7-day and 30-day windows ending at ``as_of``, plus a per-day
+series for the dashboard. The metric code is shared with the dashboard in
+``src.monitoring.metrics``.
 
-Out-of-sample backtest (``backtest_vs_official``)
--------------------------------------------------
-The live table only starts filling the day the batch job first ran. To compare
-against the official forecast *honestly* before that history exists, train a
-LightGBM on all data strictly before the last ``days`` days, predict that window
-with day-ahead features, and score it against the official forecast on the same
-hours. Never uses the champion itself (which has seen those hours).
+``backtest_vs_official`` covers the time before live history exists: it trains a
+LightGBM on all data strictly before the last ``days`` days, predicts that window with
+day-ahead features and scores it against the official forecast on the same hours. It
+never uses the champion itself, which has seen those hours.
 
 CLI::
 
@@ -33,124 +27,24 @@ from typing import Any
 import pandas as pd
 from sqlalchemy.engine import Engine
 
-from config.settings import get_settings
+from config.log import configure_logging
 from src.data import db
+from src.data.db import OFFICIAL_SOURCE
 from src.features.build_features import TARGET, build_features
 from src.features.horizons import DAY_AHEAD, select_features
-from src.models.evaluate import compute_metrics
+from src.monitoring.metrics import (
+    MIN_WINDOW_HOURS,
+    WindowMetrics,
+    aligned_frame,
+    daily_metrics,
+    official_accuracy,
+    score_pair,
+    window_metrics,
+)
 
 log = logging.getLogger(__name__)
 
 WINDOWS_DAYS: tuple[int, ...] = (7, 30)
-OFFICIAL_SOURCE = "smard"  # tokenless benchmark; "entsoe" once the token is in
-LOAD_SOURCE = "smard"
-MIN_WINDOW_HOURS = 24  # fewer aligned hours than this -> window not judged
-
-
-# --------------------------------------------------------------------------- #
-# Data alignment
-# --------------------------------------------------------------------------- #
-def aligned_frame(
-    engine: Engine,
-    *,
-    start: pd.Timestamp | None = None,
-    end: pd.Timestamp | None = None,
-    model_version: str | None = None,
-    official_source: str = OFFICIAL_SOURCE,
-    load_source: str = LOAD_SOURCE,
-) -> pd.DataFrame:
-    """``[timestamp_utc, actual_mw, model_mw, official_mw, model_version]`` on common hours.
-
-    With ``model_version=None`` the most recently *issued* forecast per hour is used.
-    """
-    actual = db.read_load(engine, source=load_source, start=start, end=end).rename(
-        columns={TARGET: "actual_mw"}
-    )
-    filters = {"model_version": model_version} if model_version else {}
-    model = db.read_table(engine, db.LoadForecastModel, start=start, end=end, **filters)
-    official = db.read_table(
-        engine, db.LoadForecastOfficial, start=start, end=end, source=official_source
-    ).rename(columns={"forecast_mw": "official_mw"})[["timestamp_utc", "official_mw"]]
-
-    if model.empty or actual.empty or official.empty:
-        return pd.DataFrame(
-            columns=["timestamp_utc", "actual_mw", "model_mw", "official_mw", "model_version"]
-        )
-    model = (
-        model.sort_values(["timestamp_utc", "issued_at"])
-        .drop_duplicates("timestamp_utc", keep="last")
-        .rename(columns={"forecast_mw": "model_mw"})[["timestamp_utc", "model_mw", "model_version"]]
-    )
-    out = actual.merge(model, on="timestamp_utc").merge(official, on="timestamp_utc")
-    cols = ["timestamp_utc", "actual_mw", "model_mw", "official_mw", "model_version"]
-    return out.sort_values("timestamp_utc").reset_index(drop=True)[cols]
-
-
-# --------------------------------------------------------------------------- #
-# Metrics
-# --------------------------------------------------------------------------- #
-@dataclass
-class WindowMetrics:
-    window_days: int
-    start: pd.Timestamp
-    end: pd.Timestamp
-    n_hours: int
-    model_mae: float | None = None
-    model_mape: float | None = None
-    official_mae: float | None = None
-    official_mape: float | None = None
-    model_beats_official: bool | None = None
-    improvement_pct: float | None = None  # +x% = model MAE is x% lower than official
-
-    @property
-    def judged(self) -> bool:
-        return self.model_mae is not None
-
-
-def _score(aligned: pd.DataFrame) -> dict[str, float]:
-    m = compute_metrics(aligned["actual_mw"], aligned["model_mw"])
-    o = compute_metrics(aligned["actual_mw"], aligned["official_mw"])
-    return {
-        "model_mae": m["mae"],
-        "model_mape": m["mape"],
-        "official_mae": o["mae"],
-        "official_mape": o["mape"],
-        "model_beats_official": bool(m["mae"] < o["mae"]),
-        "improvement_pct": float((o["mae"] - m["mae"]) / o["mae"] * 100.0),
-    }
-
-
-def window_metrics(aligned: pd.DataFrame, as_of: pd.Timestamp, days: int) -> WindowMetrics:
-    start = as_of - pd.Timedelta(days=days)
-    win = aligned[(aligned["timestamp_utc"] > start) & (aligned["timestamp_utc"] <= as_of)]
-    wm = WindowMetrics(window_days=days, start=start, end=as_of, n_hours=len(win))
-    if len(win) >= MIN_WINDOW_HOURS:
-        for k, v in _score(win).items():
-            setattr(wm, k, v)
-    return wm
-
-
-def daily_metrics(aligned: pd.DataFrame) -> pd.DataFrame:
-    """Per UTC day: MAE / MAPE for model and official forecast + hours scored."""
-    if aligned.empty:
-        return pd.DataFrame(
-            columns=["date", "n_hours", "model_mae", "model_mape", "official_mae", "official_mape"]
-        )
-    df = aligned.assign(date=aligned["timestamp_utc"].dt.floor("D").dt.date)
-    rows = []
-    for date, g in df.groupby("date", sort=True):
-        s = _score(g)
-        rows.append(
-            {
-                "date": date,
-                "n_hours": len(g),
-                "model_mae": s["model_mae"],
-                "model_mape": s["model_mape"],
-                "official_mae": s["official_mae"],
-                "official_mape": s["official_mape"],
-            }
-        )
-    return pd.DataFrame(rows)
 
 
 @dataclass
@@ -160,8 +54,6 @@ class PerformanceReport:
     windows: list[WindowMetrics]
     daily: pd.DataFrame
     n_aligned_hours: int
-    first_aligned: pd.Timestamp | None
-    last_aligned: pd.Timestamp | None
     model_versions: list[str] = field(default_factory=list)
     official_only: dict[int, dict[str, Any]] = field(default_factory=dict)
 
@@ -216,25 +108,6 @@ class PerformanceReport:
         return "\n".join(lines)
 
 
-def official_accuracy(
-    engine: Engine, as_of: pd.Timestamp, days: int, *, official_source: str = OFFICIAL_SOURCE
-) -> dict[str, Any] | None:
-    """MAE/MAPE of the official forecast alone over the last ``days`` (no model needed)."""
-    start = as_of - pd.Timedelta(days=days)
-    actual = db.read_load(engine, source=LOAD_SOURCE, start=start, end=as_of)
-    official = db.read_table(
-        engine, db.LoadForecastOfficial, start=start, end=as_of, source=official_source
-    )
-    if actual.empty or official.empty:
-        return None
-    m = actual.merge(official[["timestamp_utc", "forecast_mw"]], on="timestamp_utc")
-    m = m[m["timestamp_utc"] > start]  # window is (as_of - days, as_of]
-    if len(m) < MIN_WINDOW_HOURS:
-        return None
-    s = compute_metrics(m[TARGET], m["forecast_mw"])
-    return {"n_hours": len(m), "mae": s["mae"], "mape": s["mape"]}
-
-
 def compute_report(
     engine: Engine,
     *,
@@ -243,7 +116,7 @@ def compute_report(
     model_version: str | None = None,
     official_source: str = OFFICIAL_SOURCE,
 ) -> PerformanceReport:
-    as_of = _utc(as_of) if as_of is not None else pd.Timestamp.now(tz="UTC").floor("h")
+    as_of = db.to_utc(as_of) if as_of is not None else pd.Timestamp.now(tz="UTC").floor("h")
     start = as_of - pd.Timedelta(days=max(windows))
     aligned = aligned_frame(
         engine,
@@ -259,21 +132,17 @@ def compute_report(
         windows=[window_metrics(aligned, as_of, d) for d in windows],
         daily=daily_metrics(aligned),
         n_aligned_hours=len(aligned),
-        first_aligned=None if aligned.empty else aligned["timestamp_utc"].min(),
-        last_aligned=None if aligned.empty else aligned["timestamp_utc"].max(),
         model_versions=[] if aligned.empty else sorted(aligned["model_version"].unique()),
     )
     for d in windows:
         oa = official_accuracy(engine, as_of, d, official_source=official_source)
-        if oa is not None:
+        if oa["mae"] is not None:
             report.official_only[d] = oa
     log.info("performance report:\n%s", report.summary())
     return report
 
 
-# --------------------------------------------------------------------------- #
-# Out-of-sample backtest vs the official forecast
-# --------------------------------------------------------------------------- #
+# --- Out-of-sample backtest vs the official forecast ---
 @dataclass
 class BacktestReport:
     start: pd.Timestamp
@@ -315,7 +184,7 @@ def backtest_vs_official(
     from src.models.train import LightGBMForecaster
 
     frame = frame if frame is not None else build_features(engine, output=None)
-    as_of = _utc(as_of) if as_of is not None else frame.index.max()
+    as_of = db.to_utc(as_of) if as_of is not None else frame.index.max()
     holdout_start = as_of - pd.Timedelta(days=days)
     train = frame[frame.index <= holdout_start]
     holdout = frame[(frame.index > holdout_start) & (frame.index <= as_of)]
@@ -339,7 +208,7 @@ def backtest_vs_official(
     if len(aligned) < MIN_WINDOW_HOURS:
         raise ValueError(f"only {len(aligned)} hours have an official forecast in the window")
     aligned = aligned.rename_axis("timestamp_utc").reset_index()
-    s = _score(aligned)
+    s = score_pair(aligned)
 
     local_hour = aligned["timestamp_utc"].dt.tz_convert("Europe/Berlin").dt.hour
     by_hour = (
@@ -367,20 +236,9 @@ def backtest_vs_official(
     return report
 
 
-def _utc(value: Any) -> pd.Timestamp:
-    ts = pd.Timestamp(value)
-    return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
-
-
-# --------------------------------------------------------------------------- #
-# CLI
-# --------------------------------------------------------------------------- #
+# --- CLI ---
 def main(argv: list[str] | None = None) -> int:
-    logging.basicConfig(
-        level=get_settings().log_level,
-        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    configure_logging()
     p = argparse.ArgumentParser(prog="python -m src.monitoring.performance")
     p.add_argument("--as-of", default=None)
     p.add_argument("--model-version", default=None)
