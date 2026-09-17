@@ -48,7 +48,8 @@ dependencies = [
     # Monitoring / drift
     "evidently>=0.4.15",
     # Dashboard
-    "streamlit>=1.29",
+    "streamlit>=1.49",
+    "plotly>=5.18",
 ]
 
 [project.optional-dependencies]

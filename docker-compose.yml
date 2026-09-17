@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------------------
-# Local stack (README §11): TimescaleDB + forecast API (+ Streamlit dashboard, not yet wired).
+# Local stack (README §11): TimescaleDB + forecast API + Streamlit dashboard.
 #
 #   docker compose up --build
 #   -> API      http://localhost:8000/docs
@@ -42,11 +42,19 @@ services:
     volumes:
       - ./data:/app/data # model cache (data/models) + local files
 
-  # dashboard:            # Streamlit (enable once dashboard/app.py exists)
-  #   build: .
-  #   command: streamlit run dashboard/app.py --server.port 8501 --server.address 0.0.0.0
-  #   ports: ["8501:8501"]
-  #   depends_on: [api]
+  dashboard:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgresql+psycopg://load:load@db:5432/load
+    command: streamlit run dashboard/app.py --server.port 8501 --server.address 0.0.0.0 --server.headless true
+    ports:
+      - "8501:8501"
 
 volumes:
   pgdata:

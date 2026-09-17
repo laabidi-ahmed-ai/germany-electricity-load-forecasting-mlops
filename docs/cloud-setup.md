@@ -57,6 +57,27 @@ everywhere: an empty `ENTSOE_API_TOKEN` means "skip ENTSO-E", never a failure.
 Local development is unchanged: SQLite data DB + SQLite MLflow by default. To point
 your laptop at the cloud, put the same `DATABASE_URL` in `.env`.
 
+## Dashboard (Streamlit Community Cloud, free)
+
+`dashboard/app.py` reads the same Postgres and renders forecast vs. actuals, the
+head-to-head against the official forecast, drift signals and the retraining timeline.
+It installs only `dashboard/requirements.txt` (Streamlit, plotly, pandas, SQLAlchemy,
+psycopg) - no LightGBM / MLflow / Evidently - so it boots in well under a minute.
+
+1. [share.streamlit.io](https://share.streamlit.io) → *New app* → this repository,
+   branch `main`, main file path `dashboard/app.py`. Community Cloud picks up the
+   requirements file next to the entrypoint automatically.
+2. *Advanced settings → Secrets*: add `DATABASE_URL = "postgresql://..."`. Prefer a
+   **read-only role** here - the dashboard only reads, and it additionally opens every
+   Postgres transaction with `default_transaction_read_only=on`, but a read-only role
+   keeps a public app from ever holding write credentials. On Neon:
+   `CREATE ROLE dashboard LOGIN PASSWORD '...'; GRANT SELECT ON ALL TABLES IN SCHEMA public TO dashboard;`
+   (Supabase: same, from the SQL editor.)
+3. Deploy. Queries are cached for 10 minutes; the *Refresh data* button clears the cache.
+
+Locally: `make dashboard` (or the `dashboard` service in `docker-compose.yml`) uses
+whatever `DATABASE_URL` is in `.env`, falling back to the SQLite file.
+
 ## Storage budget (Neon free tier, 0.5 GB)
 
 Load + official forecast: ~50 k rows each; weather: ~250 k rows (~40 MB); model
