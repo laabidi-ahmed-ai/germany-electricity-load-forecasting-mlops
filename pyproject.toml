@@ -59,11 +59,11 @@ dev = [
     "pyyaml>=6.0",          # workflow-contract tests
     "ruff>=0.4",
 ]
-# Deep learning (Phase 8: LSTM/GRU -> TFT). Kept optional: large, platform-specific wheels.
+# Deep learning (LSTM/GRU -> TFT). Kept optional: large, platform-specific wheels.
 dl = [
     "torch>=2.1",
 ]
-# Data versioning (Phase 1+). Optional so a plain `pip install -e .` stays light.
+# Data versioning. Optional so a plain `pip install -e .` stays light.
 dvc = [
     "dvc>=3.30",
 ]

@@ -1,4 +1,4 @@
-"""Time-series cross-validation + metrics (README §15, Phase 3).
+"""Time-series cross-validation + metrics.
 
 Evaluation protocol
 -------------------

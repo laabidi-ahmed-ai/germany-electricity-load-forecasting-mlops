@@ -1,4 +1,4 @@
-"""LightGBM day-ahead load model: training + MLflow logging (README §15, Phase 3).
+"""LightGBM day-ahead load model: training + MLflow logging.
 
 ``LightGBMForecaster`` wraps ``lightgbm.LGBMRegressor`` behind the same
 ``fit / predict / get_params / name`` protocol as the baselines, so the CV in
@@ -9,7 +9,8 @@ Early stopping is done on the *chronological tail* of the training data (last
 trees would be tuned on the data we report metrics on.
 
 No scaler: tree models are invariant to monotone feature transforms. If a linear
-model is ever added, fit its scaler on the training split only (CLAUDE.md #6).
+model is ever added, fit its scaler on the training split only - fitting it on
+the full frame would leak validation statistics into training.
 
 CLI (``make train``)::
 

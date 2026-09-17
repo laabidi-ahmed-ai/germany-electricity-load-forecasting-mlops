@@ -1,4 +1,4 @@
-"""Performance monitoring: model vs actuals vs the official day-ahead forecast (Phase 5).
+"""Performance monitoring: model vs actuals vs the official day-ahead forecast.
 
 Live report (``compute_report``)
 --------------------------------

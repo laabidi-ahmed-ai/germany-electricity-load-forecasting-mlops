@@ -1,4 +1,4 @@
-# Cloud setup (Phase 6) — running the loop with your PC off
+# Cloud setup — running the loop with your PC off
 
 Everything runs on **GitHub Actions** (scheduler + compute) against one **free cloud
 Postgres**. Total cost: €0/month. README §14 describes the idea; this page is the

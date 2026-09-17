@@ -43,6 +43,6 @@ jobs:
 
       - name: Test (pytest)
         env:
-          # No secrets in CI for Phase 0: the suite must pass without them.
+          # No secrets in CI: the suite must pass without them.
           MLFLOW_TRACKING_URI: ./mlruns
         run: pytest -m "not integration"

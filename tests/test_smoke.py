@@ -1,6 +1,6 @@
-"""Phase 0 smoke tests: prove the scaffolding and CI pipeline work."""
+"""Smoke tests: prove the scaffolding and CI pipeline work."""
 
 
 def test_ci_is_wired() -> None:
-    """Trivial passing test so CI goes green (README §15, Phase 0)."""
+    """Trivial passing test so CI goes green."""
     assert 1 + 1 == 2

@@ -87,7 +87,7 @@ class Settings(BaseSettings):
     )
     data_start_date: date = Field(
         default=date(2021, 3, 1),
-        description="First day of usable data (post-COVID cutoff, CLAUDE.md rule 5).",
+        description="First day of usable data (post-COVID cutoff: pandemic demand patterns are unrepresentative).",
     )
 
     # --- misc ---------------------------------------------------------------

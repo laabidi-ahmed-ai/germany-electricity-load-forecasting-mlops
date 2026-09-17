@@ -138,7 +138,7 @@ def test_served_features_equal_training_features_exactly(seeded) -> None:
     assert last_actual == as_of
     assert list(served.index) == list(forecast_window(as_of))
 
-    training = build_features(seeded, output=None)  # the Phase 2 pipeline, from the same DB
+    training = build_features(seeded, output=None)  # the training pipeline, from the same DB
     train_rows = training.loc[served.index]
 
     cols = select_features(training.columns, DAY_AHEAD)

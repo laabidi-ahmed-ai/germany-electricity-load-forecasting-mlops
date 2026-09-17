@@ -1,4 +1,4 @@
-"""Retraining trigger + champion / challenger promotion (README §9, Phase 5).
+"""Retraining trigger + champion / challenger promotion (README §9).
 
 Triggers (any one fires -> retrain)
 -----------------------------------

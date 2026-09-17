@@ -1,4 +1,4 @@
-"""Data / prediction / target drift with Evidently (>= 0.7 API) - Phase 5.
+"""Data / prediction / target drift with Evidently (>= 0.7 API).
 
 What is compared
 ----------------

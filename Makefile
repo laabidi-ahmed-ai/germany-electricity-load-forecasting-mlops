@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------------------
-# Standard commands (CLAUDE.md "Standard commands")
+# Standard commands
 #
 #   make setup      install deps into a venv
 #   make test       pytest (unit tests; `make test-integration` hits the real APIs)
@@ -58,10 +58,10 @@ data:  ## Historical backfill from DATA_START_DATE (SMARD + Open-Meteo, + ENTSO-
 data-update:  ## Incremental ingestion: pull only new hours
 	$(PY) -m src.data.ingest
 
-features:  ## Build the leakage-safe feature frame -> data/processed/features.parquet (Phase 2)
+features:  ## Build the leakage-safe feature frame -> data/processed/features.parquet
 	$(PY) -m src.features.build_features
 
-train:  ## Expanding-window CV (baselines vs LightGBM) + final model, logged to MLflow (Phase 3)
+train:  ## Expanding-window CV (baselines vs LightGBM) + final model, logged to MLflow
 	$(PY) -m src.models.train
 
 evaluate:  ## CV report only (baselines vs LightGBM), logged to MLflow
@@ -73,19 +73,19 @@ mlflow-ui:  ## Open the MLflow UI on the local store
 register:  ## Register the latest training run in the MLflow registry and promote it to champion
 	$(PY) -m src.models.registry --promote-latest
 
-forecast:  ## Batch day-ahead forecast with the champion -> load_forecast_model table (Phase 4)
+forecast:  ## Batch day-ahead forecast with the champion -> load_forecast_model table
 	$(PY) -m src.serving.batch_forecast
 
 monitor:  ## Performance vs official forecast + drift + retrain-trigger check (no retraining)
 	$(PY) -m src.monitoring.retrain --check-only
 
-retrain:  ## Evaluate triggers; if fired, train a challenger and promote it only if it wins (Phase 5)
+retrain:  ## Evaluate triggers; if fired, train a challenger and promote it only if it wins
 	$(PY) -m src.monitoring.retrain
 
-serve:  ## Run the FastAPI app locally (Phase 4)
+serve:  ## Run the FastAPI app locally
 	$(BIN)/uvicorn src.serving.api:app --reload --host 0.0.0.0 --port 8000
 
-dashboard:  ## Run the Streamlit dashboard (Phase 7)
+dashboard:  ## Run the Streamlit dashboard
 	$(BIN)/streamlit run dashboard/app.py
 
 clean:  ## Remove caches and build artifacts

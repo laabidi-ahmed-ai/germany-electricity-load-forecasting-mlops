@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build a flat starter CSV (German load + national-average weather), no API token needed.
 
-This is a thin convenience wrapper: since Phase 1 the real logic lives in
+This is a thin convenience wrapper: the real logic lives in
 ``src/data/`` (``smard_client``, ``weather_client``, ``validation``). The
 canonical ingestion path is the database pipeline::
 

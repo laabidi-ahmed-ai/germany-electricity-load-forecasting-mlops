@@ -1,4 +1,4 @@
-# Daily monitoring + drift-triggered retraining (README §9 / §15 Phase 5-6).
+# Daily monitoring + drift-triggered retraining (README §9).
 #
 # Scores yesterday's forecasts against the actuals and the official forecast, runs the
 # Evidently drift check, and - only if a trigger fires - trains a challenger and promotes

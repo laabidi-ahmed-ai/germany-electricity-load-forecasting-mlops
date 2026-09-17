@@ -1,4 +1,4 @@
-"""FastAPI serving app (README §15, Phase 4).
+"""FastAPI serving app.
 
 Endpoints
 ---------

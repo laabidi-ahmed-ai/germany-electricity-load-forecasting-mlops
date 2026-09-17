@@ -1,10 +1,10 @@
-"""Leakage-safe feature engineering for day-ahead hourly load forecasting (README §15, Phase 2).
+"""Leakage-safe feature engineering for day-ahead hourly load forecasting.
 
 Input: hourly actual load (``db.read_load``) and national-average weather.
 Output: one row per hour, indexed by ``timestamp_utc``, with the target ``load_mw``
 plus the feature columns listed in ``feature_columns()``.
 
-Leakage rules (CLAUDE.md #6) - every feature for hour *t* uses only information
+Leakage rules - every feature for hour *t* uses only information
 available strictly before *t*:
 
 * **Lags** ``load_lag_{k}`` = load at *t-k* hours (k in 1, 24, 48, 168). Computed on a
@@ -194,7 +194,7 @@ def feature_columns(df: pd.DataFrame) -> list[str]:
 
 
 # --------------------------------------------------------------------------- #
-# Time-based splits (never random - CLAUDE.md #6)
+# Time-based splits (never random - a random split leaks future information into the past)
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class Split:

@@ -1,4 +1,4 @@
-"""Ingestion pipeline + CLI (README §15, Phase 1).
+"""Ingestion pipeline + CLI.
 
 Modes
 -----

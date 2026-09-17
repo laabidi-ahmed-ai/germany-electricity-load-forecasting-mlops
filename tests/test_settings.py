@@ -30,7 +30,7 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_runs_without_any_secrets() -> None:
-    """The whole system must boot without the ENTSO-E token (CLAUDE.md)."""
+    """The whole system must boot without the ENTSO-E token (it arrives days after signup)."""
     s = Settings(_env_file=None)
     assert s.entsoe_api_token is None
     assert s.has_entsoe_token is False
