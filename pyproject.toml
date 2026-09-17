@@ -1,0 +1,131 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "germany-electricity-load-forecasting-mlops"
+version = "0.1.0"
+description = "End-to-end MLOps system forecasting Germany's day-ahead hourly electricity load (DE_LU)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Ahmed Laabidi" }]
+keywords = ["mlops", "forecasting", "time-series", "electricity", "entso-e", "germany"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+]
+
+# Core runtime stack — see README §10 "Tech stack".
+dependencies = [
+    # Data pull
+    "requests>=2.31",
+    "entsoe-py>=0.6",
+    # Data handling
+    "pandas>=2.1",
+    "numpy>=1.26",
+    "pyarrow>=14",
+    "holidays>=0.40",
+    # Storage (Postgres / TimescaleDB; SQLite fallback for local dev)
+    "sqlalchemy>=2.0",
+    "psycopg[binary]>=3.1",
+    # Config / secrets
+    "pydantic>=2.5",
+    "pydantic-settings>=2.1",
+    "python-dotenv>=1.0",
+    # Modeling (scipy / scikit-learn floors = wheels that clear Windows Smart App Control)
+    "scipy>=1.16.2",
+    "scikit-learn>=1.7.2",
+    "lightgbm>=4.1",
+    # Experiment tracking, registry, tuning
+    "mlflow>=2.9",
+    "optuna>=3.4",
+    # Serving
+    "fastapi>=0.104",
+    "uvicorn[standard]>=0.24",
+    # Monitoring / drift
+    "evidently>=0.4.15",
+    # Dashboard
+    "streamlit>=1.29",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "httpx>=0.25",          # FastAPI TestClient
+    "pyyaml>=6.0",          # workflow-contract tests
+    "ruff>=0.4",
+]
+# Deep learning (Phase 8: LSTM/GRU -> TFT). Kept optional: large, platform-specific wheels.
+dl = [
+    "torch>=2.1",
+]
+# Data versioning (Phase 1+). Optional so a plain `pip install -e .` stays light.
+dvc = [
+    "dvc>=3.30",
+]
+
+[project.urls]
+Repository = "https://github.com/<your-username>/germany-electricity-load-forecasting-mlops"
+
+# --------------------------------------------------------------------------- #
+# setuptools: which top-level packages ship in the wheel
+# --------------------------------------------------------------------------- #
+[tool.setuptools.packages.find]
+include = ["src*", "config*", "dashboard*"]
+
+# --------------------------------------------------------------------------- #
+# pytest
+# --------------------------------------------------------------------------- #
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra -q --strict-markers"
+markers = [
+    "integration: tests that need network or a live database (deselect with '-m \"not integration\"')",
+]
+filterwarnings = [
+    "error::DeprecationWarning:src",
+]
+
+# --------------------------------------------------------------------------- #
+# ruff (lint + format)
+# --------------------------------------------------------------------------- #
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+extend-exclude = [
+    "notebooks",              # exploration only, never the source of truth (README §11)
+]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "UP",  # pyupgrade
+    "N",   # pep8-naming
+    "SIM", # flake8-simplify
+    "RUF", # ruff-specific rules
+]
+ignore = [
+    "E501",  # line length is enforced by the formatter
+    "N803",  # `X` (feature matrix) is the ML/scikit-learn convention ...
+    "N806",  # ... and so are X_train / X_val locals
+]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's dependency-injection idiom: `param: T = Depends(...)` / `Query(...)`.
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Query", "fastapi.Header", "fastapi.Path"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["src", "config", "dashboard"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"

@@ -1,0 +1,16 @@
+# Minimal dependency set for the hourly ingestion job (.github/workflows/ingest.yml).
+#
+# `python -m src.data.ingest` only needs the data layer: HTTP clients, pandas,
+# SQLAlchemy + the Postgres driver, and pydantic-settings for config. No LightGBM,
+# MLflow, Evidently, FastAPI, Streamlit or PyTorch - that keeps a run at ~1 minute
+# and well inside the free Actions quota. Keep in sync with pyproject.toml floors.
+# (tests/test_workflows.py checks the ingest CLI imports nothing beyond this set.)
+requests>=2.31
+entsoe-py>=0.6
+pandas>=2.1
+numpy>=1.26
+sqlalchemy>=2.0
+psycopg[binary]>=3.1
+pydantic>=2.5
+pydantic-settings>=2.1
+python-dotenv>=1.0

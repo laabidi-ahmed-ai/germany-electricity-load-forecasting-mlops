@@ -1,0 +1,44 @@
+# --- secrets ---------------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# --- data & ML artifacts (data/ is tracked via DVC, not git) ---------------
+data/*
+!data/.gitkeep
+mlruns/
+mlartifacts/
+*.db
+*.sqlite
+*.sqlite3
+
+# --- python ----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# --- virtual environments --------------------------------------------------
+.venv/
+venv/
+env/
+
+# --- tooling caches --------------------------------------------------------
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# --- notebooks -------------------------------------------------------------
+.ipynb_checkpoints/
+
+# --- editors / OS ----------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

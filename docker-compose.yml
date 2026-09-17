@@ -1,0 +1,52 @@
+# ---------------------------------------------------------------------------
+# Local stack (README §11): TimescaleDB + forecast API (+ dashboard in Phase 7).
+#
+#   docker compose up --build
+#   -> API      http://localhost:8000/docs
+#   -> Postgres postgresql://load:load@localhost:5432/load
+#
+# The API loads the champion from the database (model_artifacts table) - run
+# `make train` + `make register` against that database first, or point
+# DATABASE_URL at the cloud DB seeded by the bootstrap workflow. Secrets come
+# from .env (never baked in).
+# ---------------------------------------------------------------------------
+services:
+  db:
+    image: timescale/timescaledb:latest-pg16
+    environment:
+      POSTGRES_USER: load
+      POSTGRES_PASSWORD: load
+      POSTGRES_DB: load
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U load -d load"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgresql+psycopg://load:load@db:5432/load
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data # model cache (data/models) + local files
+
+  # dashboard:            # Phase 7 (Streamlit)
+  #   build: .
+  #   command: streamlit run dashboard/app.py --server.port 8501 --server.address 0.0.0.0
+  #   ports: ["8501:8501"]
+  #   depends_on: [api]
+
+volumes:
+  pgdata:

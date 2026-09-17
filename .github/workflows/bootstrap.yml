@@ -1,0 +1,92 @@
+# One-time seeding of the cloud stack (run manually once, after adding the secrets):
+#   backfill 2021-03-01 -> now  ->  features  ->  train + CV (MLflow on Postgres)
+#   -> register + promote champion (exported to the DB)  ->  first day-ahead forecast
+#   -> monitoring check.
+# Re-running is safe: every step is idempotent (upserts) or creates a new model version.
+name: bootstrap
+
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: "backfill start date YYYY-MM-DD"
+        required: false
+        default: "2021-03-01"
+      skip_backfill:
+        description: "skip the data backfill (data already in the DB)"
+        type: boolean
+        default: false
+      skip_training:
+        description: "skip training (a champion is already exported)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: bootstrap
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI || secrets.DATABASE_URL }}
+      ENTSOE_API_TOKEN: ${{ secrets.ENTSOE_API_TOKEN }}
+      LOG_LEVEL: INFO
+      PYTHONUNBUFFERED: "1"
+      MLFLOW_DISABLE_AGENT_HINT: "1"
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Require DATABASE_URL secret
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "::error::DATABASE_URL secret is not set"
+            exit 1
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install project
+        run: |
+          python -m pip install --upgrade pip
+          pip install .
+
+      - name: Backfill history (SMARD load + official forecast, Open-Meteo, ENTSO-E if token)
+        if: ${{ !inputs.skip_backfill }}
+        run: python -m src.data.ingest --backfill --start "${{ inputs.start }}"
+
+      - name: Build feature frame
+        if: ${{ !inputs.skip_training }}
+        run: python -m src.features.build_features
+
+      - name: Train + expanding-window CV (baselines vs LightGBM) -> MLflow
+        if: ${{ !inputs.skip_training }}
+        run: python -m src.models.train
+
+      - name: Register + promote champion (exported to the database)
+        if: ${{ !inputs.skip_training }}
+        run: python -m src.models.registry --promote-latest
+
+      - name: First day-ahead forecast
+        run: python -m src.serving.batch_forecast
+
+      - name: Monitoring check (no retraining)
+        run: python -m src.monitoring.retrain --check-only
+
+      - name: Summary
+        if: always()
+        run: python -m src.models.registry --show

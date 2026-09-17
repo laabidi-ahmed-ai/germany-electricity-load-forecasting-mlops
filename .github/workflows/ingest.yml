@@ -1,0 +1,79 @@
+# Hourly ingestion: SMARD actual load + official day-ahead forecast, Open-Meteo weather
+# (+ ENTSO-E when a token is configured) -> the cloud Postgres. README §3 / §14.
+#
+# Lean by design: installs only requirements/ingest.txt (no ML stack), ~1 min per run.
+# Manual runs can switch to --backfill to (re)seed history.
+name: ingest
+
+on:
+  schedule:
+    - cron: "15 * * * *" # hourly at :15 UTC - SMARD publishes the previous hour with a short lag
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "incremental (only new hours) or backfill (full history from --start)"
+        type: choice
+        options: [incremental, backfill]
+        default: incremental
+      start:
+        description: "backfill start date YYYY-MM-DD (default: DATA_START_DATE = 2021-03-01)"
+        required: false
+        default: ""
+      sources:
+        description: "comma-separated subset of smard,weather,entsoe"
+        required: false
+        default: "smard,weather,entsoe"
+
+concurrency:
+  group: ingest
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      ENTSOE_API_TOKEN: ${{ secrets.ENTSOE_API_TOKEN }} # optional - blank means "skip ENTSO-E"
+      LOG_LEVEL: INFO
+      PYTHONPATH: .
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Require DATABASE_URL secret
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "::error::DATABASE_URL secret is not set (Settings > Secrets and variables > Actions)"
+            exit 1
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements/ingest.txt
+
+      - name: Install (lean data-layer deps only)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements/ingest.txt
+
+      - name: Ingest (incremental)
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.mode == 'incremental' }}
+        run: python -m src.data.ingest --sources "${{ inputs.sources || 'smard,weather,entsoe' }}"
+
+      - name: Ingest (backfill)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'backfill' }}
+        run: |
+          START_FLAG=""
+          if [ -n "${{ inputs.start }}" ]; then START_FLAG="--start ${{ inputs.start }}"; fi
+          python -m src.data.ingest --backfill $START_FLAG --sources "${{ inputs.sources }}"
