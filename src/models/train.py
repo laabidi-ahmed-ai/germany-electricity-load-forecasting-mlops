@@ -13,9 +13,10 @@ model is ever added, fit its scaler on the training split only - fitting it on
 the full frame would leak validation statistics into training.
 
 CLI (``make train``): expanding-window CV (baselines + LightGBM), final fit on all
-data, everything logged to MLflow::
+data, everything logged to MLflow. ``--cv-only`` stops after the CV report
+(``make evaluate``)::
 
-    python -m src.models.train [--features PATH] [--n-splits 12] [--val-hours 720]
+    python -m src.models.train [--features PATH] [--n-splits 12] [--val-hours 720] [--cv-only]
 """
 
 from __future__ import annotations
@@ -136,14 +137,18 @@ def lightgbm_factory(params: dict[str, Any] | None = None) -> Callable[[], Light
     return _make
 
 
-def train_final_model(
+def fit_model(
     df: pd.DataFrame, horizon: Horizon = DAY_AHEAD, params: dict[str, Any] | None = None
 ) -> tuple[LightGBMForecaster, list[str]]:
-    """Fit LightGBM on the whole frame using only horizon-valid features."""
+    """Fit LightGBM on every row of ``df`` using only horizon-valid features.
+
+    Used for the final model and for every out-of-time fit (backtest, challenger):
+    pass the rows before the cutoff and nothing after it can leak in.
+    """
     cols = select_features(df.columns, horizon)
     model = LightGBMForecaster(params).fit(df[cols], df[TARGET])
     log.info(
-        "final %s model: %d rows, %d features, best_iteration=%d",
+        "fitted %s model: %d rows, %d features, best_iteration=%d",
         horizon.name,
         len(df),
         len(cols),
@@ -221,6 +226,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--val-hours", type=int, default=evaluate.DEFAULT_VAL_HOURS)
     p.add_argument("--min-train-hours", type=int, default=evaluate.DEFAULT_MIN_TRAIN_HOURS)
     p.add_argument("--no-mlflow", action="store_true", help="skip MLflow logging")
+    p.add_argument(
+        "--cv-only", action="store_true", help="print the CV report only (no final model)"
+    )
     return p
 
 
@@ -240,8 +248,10 @@ def main(argv: list[str] | None = None) -> int:
         min_train_hours=args.min_train_hours,
     )
     print(evaluate.format_report(cv))
+    if args.cv_only:
+        return 0
 
-    model, cols = train_final_model(df, horizon)
+    model, cols = fit_model(df, horizon)
     print("\nTop features by gain:")
     print(model.feature_importances().head(10).to_string(index=False))
 

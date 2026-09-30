@@ -40,14 +40,14 @@ from sqlalchemy.engine import Engine
 from config.log import configure_logging
 from src.data import db
 from src.features.build_features import TARGET, build_features
-from src.features.horizons import DAY_AHEAD, select_features
+from src.features.horizons import DAY_AHEAD
 from src.models import evaluate, registry, train
 from src.models.baselines import BASELINE_FACTORIES
-from src.models.evaluate import compute_metrics
 from src.models.registry import LoadedModel
 from src.models.tracking import DEFAULT_EXPERIMENT, setup_mlflow
 from src.monitoring import drift as drift_mod
 from src.monitoring import performance as perf_mod
+from src.monitoring.metrics import compute_metrics
 
 log = logging.getLogger(__name__)
 
@@ -291,7 +291,6 @@ def run_champion_challenger(
     frame = frame if frame is not None else build_features(engine, output=None)
     as_of = db.to_utc(as_of) if as_of is not None else frame.index.max()
     frame = frame[frame.index <= as_of]
-    cols = select_features(frame.columns, DAY_AHEAD)
     champion.check_features(list(frame.columns))
 
     train_end = champion.train_end
@@ -314,8 +313,9 @@ def run_champion_challenger(
             triggers=triggers or [],
         )
 
-    fit_frame = frame[frame.index < holdout.index.min()]
-    candidate = train.LightGBMForecaster(cfg.lgbm_params).fit(fit_frame[cols], fit_frame[TARGET])
+    candidate, cols = train.fit_model(
+        frame[frame.index < holdout.index.min()], DAY_AHEAD, cfg.lgbm_params
+    )
     champ_m = compute_metrics(holdout[TARGET], champion.predict(holdout))
     cand_m = compute_metrics(holdout[TARGET], candidate.predict(holdout[cols]))
     improvement = (champ_m["mae"] - cand_m["mae"]) / champ_m["mae"] * 100.0
@@ -354,7 +354,7 @@ def run_champion_challenger(
         val_hours=cfg.cv_val_hours,
         min_train_hours=cfg.cv_min_train_hours,
     )
-    final, final_cols = train.train_final_model(frame, DAY_AHEAD, cfg.lgbm_params)
+    final, final_cols = train.fit_model(frame, DAY_AHEAD, cfg.lgbm_params)
     run_id = train.log_training_run(
         final, final_cols, cv, DAY_AHEAD, frame, run_name="retrain_challenger"
     )

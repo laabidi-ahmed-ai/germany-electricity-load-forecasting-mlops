@@ -135,8 +135,8 @@ def test_lightgbm_refuses_unsorted_input(frame) -> None:
         train.LightGBMForecaster(FAST_LGBM).fit(frame[cols].iloc[::-1], frame[TARGET].iloc[::-1])
 
 
-def test_train_final_model_uses_only_horizon_valid_features(frame) -> None:
-    model, cols = train.train_final_model(frame, DAY_AHEAD, FAST_LGBM)
+def test_fit_model_uses_only_horizon_valid_features(frame) -> None:
+    model, cols = train.fit_model(frame, DAY_AHEAD, FAST_LGBM)
     assert cols == select_features(frame.columns, DAY_AHEAD)
     assert "load_lag_1" not in model.feature_names_
     assert not any(c.startswith("load_roll_") for c in model.feature_names_)
@@ -259,7 +259,7 @@ def test_training_run_is_logged_to_mlflow(frame, cv, tmp_path, monkeypatch) -> N
 
     get_settings.cache_clear()
 
-    model, cols = train.train_final_model(frame, DAY_AHEAD, FAST_LGBM)
+    model, cols = train.fit_model(frame, DAY_AHEAD, FAST_LGBM)
     run_id = train.log_training_run(model, cols, cv, DAY_AHEAD, frame, experiment="test-exp")
 
     client = mlflow.MlflowClient(tracking_uri=tracking.resolve_tracking_uri())
@@ -282,20 +282,6 @@ def test_training_run_is_logged_to_mlflow(frame, cv, tmp_path, monkeypatch) -> N
     np.testing.assert_allclose(
         loaded.predict(frame[cols].head(10)), model.predict(frame.head(10)), rtol=1e-6
     )
-
-
-def test_standalone_cv_run_is_logged(cv, tmp_path, monkeypatch) -> None:
-    import mlflow
-
-    monkeypatch.setenv("MLFLOW_TRACKING_URI", f"sqlite:///{(tmp_path / 'mlflow.db').as_posix()}")
-    from config.settings import get_settings
-
-    get_settings.cache_clear()
-    run_id = evaluate.log_cv_run(cv, experiment="test-cv")
-    run = mlflow.MlflowClient(tracking_uri=tracking.resolve_tracking_uri()).get_run(run_id)
-    assert run.data.tags["stage"] == "evaluation"
-    assert run.data.params["n_splits"] == "3"
-    assert "lightgbm_vs_seasonal_naive_168_improvement_pct" in run.data.metrics
 
 
 # --- CLI ---
@@ -324,12 +310,13 @@ def test_train_cli_end_to_end(frame, tmp_path, monkeypatch, capsys) -> None:
     assert "Top features by gain" in out
 
 
-def test_evaluate_cli_end_to_end(frame, tmp_path, monkeypatch, capsys) -> None:
+def test_train_cli_cv_only_stops_after_the_report(frame, tmp_path, monkeypatch, capsys) -> None:
     path = tmp_path / "features.parquet"
     frame.to_parquet(path)
     original_factory = train.lightgbm_factory
     monkeypatch.setattr(train, "lightgbm_factory", lambda params=None: original_factory(FAST_LGBM))
-    rc = evaluate.main(
+    monkeypatch.setattr(train, "fit_model", lambda *a, **k: pytest.fail("final fit must not run"))
+    rc = train.main(
         [
             "--features",
             str(path),
@@ -339,11 +326,12 @@ def test_evaluate_cli_end_to_end(frame, tmp_path, monkeypatch, capsys) -> None:
             "24",
             "--min-train-hours",
             "200",
-            "--no-mlflow",
+            "--cv-only",
         ]
     )
     assert rc == 0
-    assert "Mean over folds" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "Mean over folds" in out and "Top features by gain" not in out
 
 
 class _FastForecaster(train.LightGBMForecaster):

@@ -64,8 +64,8 @@ features:  ## Build the leakage-safe feature frame -> data/processed/features.pa
 train:  ## Expanding-window CV (baselines vs LightGBM) + final model, logged to MLflow
 	$(PY) -m src.models.train
 
-evaluate:  ## CV report only (baselines vs LightGBM), logged to MLflow
-	$(PY) -m src.models.evaluate
+evaluate:  ## CV report only (baselines vs LightGBM), no final model
+	$(PY) -m src.models.train --cv-only
 
 mlflow-ui:  ## Open the MLflow UI on the local store
 	$(BIN)/mlflow ui --backend-store-uri sqlite:///mlruns/mlflow.db --port 5000

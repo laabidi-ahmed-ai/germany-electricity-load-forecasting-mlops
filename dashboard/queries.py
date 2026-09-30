@@ -5,8 +5,8 @@ Everything the dashboard shows is derived here from the database tables through
 the dashboard deploys with the lean ``dashboard/requirements.txt``. Keeping this
 module free of Streamlit calls makes it importable and testable on its own.
 
-Metric definitions (MAE in MW, MAPE in %) match ``src.models.evaluate`` so the
-numbers on the dashboard agree with the training reports and monitoring events.
+Metric definitions (MAE in MW, MAPE in %) come from ``src.monitoring.metrics``, the
+same code training and monitoring use, so the dashboard agrees with both.
 """
 
 from __future__ import annotations

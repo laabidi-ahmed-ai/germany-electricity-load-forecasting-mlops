@@ -50,7 +50,7 @@ def env(store, monkeypatch):
             val_hours=24,
             min_train_hours=200,
         )
-        model, cols = train.train_final_model(df, DAY_AHEAD, FAST_LGBM)
+        model, cols = train.fit_model(df, DAY_AHEAD, FAST_LGBM)
         store["run_id"] = train.log_training_run(model, cols, cv, DAY_AHEAD, df)
         store["cols"] = cols
         store["model"] = model

@@ -31,7 +31,7 @@ from config.log import configure_logging
 from src.data import db
 from src.data.db import SOURCE_SMARD
 from src.features.build_features import TARGET, build_features
-from src.features.horizons import DAY_AHEAD, select_features
+from src.features.horizons import DAY_AHEAD
 from src.monitoring.metrics import (
     MIN_WINDOW_HOURS,
     WindowMetrics,
@@ -170,18 +170,18 @@ def backtest_vs_official(
     params: dict[str, Any] | None = None,
     frame: pd.DataFrame | None = None,
 ) -> BacktestReport:
-    from src.models.train import LightGBMForecaster
+    from src.models.evaluate import DEFAULT_MIN_TRAIN_HOURS
+    from src.models.train import fit_model
 
     frame = frame if frame is not None else build_features(engine, output=None)
     as_of = db.to_utc(as_of) if as_of is not None else frame.index.max()
     holdout_start = as_of - pd.Timedelta(days=days)
     train = frame[frame.index <= holdout_start]
     holdout = frame[(frame.index > holdout_start) & (frame.index <= as_of)]
-    if len(train) < 24 * 365 or holdout.empty:
+    if len(train) < DEFAULT_MIN_TRAIN_HOURS or holdout.empty:
         raise ValueError("not enough data for a backtest (need >= 1 year of training rows)")
 
-    cols = select_features(frame.columns, DAY_AHEAD)
-    model = LightGBMForecaster(params).fit(train[cols], train[TARGET])
+    model, cols = fit_model(train, DAY_AHEAD, params)
     pred = pd.Series(model.predict(holdout[cols]), index=holdout.index, name="model_mw")
 
     official = db.read_table(

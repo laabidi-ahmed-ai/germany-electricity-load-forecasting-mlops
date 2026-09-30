@@ -7,29 +7,22 @@ the same folds and the same horizon-valid columns (``src.features.horizons``). M
 RMSE and MAPE are reported per fold and averaged, and the report states whether
 LightGBM beats both seasonal-naive baselines on mean MAE.
 
-CLI (``make evaluate``)::
-
-    python -m src.models.evaluate [--features PATH] [--n-splits 12] [--val-hours 720]
+The command line lives in ``src.models.train``; ``--cv-only`` prints this report
+without fitting the final model (``make evaluate``).
 """
 
 from __future__ import annotations
 
-import argparse
 import logging
-import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Protocol
 
 import numpy as np
 import pandas as pd
 
-from config.log import configure_logging
-from src.features.build_features import DEFAULT_OUTPUT as FEATURES_PARQUET
 from src.features.build_features import TARGET, expanding_window_splits
-from src.features.horizons import DAY_AHEAD, HORIZONS, Horizon, select_features
-from src.models.tracking import DEFAULT_EXPERIMENT, setup_mlflow
+from src.features.horizons import DAY_AHEAD, Horizon, select_features
 from src.monitoring.metrics import compute_metrics
 
 log = logging.getLogger(__name__)
@@ -213,54 +206,3 @@ def log_cv_metrics(cv: CVResult) -> None:
         mlflow.log_metric(f"{CHALLENGER_NAME}_vs_{b}_improvement_pct", v["improvement_pct"])
     if CHALLENGER_NAME in cv.summary.index:
         mlflow.log_metric("beats_all_baselines", int(cv.beats_all_baselines()))
-
-
-def log_cv_run(
-    cv: CVResult, *, experiment: str = DEFAULT_EXPERIMENT, run_name: str | None = None
-) -> str:
-    """Log a standalone CV run (no model artifact) to MLflow and return its run id."""
-    import mlflow
-
-    setup_mlflow(experiment)
-    with mlflow.start_run(run_name=run_name or f"cv_{cv.horizon}") as run:
-        mlflow.set_tags({"stage": "evaluation", "horizon": cv.horizon})
-        mlflow.log_params({"horizon": cv.horizon, "n_features": len(cv.features), **cv.config})
-        mlflow.log_dict({"features": cv.features}, "features.json")
-        log_cv_metrics(cv)
-        mlflow.log_text(format_report(cv), "cv_report.md")
-        mlflow.log_text(cv.folds.to_csv(index=False), "cv_folds.csv")
-        return run.info.run_id
-
-
-# --- CLI ---
-def main(argv: list[str] | None = None) -> int:
-    from src.models.baselines import BASELINE_FACTORIES
-    from src.models.train import lightgbm_factory, load_feature_frame
-
-    configure_logging()
-    p = argparse.ArgumentParser(prog="python -m src.models.evaluate")
-    p.add_argument("--features", type=Path, default=FEATURES_PARQUET)
-    p.add_argument("--horizon", choices=sorted(HORIZONS), default=DAY_AHEAD.name)
-    p.add_argument("--n-splits", type=int, default=DEFAULT_N_SPLITS)
-    p.add_argument("--val-hours", type=int, default=DEFAULT_VAL_HOURS)
-    p.add_argument("--min-train-hours", type=int, default=DEFAULT_MIN_TRAIN_HOURS)
-    p.add_argument("--no-mlflow", action="store_true")
-    args = p.parse_args(argv)
-
-    df = load_feature_frame(args.features)
-    cv = cross_validate(
-        df,
-        {**BASELINE_FACTORIES, CHALLENGER_NAME: lightgbm_factory()},
-        HORIZONS[args.horizon],
-        n_splits=args.n_splits,
-        val_hours=args.val_hours,
-        min_train_hours=args.min_train_hours,
-    )
-    print(format_report(cv))
-    if not args.no_mlflow:
-        print(f"\nMLflow run: {log_cv_run(cv)}")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
