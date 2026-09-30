@@ -97,7 +97,13 @@ class StubPyfunc:
         return X["load_lag_168"].to_numpy() + self.bias
 
 
-def fake_champion(features: list[str], *, bias: float = 0.0, version: str = "1") -> LoadedModel:
+def fake_champion(
+    features: list[str],
+    *,
+    bias: float = 0.0,
+    version: str = "1",
+    train_end: pd.Timestamp | None = None,
+) -> LoadedModel:
     return LoadedModel(
         name="germany-load-day-ahead",
         version=version,
@@ -106,6 +112,7 @@ def fake_champion(features: list[str], *, bias: float = 0.0, version: str = "1")
         features=features,
         horizon=DAY_AHEAD,
         pyfunc=StubPyfunc(bias),
+        train_end=train_end,
     )
 
 
@@ -500,30 +507,29 @@ def test_drift_trigger_fires_and_drift_errors_are_contained(engine, cfg) -> None
 
 
 # --- Champion / challenger ---
-def test_challenger_skipped_without_fresh_data(engine, cfg, monkeypatch) -> None:
+def test_challenger_skipped_without_fresh_data(engine, cfg) -> None:
     load = seed_db(engine, days=60, with_model=False)
     frame = feature_frame(load)
-    champ = fake_champion(select_features(frame.columns, DAY_AHEAD))
-    monkeypatch.setattr(retrain.registry, "training_window", lambda m: (None, frame.index.max()))
+    champ = fake_champion(select_features(frame.columns, DAY_AHEAD), train_end=frame.index.max())
     out = retrain.run_champion_challenger(engine, champ, cfg, frame=frame)
     assert out.decision == "skipped" and "need 72h" in out.reason
     assert out.champion_mae is None
 
 
-def test_challenger_skipped_without_train_end(engine, cfg, monkeypatch) -> None:
+def test_challenger_skipped_without_train_end(engine, cfg) -> None:
     load = seed_db(engine, days=60, with_model=False)
     frame = feature_frame(load)
-    champ = fake_champion(select_features(frame.columns, DAY_AHEAD))
-    monkeypatch.setattr(retrain.registry, "training_window", lambda m: (None, None))
+    champ = fake_champion(select_features(frame.columns, DAY_AHEAD))  # no train_end recorded
     assert retrain.run_champion_challenger(engine, champ, cfg, frame=frame).decision == "skipped"
 
 
 def test_challenger_promoted_when_it_beats_champion_by_margin(engine, cfg, monkeypatch) -> None:
     load = seed_db(engine, days=90, with_model=False)
     frame = feature_frame(load)
-    champ = fake_champion(select_features(frame.columns, DAY_AHEAD), bias=3_000)  # a weak champion
     train_end = frame.index.max() - pd.Timedelta(days=5)
-    monkeypatch.setattr(retrain.registry, "training_window", lambda m: (None, train_end))
+    champ = fake_champion(  # a weak champion
+        select_features(frame.columns, DAY_AHEAD), bias=3_000, train_end=train_end
+    )
 
     dry = retrain.run_champion_challenger(
         engine, champ, cfg, frame=frame, dry_run=True, triggers=["x"]
@@ -551,13 +557,12 @@ def test_challenger_promoted_when_it_beats_champion_by_margin(engine, cfg, monke
     assert "promoted challenger as v9" in out.summary()
 
 
-def test_challenger_kept_when_margin_not_met(engine, cfg, monkeypatch) -> None:
+def test_challenger_kept_when_margin_not_met(engine, cfg) -> None:
     """The anti-churn margin: a champion as good as the candidate stays."""
     load = seed_db(engine, days=90, with_model=False)
     frame = feature_frame(load)
     cols = select_features(frame.columns, DAY_AHEAD)
     train_end = frame.index.max() - pd.Timedelta(days=5)
-    monkeypatch.setattr(retrain.registry, "training_window", lambda m: (None, train_end))
 
     # Champion = the very same LightGBM the challenger would be -> ~0% improvement.
     from src.models.train import LightGBMForecaster
@@ -570,7 +575,14 @@ def test_challenger_kept_when_margin_not_met(engine, cfg, monkeypatch) -> None:
             return twin.predict(X)
 
     champ = LoadedModel(
-        "germany-load-day-ahead", "1", "champion", "r", cols, DAY_AHEAD, TwinPyfunc()
+        "germany-load-day-ahead",
+        "1",
+        "champion",
+        "r",
+        cols,
+        DAY_AHEAD,
+        TwinPyfunc(),
+        train_end=train_end,
     )
     strict = retrain.RetrainConfig(
         min_holdout_hours=24 * 3, holdout_days=5, lgbm_params=FAST_LGBM, min_improvement_pct=50.0
@@ -634,13 +646,12 @@ def test_decisions_are_logged_to_mlflow_and_db(engine, cfg, tmp_path, monkeypatc
 def test_cli_check_only_and_force_dry_run(engine, cfg, monkeypatch, capsys) -> None:
     load = seed_db(engine, days=90, with_model=False)
     frame = feature_frame(load)
-    champ = fake_champion(select_features(frame.columns, DAY_AHEAD), bias=3_000)
-    monkeypatch.setattr(retrain.registry, "load_champion", lambda engine: champ)
-    monkeypatch.setattr(
-        retrain.registry,
-        "training_window",
-        lambda m: (None, frame.index.max() - pd.Timedelta(days=10)),
+    champ = fake_champion(
+        select_features(frame.columns, DAY_AHEAD),
+        bias=3_000,
+        train_end=frame.index.max() - pd.Timedelta(days=10),
     )
+    monkeypatch.setattr(retrain.registry, "load_champion", lambda engine: champ)
     monkeypatch.setattr(retrain, "build_features", lambda *a, **k: frame)
     monkeypatch.setattr(retrain.drift_mod, "run_evidently", fake_runner(set()))
     url = str(engine.url)

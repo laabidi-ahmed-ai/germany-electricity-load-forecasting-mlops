@@ -11,7 +11,7 @@ import pytest
 from src.features.build_features import TARGET, WEATHER_COLUMNS, build_feature_frame
 from src.features.horizons import DAY_AHEAD, NOWCAST, select_features
 from src.models import evaluate, tracking, train
-from src.models.baselines import BASELINE_FACTORIES, SeasonalNaive, seasonal_naive_168
+from src.models.baselines import BASELINE_FACTORIES, SeasonalNaive
 from src.models.evaluate import compute_metrics, cross_validate
 
 FAST_LGBM = {"n_estimators": 60, "learning_rate": 0.2, "num_leaves": 15, "min_child_samples": 5}
@@ -58,7 +58,7 @@ def test_seasonal_naive_predicts_the_lag_column(frame) -> None:
 def test_seasonal_naive_is_day_ahead_valid_by_construction() -> None:
     with pytest.raises(ValueError, match="lag_hours >= 24"):
         SeasonalNaive(1)
-    assert seasonal_naive_168().column in select_features(["load_lag_168", "load_lag_1"], DAY_AHEAD)
+    assert SeasonalNaive(168).column in select_features(["load_lag_168", "load_lag_1"], DAY_AHEAD)
     assert set(BASELINE_FACTORIES) == {"seasonal_naive_24", "seasonal_naive_168"}
 
 

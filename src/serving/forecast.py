@@ -59,12 +59,6 @@ class ForecastResult:
     def forecast(self) -> pd.DataFrame:
         return self.frame[["forecast_mw"]].reset_index()
 
-    def to_records(self) -> list[dict]:
-        return [
-            {"timestamp_utc": ts.isoformat(), "forecast_mw": round(float(v), 1)}
-            for ts, v in self.frame["forecast_mw"].items()
-        ]
-
 
 # --- Feature reconstruction ---
 def forecast_window(last_actual: pd.Timestamp, hours: int = DAY_AHEAD_HOURS) -> pd.DatetimeIndex:
@@ -78,15 +72,11 @@ def forecast_window(last_actual: pd.Timestamp, hours: int = DAY_AHEAD_HOURS) -> 
 
 
 def ensure_weather(
-    engine: Engine,
-    target: pd.DatetimeIndex,
-    weather_client: WeatherClient | None,
-    *,
-    n_cities: int | None = None,
+    engine: Engine, target: pd.DatetimeIndex, weather_client: WeatherClient | None
 ) -> None:
     """Fetch + upsert the Open-Meteo forecast if the DB lacks weather for any target hour."""
     have = db.read_table(engine, db.WeatherHourly, start=target.min(), end=target.max())
-    expected_cities = n_cities or (len(weather_client.cities) if weather_client else 0)
+    expected_cities = len(weather_client.cities) if weather_client else 0
     complete = (
         not have.empty
         and have.groupby("timestamp_utc").size().reindex(target).fillna(0).ge(expected_cities).all()
@@ -114,14 +104,13 @@ def build_serving_features(
     weather_client: WeatherClient | None = None,
     hours: int = DAY_AHEAD_HOURS,
     as_of: pd.Timestamp | None = None,
-    load_source: str = LOAD_SOURCE,
 ) -> tuple[pd.DataFrame, pd.Timestamp]:
     """Return ``(full feature frame for the target hours, last_actual)``.
 
     ``as_of`` pretends the latest known load is at/before that time (for backtests);
     default is the real latest actual in the database.
     """
-    last_actual = db.latest_timestamp(engine, db.LoadActual, source=load_source)
+    last_actual = db.latest_timestamp(engine, db.LoadActual, source=LOAD_SOURCE)
     if last_actual is None:
         raise NoDataError("no actual load in the database - run the ingestion first")
     if as_of is not None:
@@ -129,7 +118,7 @@ def build_serving_features(
 
     target = forecast_window(last_actual, hours)
     hist_start = last_actual - pd.Timedelta(hours=HISTORY_HOURS)
-    history = db.read_load(engine, source=load_source, start=hist_start, end=last_actual)
+    history = db.read_load(engine, source=LOAD_SOURCE, start=hist_start, end=last_actual)
     if history.empty or history["timestamp_utc"].max() != last_actual:
         raise NoDataError(f"could not read actual load up to {last_actual}")
 

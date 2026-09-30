@@ -252,7 +252,6 @@ class ChallengerOutcome:
     challenger_mape: float | None = None
     improvement_pct: float | None = None
     training_run_id: str | None = None
-    retrain_run_id: str | None = None
     triggers: list[str] = field(default_factory=list)
 
     def summary(self) -> str:
@@ -295,7 +294,7 @@ def run_champion_challenger(
     cols = select_features(frame.columns, DAY_AHEAD)
     champion.check_features(list(frame.columns))
 
-    _, train_end = registry.training_window(champion)
+    train_end = champion.train_end
     if train_end is None:
         return ChallengerOutcome("skipped", "champion has no recorded train_end", champion.version)
 

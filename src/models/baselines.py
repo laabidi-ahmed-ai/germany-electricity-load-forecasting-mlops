@@ -10,6 +10,8 @@ observation >= 24h old, see ``src.features.horizons``).
 
 from __future__ import annotations
 
+from functools import partial
+
 import numpy as np
 import pandas as pd
 
@@ -38,19 +40,5 @@ class SeasonalNaive:
     def get_params(self) -> dict[str, int]:
         return {"lag_hours": self.lag_hours}
 
-    def __repr__(self) -> str:
-        return f"SeasonalNaive(lag_hours={self.lag_hours})"
 
-
-def seasonal_naive_24() -> SeasonalNaive:
-    return SeasonalNaive(24)
-
-
-def seasonal_naive_168() -> SeasonalNaive:
-    return SeasonalNaive(168)
-
-
-BASELINE_FACTORIES = {
-    "seasonal_naive_24": seasonal_naive_24,
-    "seasonal_naive_168": seasonal_naive_168,
-}
+BASELINE_FACTORIES = {f"seasonal_naive_{k}": partial(SeasonalNaive, k) for k in (24, 168)}

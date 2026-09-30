@@ -235,8 +235,6 @@ def test_make_day_ahead_forecast_uses_champion_and_served_features(
     assert list(result.frame.columns) == ["forecast_mw", *day_ahead_features]
     np.testing.assert_allclose(result.frame["forecast_mw"], result.frame["load_lag_168"] + 100)
     assert result.issued_at.tzinfo is not None
-    recs = result.to_records()
-    assert len(recs) == 24 and recs[0]["timestamp_utc"].endswith("+00:00")
 
 
 def test_forecast_refuses_model_with_different_features(seeded, day_ahead_features) -> None:

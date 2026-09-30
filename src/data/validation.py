@@ -98,8 +98,6 @@ def validate_load(
     df: pd.DataFrame,
     *,
     min_rows: int = 1,
-    mean_range: tuple[float, float] = (LOAD_MIN_MW, LOAD_MAX_MW),
-    row_range: tuple[float, float] = (LOAD_MIN_MW, LOAD_MAX_MW),
     max_outlier_frac: float = 0.01,
     max_gap_warning_hours: int = 24,
     raise_on_error: bool = True,
@@ -141,22 +139,21 @@ def validate_load(
     report.min_load_mw = float(load.min())
     report.max_load_mw = float(load.max())
 
-    lo, hi = mean_range
+    lo, hi = LOAD_MIN_MW, LOAD_MAX_MW
     if not (lo <= report.mean_load_mw <= hi):
         report.errors.append(
             f"mean load {report.mean_load_mw:,.0f} MW outside sane range [{lo:,.0f}, {hi:,.0f}]"
         )
 
-    rlo, rhi = row_range
-    outliers = (load < rlo) | (load > rhi)
+    outliers = (load < lo) | (load > hi)
     report.outlier_rows = int(outliers.sum())
     frac = report.outlier_rows / len(df)
     if frac > max_outlier_frac:
         report.errors.append(
-            f"{report.outlier_rows} rows ({frac:.2%}) outside [{rlo:,.0f}, {rhi:,.0f}] MW"
+            f"{report.outlier_rows} rows ({frac:.2%}) outside [{lo:,.0f}, {hi:,.0f}] MW"
         )
     elif report.outlier_rows:
-        report.warnings.append(f"{report.outlier_rows} rows outside [{rlo:,.0f}, {rhi:,.0f}] MW")
+        report.warnings.append(f"{report.outlier_rows} rows outside [{lo:,.0f}, {hi:,.0f}] MW")
 
     report.gaps = find_gaps(ts.drop_duplicates())
     for gap in report.gaps:

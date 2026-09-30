@@ -34,7 +34,7 @@ from config.log import configure_logging
 from config.settings import get_settings
 from src.data import db
 from src.data.entsoe_client import EntsoeClient
-from src.data.smard_client import SmardClient
+from src.data.smard_client import FORECAST_LOOKAHEAD, SmardClient
 from src.data.validation import DataValidationError, validate_load, validate_weather
 from src.data.weather_client import SOURCE_ARCHIVE, WeatherClient
 
@@ -80,16 +80,37 @@ def _span(df: pd.DataFrame) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
 
 
 # --- Per-source ingestion steps ---
+def _validate_forecast(df: pd.DataFrame) -> None:
+    """An official forecast is checked like actual load: same quantity, same sane range."""
+    validate_load(df.rename(columns={"forecast_mw": "load_mw"}))
+
+
+def _store(
+    engine: Engine,
+    name: str,
+    df: pd.DataFrame,
+    model: type[db.Base],
+    *,
+    validate: Callable[[pd.DataFrame], Any],
+    source: str | None = None,
+    update_where: db.UpdateWhere | None = None,
+) -> IngestResult:
+    """Validate one fetched batch and upsert it; an empty batch is reported as skipped."""
+    if df.empty:
+        return IngestResult(name, status="skipped", message="no rows")
+    validate(df)
+    if source is not None:
+        df = df.assign(source=source)
+    n = db.upsert_dataframe(engine, model, df, update_where=update_where)
+    lo, hi = _span(df)
+    return IngestResult(name, rows=n, start=lo, end=hi)
+
+
 def ingest_smard(
     engine: Engine, client: SmardClient, start: pd.Timestamp, end: pd.Timestamp | None = None
 ) -> IngestResult:
     df = client.fetch_load(start, end)
-    if df.empty:
-        return IngestResult(SOURCE_SMARD, status="skipped", message="no new rows")
-    validate_load(df)
-    n = db.upsert_dataframe(engine, db.LoadActual, df.assign(source=SOURCE_SMARD))
-    lo, hi = _span(df)
-    return IngestResult(SOURCE_SMARD, rows=n, start=lo, end=hi)
+    return _store(engine, "smard", df, db.LoadActual, validate=validate_load, source=SOURCE_SMARD)
 
 
 def ingest_smard_forecast(
@@ -97,36 +118,42 @@ def ingest_smard_forecast(
 ) -> IngestResult:
     """Official day-ahead load forecast (SMARD filter 411) -> ``load_forecast_official``."""
     df = client.fetch_forecast(start, end)
-    if df.empty:
-        return IngestResult("smard_forecast", status="skipped", message="no new rows")
-    validate_load(df.rename(columns={"forecast_mw": "load_mw"}))  # same sanity range
-    n = db.upsert_dataframe(engine, db.LoadForecastOfficial, df.assign(source=SOURCE_SMARD))
-    lo, hi = _span(df)
-    return IngestResult("smard_forecast", rows=n, start=lo, end=hi)
+    return _store(
+        engine,
+        "smard_forecast",
+        df,
+        db.LoadForecastOfficial,
+        validate=_validate_forecast,
+        source=SOURCE_SMARD,
+    )
 
 
 def ingest_weather_history(
     engine: Engine, client: WeatherClient, start: pd.Timestamp, end: pd.Timestamp | None = None
 ) -> IngestResult:
     df = client.fetch_historical(start, end)
-    if df.empty:
-        return IngestResult("weather_archive", status="skipped", message="no new rows")
-    validate_weather(df)
-    n = db.upsert_dataframe(engine, db.WeatherHourly, df, update_where=db.weather_update_where)
-    lo, hi = _span(df)
-    return IngestResult("weather_archive", rows=n, start=lo, end=hi)
+    return _store(
+        engine,
+        "weather_archive",
+        df,
+        db.WeatherHourly,
+        validate=validate_weather,
+        update_where=db.weather_update_where,
+    )
 
 
 def ingest_weather_forecast(
     engine: Engine, client: WeatherClient, *, past_days: int = 2, forecast_days: int = 3
 ) -> IngestResult:
     df = client.fetch_forecast(past_days=past_days, forecast_days=forecast_days)
-    if df.empty:
-        return IngestResult("weather_forecast", status="skipped", message="no rows")
-    validate_weather(df)
-    n = db.upsert_dataframe(engine, db.WeatherHourly, df, update_where=db.weather_update_where)
-    lo, hi = _span(df)
-    return IngestResult("weather_forecast", rows=n, start=lo, end=hi)
+    return _store(
+        engine,
+        "weather_forecast",
+        df,
+        db.WeatherHourly,
+        validate=validate_weather,
+        update_where=db.weather_update_where,
+    )
 
 
 def ingest_entsoe(
@@ -146,31 +173,26 @@ def ingest_entsoe(
             IngestResult("entsoe_forecast", status="skipped", message=msg),
         ]
 
-    results: list[IngestResult] = []
-
-    actual = client.fetch_actual_load(start, end)
-    if actual.empty:
-        results.append(IngestResult("entsoe_actual", status="skipped", message="no rows"))
-    else:
-        validate_load(actual)
-        n = db.upsert_dataframe(engine, db.LoadActual, actual.assign(source=SOURCE_ENTSOE))
-        lo, hi = _span(actual)
-        results.append(IngestResult("entsoe_actual", rows=n, start=lo, end=hi))
-
-    f_start = forecast_start if forecast_start is not None else start
-    f_end = forecast_end if forecast_end is not None else end
-    forecast = client.fetch_dayahead_forecast(f_start, f_end)
-    if forecast.empty:
-        results.append(IngestResult("entsoe_forecast", status="skipped", message="no rows"))
-    else:
-        # Same sanity checks as actual load (it forecasts the same quantity).
-        validate_load(forecast.rename(columns={"forecast_mw": "load_mw"}))
-        n = db.upsert_dataframe(
-            engine, db.LoadForecastOfficial, forecast.assign(source=SOURCE_ENTSOE)
-        )
-        lo, hi = _span(forecast)
-        results.append(IngestResult("entsoe_forecast", rows=n, start=lo, end=hi))
-    return results
+    actual = _store(
+        engine,
+        "entsoe_actual",
+        client.fetch_actual_load(start, end),
+        db.LoadActual,
+        validate=validate_load,
+        source=SOURCE_ENTSOE,
+    )
+    forecast = _store(
+        engine,
+        "entsoe_forecast",
+        client.fetch_dayahead_forecast(
+            forecast_start if forecast_start is not None else start,
+            forecast_end if forecast_end is not None else end,
+        ),
+        db.LoadForecastOfficial,
+        validate=_validate_forecast,
+        source=SOURCE_ENTSOE,
+    )
+    return [actual, forecast]
 
 
 # --- Modes ---
@@ -187,6 +209,18 @@ def _guard(
     except Exception as err:  # keep other sources running
         log.exception("%s: ingestion failed", source)
         return [IngestResult(source, status="failed", message=str(err))]
+
+
+def _resume_from(
+    engine: Engine,
+    model: type[db.Base],
+    overlap: pd.Timedelta,
+    default: pd.Timestamp,
+    **filters: Any,
+) -> pd.Timestamp:
+    """Latest stored hour minus ``overlap`` (to pick up late corrections), else ``default``."""
+    latest = db.latest_timestamp(engine, model, **filters)
+    return default if latest is None else latest - overlap
 
 
 def run_backfill(
@@ -207,9 +241,8 @@ def run_backfill(
     results: list[IngestResult] = []
     if SOURCE_SMARD in sources:
         results += _guard("smard", ingest_smard, engine, clients.smard, start_ts, end_ts)
-        fc_end = end_ts if end_ts is not None else pd.Timestamp.now(tz="UTC") + pd.Timedelta(days=2)
         results += _guard(
-            "smard_forecast", ingest_smard_forecast, engine, clients.smard, start_ts, fc_end
+            "smard_forecast", ingest_smard_forecast, engine, clients.smard, start_ts, end_ts
         )
     if SOURCE_WEATHER in sources:
         results += _guard(
@@ -230,6 +263,7 @@ def run_incremental(
     """Pull only new hours since the latest stored timestamp per source."""
     settings = get_settings()
     now_ts = now or pd.Timestamp.now(tz="UTC")
+    forecast_end = now_ts + FORECAST_LOOKAHEAD
     default_start = db.to_utc(settings.data_start_date)
     log.info("=== incremental ingestion at %s | sources=%s", now_ts, ",".join(sources))
 
@@ -237,33 +271,42 @@ def run_incremental(
     results: list[IngestResult] = []
 
     if SOURCE_SMARD in sources:
-        latest = db.latest_timestamp(engine, db.LoadActual, source=SOURCE_SMARD)
-        start = (latest - LOAD_OVERLAP) if latest is not None else default_start
+        start = _resume_from(
+            engine, db.LoadActual, LOAD_OVERLAP, default_start, source=SOURCE_SMARD
+        )
+        fc_start = _resume_from(
+            engine, db.LoadForecastOfficial, LOAD_OVERLAP, default_start, source=SOURCE_SMARD
+        )
         results += _guard("smard", ingest_smard, engine, clients.smard, start, now_ts)
-        latest_fc = db.latest_timestamp(engine, db.LoadForecastOfficial, source=SOURCE_SMARD)
-        fc_start = (latest_fc - LOAD_OVERLAP) if latest_fc is not None else default_start
         results += _guard(
             "smard_forecast",
             ingest_smard_forecast,
             engine,
             clients.smard,
             fc_start,
-            now_ts + pd.Timedelta(days=2),  # tomorrow's forecast is already published
+            forecast_end,
         )
 
     if SOURCE_WEATHER in sources:
-        latest = db.latest_timestamp(engine, db.WeatherHourly, source=SOURCE_ARCHIVE)
-        start = (latest - WEATHER_ARCHIVE_OVERLAP) if latest is not None else default_start
+        start = _resume_from(
+            engine,
+            db.WeatherHourly,
+            WEATHER_ARCHIVE_OVERLAP,
+            default_start,
+            source=SOURCE_ARCHIVE,
+        )
         results += _guard(
             "weather_archive", ingest_weather_history, engine, clients.weather, start, now_ts
         )
         results += _guard("weather_forecast", ingest_weather_forecast, engine, clients.weather)
 
     if SOURCE_ENTSOE in sources:
-        latest_actual = db.latest_timestamp(engine, db.LoadActual, source=SOURCE_ENTSOE)
-        latest_fc = db.latest_timestamp(engine, db.LoadForecastOfficial, source=SOURCE_ENTSOE)
-        a_start = (latest_actual - LOAD_OVERLAP) if latest_actual is not None else default_start
-        f_start = (latest_fc - LOAD_OVERLAP) if latest_fc is not None else default_start
+        a_start = _resume_from(
+            engine, db.LoadActual, LOAD_OVERLAP, default_start, source=SOURCE_ENTSOE
+        )
+        f_start = _resume_from(
+            engine, db.LoadForecastOfficial, LOAD_OVERLAP, default_start, source=SOURCE_ENTSOE
+        )
         results += _guard(
             "entsoe",
             ingest_entsoe,
@@ -272,7 +315,7 @@ def run_incremental(
             a_start,
             now_ts,
             forecast_start=f_start,
-            forecast_end=now_ts + pd.Timedelta(days=2),  # day-ahead is published for tomorrow
+            forecast_end=forecast_end,
         )
     return results
 

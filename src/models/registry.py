@@ -57,7 +57,7 @@ _METRIC_KEYS = (
 
 @dataclass
 class LoadedModel:
-    """A model ready to predict on a feature frame (from the DB export or MLflow)."""
+    """A model ready to predict on a feature frame (loaded from the database export)."""
 
     name: str
     version: str
@@ -69,7 +69,6 @@ class LoadedModel:
     train_start: pd.Timestamp | None = None
     train_end: pd.Timestamp | None = None
     metrics: dict[str, float] | None = None
-    source: str = "db"
 
     @property
     def version_label(self) -> str:
@@ -241,24 +240,7 @@ def load_champion(
         train_start=_utc_or_none(row["train_start"]),
         train_end=_utc_or_none(row["train_end"]),
         metrics=json.loads(row["metrics"]) if row["metrics"] else None,
-        source="db",
     )
-
-
-def training_window(
-    model: LoadedModel, *, experiment: str = DEFAULT_EXPERIMENT
-) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
-    """``(train_start, train_end)`` of the model - from its export metadata, else its MLflow run."""
-    if model.train_end is not None:
-        return model.train_start, model.train_end
-    if model.run_id is None:
-        return None, None
-    try:
-        start, end, _ = _run_metadata(model.run_id, experiment=experiment)
-    except Exception as err:  # the run may live in another tracking store
-        log.warning("could not read run %s from MLflow: %s", model.run_id, err)
-        return None, None
-    return start, end
 
 
 # --- helpers ---

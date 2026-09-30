@@ -98,7 +98,7 @@ def test_register_promote_export_and_load_from_db(env) -> None:
 
     # Load from the DB into a fresh cache dir (= a fresh runner) and compare predictions.
     champ = registry.load_champion(engine, cache_dir=env["cache"])
-    assert champ.source == "db" and champ.version == str(mv.version)
+    assert champ.version == str(mv.version)
     assert champ.features == select_features(env["frame"].columns, DAY_AHEAD)
     assert "load_lag_1" not in champ.features
     assert champ.train_end is not None and champ.train_start < champ.train_end
@@ -121,9 +121,6 @@ def test_register_promote_export_and_load_from_db(env) -> None:
         champ.check_features([c for c in df.columns if c != "hour"])
     with pytest.raises(ValueError, match="missing model inputs"):
         champ.predict(df.drop(columns=["load_lag_24"]))
-
-    # training_window comes straight from the export metadata (no MLflow needed).
-    assert registry.training_window(champ) == (champ.train_start, champ.train_end)
 
 
 def test_loading_uses_the_cache_and_detects_corruption(env) -> None:

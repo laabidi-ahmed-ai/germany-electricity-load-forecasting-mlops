@@ -193,27 +193,23 @@ def expanding_window_splits(
     n_splits: int,
     val_hours: int,
     min_train_hours: int = 24 * 365,
-    gap_hours: int = 0,
 ) -> Iterator[tuple[pd.DataFrame, pd.DataFrame]]:
     """Expanding-window time-series CV: yields ``(train, val)`` pairs, oldest first.
 
     The last ``n_splits`` blocks of ``val_hours`` are validation folds; each fold
-    trains on *everything* before it (minus an optional ``gap_hours`` buffer).
+    trains on *everything* before it.
     """
     idx = df.index
     end = idx.max() + pd.Timedelta(hours=1)
     fold_starts = [end - pd.Timedelta(hours=val_hours * (n_splits - i)) for i in range(n_splits)]
     for start in fold_starts:
         stop = start + pd.Timedelta(hours=val_hours)
-        train_stop = start - pd.Timedelta(hours=gap_hours)
-        train = df[idx < train_stop]
+        train = df[idx < start]
         val = df[(idx >= start) & (idx < stop)]
         if len(train) < min_train_hours:
             raise ValueError(
                 f"fold starting {start} has only {len(train)} training hours (< {min_train_hours})"
             )
-        if not train.index.max() < val.index.min():
-            raise ValueError(f"fold starting {start} overlaps its training data")
         yield train, val
 
 

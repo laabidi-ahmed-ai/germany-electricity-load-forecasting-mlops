@@ -36,7 +36,6 @@ log = logging.getLogger(__name__)
 
 DEFAULT_N_SPLITS = 12
 DEFAULT_VAL_HOURS = 24 * 30  # one-month folds -> 12 folds = the last year
-DEFAULT_GAP_HOURS = 0
 DEFAULT_MIN_TRAIN_HOURS = 24 * 365
 
 METRICS = ("mae", "rmse", "mape")
@@ -104,7 +103,6 @@ def cross_validate(
     *,
     n_splits: int = DEFAULT_N_SPLITS,
     val_hours: int = DEFAULT_VAL_HOURS,
-    gap_hours: int = DEFAULT_GAP_HOURS,
     min_train_hours: int = DEFAULT_MIN_TRAIN_HOURS,
 ) -> CVResult:
     """Fit/score every model on every expanding-window fold with horizon-valid features."""
@@ -115,7 +113,6 @@ def cross_validate(
     config = {
         "n_splits": n_splits,
         "val_hours": val_hours,
-        "gap_hours": gap_hours,
         "min_train_hours": min_train_hours,
     }
     log.info(
@@ -128,7 +125,6 @@ def cross_validate(
         n_splits=n_splits,
         val_hours=val_hours,
         min_train_hours=min_train_hours,
-        gap_hours=gap_hours,
     )
     for k, (train, val) in enumerate(folds):
         X_tr, y_tr = train[features], train[TARGET]
@@ -247,7 +243,6 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--horizon", choices=sorted(HORIZONS), default=DAY_AHEAD.name)
     p.add_argument("--n-splits", type=int, default=DEFAULT_N_SPLITS)
     p.add_argument("--val-hours", type=int, default=DEFAULT_VAL_HOURS)
-    p.add_argument("--gap-hours", type=int, default=DEFAULT_GAP_HOURS)
     p.add_argument("--min-train-hours", type=int, default=DEFAULT_MIN_TRAIN_HOURS)
     p.add_argument("--no-mlflow", action="store_true")
     args = p.parse_args(argv)
@@ -259,7 +254,6 @@ def main(argv: list[str] | None = None) -> int:
         HORIZONS[args.horizon],
         n_splits=args.n_splits,
         val_hours=args.val_hours,
-        gap_hours=args.gap_hours,
         min_train_hours=args.min_train_hours,
     )
     print(format_report(cv))

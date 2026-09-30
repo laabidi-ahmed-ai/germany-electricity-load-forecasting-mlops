@@ -92,6 +92,14 @@ class ForecastPoint(BaseModel):
     forecast_mw: float
 
 
+def forecast_points(forecast_mw: pd.Series) -> list[ForecastPoint]:
+    """``forecast_mw`` indexed by UTC timestamp -> response points (MW rounded to 0.1)."""
+    return [
+        ForecastPoint(timestamp_utc=ts.to_pydatetime(), forecast_mw=round(float(v), 1))
+        for ts, v in forecast_mw.items()
+    ]
+
+
 class ForecastResponse(BaseModel):
     model: ModelInfo
     horizon: str
@@ -160,10 +168,7 @@ def create_app(state_loader: Callable[[], AppState] = default_state_loader) -> F
             last_actual_utc=result.last_actual.to_pydatetime(),
             target_start_utc=result.target_start.to_pydatetime(),
             target_end_utc=result.target_end.to_pydatetime(),
-            forecast=[
-                ForecastPoint(timestamp_utc=ts.to_pydatetime(), forecast_mw=round(float(v), 1))
-                for ts, v in result.frame["forecast_mw"].items()
-            ],
+            forecast=forecast_points(result.frame["forecast_mw"]),
         )
 
     @app.get("/forecast/latest", response_model=ForecastResponse)
@@ -185,13 +190,7 @@ def create_app(state_loader: Callable[[], AppState] = default_state_loader) -> F
             last_actual_utc=last_actual.to_pydatetime(),
             target_start_utc=latest["timestamp_utc"].min().to_pydatetime(),
             target_end_utc=latest["timestamp_utc"].max().to_pydatetime(),
-            forecast=[
-                ForecastPoint(
-                    timestamp_utc=r.timestamp_utc.to_pydatetime(),
-                    forecast_mw=round(r.forecast_mw, 1),
-                )
-                for r in latest.sort_values("timestamp_utc").itertuples(index=False)
-            ],
+            forecast=forecast_points(latest.set_index("timestamp_utc")["forecast_mw"].sort_index()),
         )
 
     return app

@@ -259,15 +259,14 @@ def test_no_fitted_transform_in_feature_frame(load, weather) -> None:
 # --- Time-based splits ---
 def test_expanding_window_folds_grow_and_never_overlap(load, weather) -> None:
     df = build_feature_frame(load, weather)
-    folds = list(
-        expanding_window_splits(df, n_splits=3, val_hours=48, min_train_hours=100, gap_hours=24)
-    )
+    folds = list(expanding_window_splits(df, n_splits=3, val_hours=48, min_train_hours=100))
     assert len(folds) == 3
     prev_train = 0
     for train, val in folds:
         assert len(val) == 48
-        assert train.index.max() < val.index.min()
-        assert val.index.min() - train.index.max() >= pd.Timedelta(hours=24 + 1)  # gap honoured
+        assert val.index.min() - train.index.max() == pd.Timedelta(
+            hours=1
+        )  # contiguous, no overlap
         assert len(train) > prev_train  # expanding
         prev_train = len(train)
     # Folds tile the end of the series, most recent last.

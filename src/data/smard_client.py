@@ -36,6 +36,10 @@ FILTER_ACTUAL_LOAD = 410  # Realisierter Stromverbrauch: Gesamt (Netzlast)
 FILTER_FORECAST_LOAD = 411  # Prognostizierter Stromverbrauch: Gesamt (Netzlast) - day-ahead
 RESOLUTION_HOUR = "hour"
 
+# The official forecast for tomorrow is already published today, so forecast fetches
+# reach this far past "now".
+FORECAST_LOOKAHEAD = pd.Timedelta(days=2)
+
 _MS_PER_HOUR = 3_600_000
 _WEEK_MS = 7 * 24 * _MS_PER_HOUR
 
@@ -95,7 +99,7 @@ class SmardClient:
         published today, and that is what monitoring compares the model against.
         """
         if end is None:
-            end = pd.Timestamp.now(tz="UTC") + pd.Timedelta(days=2)
+            end = pd.Timestamp.now(tz="UTC") + FORECAST_LOOKAHEAD
         return self._fetch_series(FILTER_FORECAST_LOAD, "forecast_mw", start, end)
 
     def _fetch_series(

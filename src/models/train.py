@@ -219,7 +219,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--horizon", choices=sorted(HORIZONS), default=DAY_AHEAD.name)
     p.add_argument("--n-splits", type=int, default=evaluate.DEFAULT_N_SPLITS)
     p.add_argument("--val-hours", type=int, default=evaluate.DEFAULT_VAL_HOURS)
-    p.add_argument("--gap-hours", type=int, default=evaluate.DEFAULT_GAP_HOURS)
     p.add_argument("--min-train-hours", type=int, default=evaluate.DEFAULT_MIN_TRAIN_HOURS)
     p.add_argument("--no-mlflow", action="store_true", help="skip MLflow logging")
     return p
@@ -238,7 +237,6 @@ def main(argv: list[str] | None = None) -> int:
         horizon,
         n_splits=args.n_splits,
         val_hours=args.val_hours,
-        gap_hours=args.gap_hours,
         min_train_hours=args.min_train_hours,
     )
     print(evaluate.format_report(cv))
