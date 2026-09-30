@@ -6,7 +6,6 @@
 # and well inside the free Actions quota. Keep in sync with pyproject.toml floors.
 # (tests/test_workflows.py checks the ingest CLI imports nothing beyond this set.)
 requests>=2.31
-entsoe-py>=0.6
 pandas>=2.1
 numpy>=1.26
 sqlalchemy>=2.0

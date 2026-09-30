@@ -6,7 +6,6 @@ import numpy as np
 import pandas as pd
 
 from src.data import db, ingest
-from src.data.entsoe_client import EntsoeClient
 from src.data.smard_client import SmardClient
 from src.data.weather_client import City, WeatherClient
 from tests.conftest import (
@@ -15,7 +14,6 @@ from tests.conftest import (
     open_meteo_route,
     smard_routes,
 )
-from tests.test_entsoe_client import FakePandasClient
 
 SMARD_BASE = "https://smard.test/app/chart_data"
 ARCHIVE = "https://archive.test/v1/archive"
@@ -27,7 +25,6 @@ def make_clients(
     *,
     weeks: dict[int, int] | None = None,
     weather_end: str = "2021-04-04T21:00",
-    entsoe_token: str | None = None,
     smard_routes_override: dict | None = None,
 ) -> tuple[ingest.Clients, FakeSession]:
     routes = smard_routes_override or smard_routes(SMARD_BASE, "DE", weeks)
@@ -39,7 +36,6 @@ def make_clients(
         weather=WeatherClient(
             session=session, cities=CITIES, archive_url=ARCHIVE, forecast_base_url=FORECAST_BASE
         ),
-        entsoe=EntsoeClient(token=entsoe_token, client_factory=lambda _: FakePandasClient()),
     )
     return clients, session
 
@@ -49,28 +45,24 @@ def by_source(results: list[ingest.IngestResult]) -> dict[str, ingest.IngestResu
 
 
 # --- backfill ---
-def test_backfill_without_token_loads_smard_and_weather_and_skips_entsoe(engine) -> None:
+def test_backfill_loads_smard_and_weather(engine) -> None:
     clients, _ = make_clients()
     results = by_source(ingest.run_backfill(engine, clients, start="2021-03-21", end="2021-04-05"))
 
     assert results["smard"].status == "ok" and results["smard"].rows == 335
     assert results["smard_forecast"].status == "ok" and results["smard_forecast"].rows == 335
     assert results["weather_archive"].status == "ok"
-    assert results["entsoe_actual"].status == "skipped"
-    assert results["entsoe_forecast"].status == "skipped"
     assert not any(r.failed for r in results.values())
 
-    load = db.read_load(engine, source="smard")
+    load = db.read_load(engine)
     assert len(load) == 335
     assert 50_000 < load["load_mw"].mean() < 60_000
     assert load["timestamp_utc"].min() == pd.Timestamp("2021-03-21T23:00Z")
-    assert db.count_rows(engine, db.LoadActual, source="entsoe") == 0
     # The official day-ahead forecast (SMARD 411) lands in load_forecast_official.
     official = db.read_table(engine, db.LoadForecastOfficial, source="smard")
     assert len(official) == 335
     merged = load.merge(official, on="timestamp_utc")
     np.testing.assert_allclose(merged["forecast_mw"], merged["load_mw"] * 0.98)
-    assert db.count_rows(engine, db.LoadForecastOfficial, source="entsoe") == 0
     assert db.count_rows(engine, db.WeatherHourly) == 335 * len(CITIES)
 
 
@@ -88,20 +80,6 @@ def test_backfill_is_idempotent(engine) -> None:
     ingest.run_backfill(engine, clients, start="2021-03-21", end="2021-04-05")
     assert db.count_rows(engine, db.LoadActual) == 335
     assert db.count_rows(engine, db.WeatherHourly) == 335 * len(CITIES)
-
-
-def test_backfill_with_token_stores_entsoe_actual_and_official_forecast(engine) -> None:
-    clients, _ = make_clients(entsoe_token="tok")
-    results = by_source(
-        ingest.run_backfill(
-            engine, clients, start="2021-03-21", end="2021-03-23", sources=("entsoe",)
-        )
-    )
-    assert results["entsoe_actual"].status == "ok" and results["entsoe_actual"].rows == 48
-    assert results["entsoe_forecast"].status == "ok" and results["entsoe_forecast"].rows == 48
-    assert db.count_rows(engine, db.LoadActual, source="entsoe") == 48
-    assert db.count_rows(engine, db.LoadForecastOfficial, source="entsoe") == 48
-    assert db.count_rows(engine, db.LoadActual, source="smard") == 0
 
 
 def test_validation_failure_writes_nothing_and_does_not_block_other_sources(engine) -> None:
@@ -156,11 +134,10 @@ def test_incremental_fetches_only_new_hours_without_duplicates(engine) -> None:
     assert results["smard_forecast"].status == "ok"
     assert results["weather_archive"].status == "ok"
     assert results["weather_forecast"].status == "ok"
-    assert results["entsoe_actual"].status == "skipped"
     assert db.count_rows(engine, db.LoadForecastOfficial, source="smard") == 335
 
     # No duplicates, everything contiguous in UTC.
-    load = db.read_load(engine, source="smard")
+    load = db.read_load(engine)
     assert len(load) == 335
     assert not load["timestamp_utc"].duplicated().any()
     assert set(load["timestamp_utc"].diff().dropna()) == {pd.Timedelta(hours=1)}
@@ -193,20 +170,6 @@ def test_incremental_weather_forecast_does_not_overwrite_archive(engine) -> None
     assert (overlap["source"] == "archive").all()
     future = w[w["timestamp_utc"] > pd.Timestamp("2021-04-04T21:00Z")]
     assert (future["source"] == "forecast").all() and len(future) > 0
-
-
-def test_incremental_with_token_queries_entsoe_from_latest(engine) -> None:
-    clients, _ = make_clients(entsoe_token="tok")
-    ingest.run_backfill(engine, clients, start="2021-03-21", end="2021-03-23", sources=("entsoe",))
-    now = pd.Timestamp("2021-03-24T00:00Z")
-    results = by_source(ingest.run_incremental(engine, clients, sources=("entsoe",), now=now))
-    assert results["entsoe_actual"].status == "ok"
-    assert results["entsoe_forecast"].status == "ok"
-    # actual: from latest(03-22T23) - 48h = 03-21T23 -> 03-24T00 => 49 rows, no duplicates
-    assert db.count_rows(engine, db.LoadActual, source="entsoe") == 73  # 03-21T00 .. 03-24T00
-    # official forecast is fetched two days into the future
-    latest_fc = db.latest_timestamp(engine, db.LoadForecastOfficial)
-    assert latest_fc == now + pd.Timedelta(days=2) - pd.Timedelta(hours=1)
 
 
 # --- CLI ---
@@ -257,7 +220,7 @@ def test_summarize_lists_every_result() -> None:
     text = ingest.summarize(
         [
             ingest.IngestResult("smard", rows=5, start=pd.Timestamp("2021-01-01T00:00Z")),
-            ingest.IngestResult("entsoe_actual", status="skipped", message="no token"),
+            ingest.IngestResult("weather_forecast", status="skipped", message="no rows"),
         ]
     )
-    assert "smard" in text and "entsoe_actual" in text and "no token" in text
+    assert "smard" in text and "weather_forecast" in text and "no rows" in text

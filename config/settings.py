@@ -3,17 +3,14 @@
 All secrets and environment-specific values are read from environment variables
 or a local ``.env`` file via ``pydantic-settings``. Nothing is hardcoded here.
 
-Every field has a safe default so the project runs *without* any secret set:
-ENTSO-E is optional (SMARD / historical data is used until the token arrives),
-and the database falls back to a local SQLite file for development.
+Every field has a safe default so the project runs *without* any secret set: all data
+sources are keyless, and the database falls back to a local SQLite file for development.
 
 Usage::
 
     from config.settings import get_settings
 
     settings = get_settings()
-    if settings.has_entsoe_token:
-        ...
 """
 
 from __future__ import annotations
@@ -23,7 +20,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Repository root (this file lives in <root>/config/settings.py).
@@ -41,10 +38,6 @@ class Settings(BaseSettings):
     )
 
     # --- external APIs ------------------------------------------------------
-    entsoe_api_token: SecretStr | None = Field(
-        default=None,
-        description="ENTSO-E Transparency Platform security token. Optional.",
-    )
     open_meteo_base_url: str = Field(
         default="https://api.open-meteo.com/v1",
         description="Open-Meteo forecast API base URL (no key required).",
@@ -73,10 +66,6 @@ class Settings(BaseSettings):
     )
 
     # --- target geography & time window ------------------------------------
-    bidding_zone: str = Field(
-        default="DE_LU",
-        description="ENTSO-E bidding zone for Germany (+Luxembourg).",
-    )
     smard_region: str = Field(
         default="DE",
         description="SMARD region code for Germany.",
@@ -90,26 +79,10 @@ class Settings(BaseSettings):
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
 
     # --- validators ---------------------------------------------------------
-    @field_validator("entsoe_api_token", mode="before")
-    @classmethod
-    def _blank_or_placeholder_token_is_none(cls, value: object) -> object:
-        """Treat an empty value or the ``.env.example`` placeholder as 'no token'."""
-        if isinstance(value, str) and (
-            not value.strip() or value.strip() == "your_entsoe_security_token_here"
-        ):
-            return None
-        return value
-
-    @field_validator("bidding_zone", "smard_region")
+    @field_validator("smard_region")
     @classmethod
     def _upper(cls, value: str) -> str:
         return value.strip().upper()
-
-    # --- derived helpers ----------------------------------------------------
-    @property
-    def has_entsoe_token(self) -> bool:
-        """True when a real ENTSO-E token is configured (live ingestion available)."""
-        return self.entsoe_api_token is not None
 
 
 @lru_cache(maxsize=1)

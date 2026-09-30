@@ -16,7 +16,7 @@ import pandas as pd
 from sqlalchemy.engine import Engine
 
 from src.data import db
-from src.data.db import LOAD_SOURCE, OFFICIAL_SOURCE
+from src.data.db import SOURCE_SMARD
 
 MIN_WINDOW_HOURS = 24  # fewer aligned hours than this -> a window is not judged
 ALIGNED_COLUMNS = ["timestamp_utc", "actual_mw", "model_mw", "official_mw", "model_version"]
@@ -49,21 +49,17 @@ def aligned_frame(
     start: pd.Timestamp | None = None,
     end: pd.Timestamp | None = None,
     model_version: str | None = None,
-    official_source: str = OFFICIAL_SOURCE,
-    load_source: str = LOAD_SOURCE,
 ) -> pd.DataFrame:
     """Hours where actual, model forecast and official forecast all exist (inner join).
 
     With ``model_version=None`` the most recently *issued* model forecast per hour is
     used, so re-issued hours and a new champion count exactly once.
     """
-    actual = db.read_load(engine, source=load_source, start=start, end=end).rename(
-        columns={"load_mw": "actual_mw"}
-    )
+    actual = db.read_load(engine, start=start, end=end).rename(columns={"load_mw": "actual_mw"})
     filters = {"model_version": model_version} if model_version else {}
     model = db.read_table(engine, db.LoadForecastModel, start=start, end=end, **filters)
     official = db.read_table(
-        engine, db.LoadForecastOfficial, start=start, end=end, source=official_source
+        engine, db.LoadForecastOfficial, start=start, end=end, source=SOURCE_SMARD
     ).rename(columns={"forecast_mw": "official_mw"})[["timestamp_utc", "official_mw"]]
 
     if model.empty or actual.empty or official.empty:
@@ -144,9 +140,6 @@ def official_accuracy(
     engine: Engine,
     as_of: pd.Timestamp,
     days: int,
-    *,
-    official_source: str = OFFICIAL_SOURCE,
-    load_source: str = LOAD_SOURCE,
 ) -> dict[str, Any]:
     """The official forecast scored alone over ``(as_of - days, as_of]`` - the bar to beat.
 
@@ -154,9 +147,9 @@ def official_accuracy(
     long before any model forecast exists. Metrics are None below ``MIN_WINDOW_HOURS``.
     """
     start = as_of - pd.Timedelta(days=days)
-    actual = db.read_load(engine, source=load_source, start=start, end=as_of)
+    actual = db.read_load(engine, start=start, end=as_of)
     official = db.read_table(
-        engine, db.LoadForecastOfficial, start=start, end=as_of, source=official_source
+        engine, db.LoadForecastOfficial, start=start, end=as_of, source=SOURCE_SMARD
     )
     joined = actual.merge(official[["timestamp_utc", "forecast_mw"]], on="timestamp_utc")
     joined = joined[joined["timestamp_utc"] > start]

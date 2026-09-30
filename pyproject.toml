@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "Ahmed Laabidi" }]
-keywords = ["mlops", "forecasting", "time-series", "electricity", "entso-e", "germany"]
+keywords = ["mlops", "forecasting", "time-series", "electricity", "germany"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
@@ -22,7 +22,6 @@ classifiers = [
 dependencies = [
     # Data pull
     "requests>=2.31",
-    "entsoe-py>=0.6",
     # Data handling
     "pandas>=2.1",
     "numpy>=1.26",

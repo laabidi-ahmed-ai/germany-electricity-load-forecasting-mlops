@@ -52,12 +52,9 @@ UPSERT_CHUNK_ROWS = 500
 
 DateLike = date | datetime | str | pd.Timestamp
 
-# ``source`` values of the load tables. SMARD is keyless, so it is the default for both
-# the actual load and the official benchmark; ENTSO-E rows sit beside it once a token is set.
+# ``source`` value of the load tables: both the actual load and the official day-ahead
+# forecast come from SMARD (the column stays in the key so another source can sit beside it).
 SOURCE_SMARD = "smard"
-SOURCE_ENTSOE = "entsoe"
-LOAD_SOURCE = SOURCE_SMARD
-OFFICIAL_SOURCE = SOURCE_SMARD
 
 
 # --- UTC handling ---
@@ -113,7 +110,7 @@ class Base(DeclarativeBase):
 
 
 class LoadActual(Base):
-    """Hourly actual total load. ``source`` = ``smard`` | ``entsoe``."""
+    """Hourly actual total load (``source`` = ``smard``)."""
 
     __tablename__ = "load_actual"
 
@@ -412,14 +409,10 @@ def read_table(
 
 
 def read_load(
-    engine: Engine,
-    *,
-    source: str = LOAD_SOURCE,
-    start: pd.Timestamp | None = None,
-    end: pd.Timestamp | None = None,
+    engine: Engine, *, start: pd.Timestamp | None = None, end: pd.Timestamp | None = None
 ) -> pd.DataFrame:
-    """Hourly actual load ``[timestamp_utc, load_mw]`` for one source."""
-    df = read_table(engine, LoadActual, start=start, end=end, source=source)
+    """Hourly actual load ``[timestamp_utc, load_mw]``."""
+    df = read_table(engine, LoadActual, start=start, end=end, source=SOURCE_SMARD)
     return df.loc[:, ["timestamp_utc", "load_mw"]].reset_index(drop=True)
 
 

@@ -27,7 +27,7 @@ import pandas as pd
 from sqlalchemy.engine import Engine
 
 from src.data import db
-from src.data.db import LOAD_SOURCE
+from src.data.db import SOURCE_SMARD
 from src.data.weather_client import WeatherClient, national_average
 from src.features.build_features import TARGET, build_feature_frame
 from src.features.horizons import DAY_AHEAD, most_recent_load_lag, select_features
@@ -110,7 +110,7 @@ def build_serving_features(
     ``as_of`` pretends the latest known load is at/before that time (for backtests);
     default is the real latest actual in the database.
     """
-    last_actual = db.latest_timestamp(engine, db.LoadActual, source=LOAD_SOURCE)
+    last_actual = db.latest_timestamp(engine, db.LoadActual, source=SOURCE_SMARD)
     if last_actual is None:
         raise NoDataError("no actual load in the database - run the ingestion first")
     if as_of is not None:
@@ -118,7 +118,7 @@ def build_serving_features(
 
     target = forecast_window(last_actual, hours)
     hist_start = last_actual - pd.Timedelta(hours=HISTORY_HOURS)
-    history = db.read_load(engine, source=LOAD_SOURCE, start=hist_start, end=last_actual)
+    history = db.read_load(engine, start=hist_start, end=last_actual)
     if history.empty or history["timestamp_utc"].max() != last_actual:
         raise NoDataError(f"could not read actual load up to {last_actual}")
 

@@ -51,7 +51,7 @@ Demand is always moving. It rises on cold winter evenings (heating) and hot summ
 
 Once deployed, the system runs on its own:
 
-- **Every hour** — a scheduled job pulls the newest electricity-load figures (SMARD / ENTSO-E), the official day-ahead forecast, and the latest weather (Open-Meteo), and stores them in a cloud database. This is the continuous data collection that runs unattended.
+- **Every hour** — a scheduled job pulls the newest electricity-load figures (SMARD), the official day-ahead forecast, and the latest weather (Open-Meteo), and stores them in a cloud database. This is the continuous data collection that runs unattended.
 - **Every morning** — a batch job produces the day-ahead forecast: expected load for each hour of the next 24 hours. It stores the forecast alongside the official grid-operator forecast for the same hours, so the two sit side by side.
 - **On demand** — a serving API returns the latest forecast instantly.
 - **Every day, looking back** — because yesterday's *actual* load has now been published, a job computes the model's error and the official forecast's error over the same period and updates the accuracy history.
@@ -75,7 +75,7 @@ Load forecasting is a well-studied problem; the distinguishing factor here is th
 ```mermaid
 flowchart TD
     subgraph Sources["External data sources (free)"]
-        A1["SMARD (Bundesnetzagentur) + ENTSO-E<br/>(actual load + official day-ahead forecast)"]
+        A1["SMARD (Bundesnetzagentur)<br/>(actual load + official day-ahead forecast)"]
         A2["Open-Meteo<br/>(weather: temp, wind, solar, cloud)"]
     end
 
@@ -143,7 +143,7 @@ The project is organized around the canonical MLOps loop; each stage maps to a f
 | Stage | What happens | Key tools |
 |---|---|---|
 | **Problem & metrics** | Target = day-ahead hourly load; ML metrics = MAE / RMSE / MAPE; the signature metric is error relative to the official forecast. | — |
-| **Data ingestion** | Scheduled pulls of load + official forecast (SMARD / ENTSO-E) and weather (Open-Meteo) into the time-series DB, with multi-year historical backfill. | `entsoe-py`, `requests`, GitHub Actions |
+| **Data ingestion** | Scheduled pulls of load + official forecast (SMARD) and weather (Open-Meteo) into the time-series DB, with multi-year historical backfill. | `requests`, GitHub Actions |
 | **Storage** | Postgres as the single source of truth for data, the model registry, and model artifacts; idempotent upserts. | Postgres |
 | **Feature engineering** | Lag, rolling, calendar/holiday, and weather features, computed leakage-safe on a complete hourly index; horizon-aware selection for day-ahead validity. | `pandas`, `holidays` |
 | **Training & experimentation** | Naive baselines → LightGBM; strict time-series cross-validation; every run logged. | LightGBM, MLflow |
@@ -162,7 +162,6 @@ The project is organized around the canonical MLOps loop; each stage maps to a f
 ### Sources (all free)
 
 - **SMARD (Bundesnetzagentur)** — the German Federal Network Agency's official data platform. Provides actual national load and the official day-ahead load forecast, hourly, back to 2015, with no API key required. This is the primary source for German load.
-- **ENTSO-E Transparency Platform** — the European TSO data platform (REST API with a free security token). Used as a second source for actual load and the official day-ahead forecast, and for broader European coverage.
 - **Open-Meteo** — free weather API (no key) for historical and forecast temperature, wind, solar radiation, and cloud cover — the physical drivers of demand.
 
 ### Geography
@@ -212,7 +211,7 @@ This loop is why the system is designed to run continuously: a retraining trigge
 | Concern | Choice |
 |---|---|
 | Language | Python 3.11+ |
-| Data ingestion | `entsoe-py`, `requests` (SMARD, ENTSO-E, Open-Meteo) |
+| Data ingestion | `requests` (SMARD, Open-Meteo) |
 | Storage | Postgres (Neon / Supabase free tier), TimescaleDB hypertables when the extension is available; SQLite for local dev |
 | Feature engineering | pandas, `holidays` |
 | Modeling | LightGBM |
@@ -250,7 +249,7 @@ germany-electricity-load-forecasting-mlops/
 ├── config/
 │   └── settings.py                # typed configuration
 ├── src/
-│   ├── data/                      # ingestion & DB access (smard, entsoe, weather, db, ingest)
+│   ├── data/                      # ingestion & DB access (smard, weather, db, ingest)
 │   ├── features/                  # build_features, horizons (leakage-safe, horizon-aware)
 │   ├── models/                    # baselines, train, evaluate, registry, tracking
 │   ├── serving/                   # api (FastAPI), forecast, batch_forecast
@@ -270,18 +269,15 @@ Secrets are **never** committed. For local use, copy `.env.example` to `.env` (g
 
 ```dotenv
 # .env.example (abridged)
-ENTSOE_API_TOKEN=your_entsoe_security_token_here   # optional
 # DATABASE_URL=postgresql://user:password@host:5432/dbname   # unset = local SQLite
 OPEN_METEO_BASE_URL=https://api.open-meteo.com/v1
 MLFLOW_TRACKING_URI=sqlite:///mlruns/mlflow.db     # the cloud jobs point this at DATABASE_URL
-BIDDING_ZONE=DE_LU                                 # ENTSO-E bidding zone
 SMARD_REGION=DE                                    # SMARD region code
 DATA_START_DATE=2021-03-01                         # post-COVID cutoff
 LOG_LEVEL=INFO
 ```
 
-- `DATABASE_URL` — connection string from a free Postgres provider (Neon / Supabase).
-- `ENTSOE_API_TOKEN` — optional. The system runs fully on SMARD without it; the ENTSO-E second source activates automatically once it is set.
+- `DATABASE_URL` — connection string from a free Postgres provider (Neon / Supabase). It is the only secret: every data source is keyless.
 
 ---
 
@@ -374,7 +370,6 @@ Planned technical extensions, in rough order:
 
 **Data sources:**
 - SMARD (Bundesnetzagentur) — https://www.smard.de
-- ENTSO-E Transparency Platform — https://transparency.entsoe.eu
 - Open-Meteo — https://open-meteo.com
 
-**Acknowledgements:** Data provided by SMARD, ENTSO-E, and Open-Meteo. This is an independent project and is not affiliated with any grid operator.
+**Acknowledgements:** Data provided by SMARD and Open-Meteo. This is an independent project and is not affiliated with any grid operator.

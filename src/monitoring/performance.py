@@ -29,7 +29,7 @@ from sqlalchemy.engine import Engine
 
 from config.log import configure_logging
 from src.data import db
-from src.data.db import OFFICIAL_SOURCE
+from src.data.db import SOURCE_SMARD
 from src.features.build_features import TARGET, build_features
 from src.features.horizons import DAY_AHEAD, select_features
 from src.monitoring.metrics import (
@@ -50,7 +50,6 @@ WINDOWS_DAYS: tuple[int, ...] = (7, 30)
 @dataclass
 class PerformanceReport:
     as_of: pd.Timestamp
-    official_source: str
     windows: list[WindowMetrics]
     daily: pd.DataFrame
     n_aligned_hours: int
@@ -67,7 +66,6 @@ class PerformanceReport:
     def to_dict(self) -> dict[str, Any]:
         return {
             "as_of": self.as_of.isoformat(),
-            "official_source": self.official_source,
             "n_aligned_hours": self.n_aligned_hours,
             "model_versions": self.model_versions,
             "windows": [
@@ -80,7 +78,7 @@ class PerformanceReport:
     def summary(self) -> str:
         lines = [
             f"Performance as of {self.as_of:%Y-%m-%d %H:%M}Z "
-            f"(official benchmark: {self.official_source}, "
+            f"(official benchmark: SMARD, "
             f"model versions scored: {self.model_versions or '-'})"
         ]
         if not self.has_data:
@@ -114,28 +112,20 @@ def compute_report(
     as_of: pd.Timestamp | None = None,
     windows: tuple[int, ...] = WINDOWS_DAYS,
     model_version: str | None = None,
-    official_source: str = OFFICIAL_SOURCE,
 ) -> PerformanceReport:
     as_of = db.to_utc(as_of) if as_of is not None else pd.Timestamp.now(tz="UTC").floor("h")
     start = as_of - pd.Timedelta(days=max(windows))
-    aligned = aligned_frame(
-        engine,
-        start=start,
-        end=as_of,
-        model_version=model_version,
-        official_source=official_source,
-    )
+    aligned = aligned_frame(engine, start=start, end=as_of, model_version=model_version)
     aligned = aligned[aligned["timestamp_utc"] > start].reset_index(drop=True)
     report = PerformanceReport(
         as_of=as_of,
-        official_source=official_source,
         windows=[window_metrics(aligned, as_of, d) for d in windows],
         daily=daily_metrics(aligned),
         n_aligned_hours=len(aligned),
         model_versions=[] if aligned.empty else sorted(aligned["model_version"].unique()),
     )
     for d in windows:
-        oa = official_accuracy(engine, as_of, d, official_source=official_source)
+        oa = official_accuracy(engine, as_of, d)
         if oa["mae"] is not None:
             report.official_only[d] = oa
     log.info("performance report:\n%s", report.summary())
@@ -177,7 +167,6 @@ def backtest_vs_official(
     *,
     days: int = 30,
     as_of: pd.Timestamp | None = None,
-    official_source: str = OFFICIAL_SOURCE,
     params: dict[str, Any] | None = None,
     frame: pd.DataFrame | None = None,
 ) -> BacktestReport:
@@ -200,7 +189,7 @@ def backtest_vs_official(
         db.LoadForecastOfficial,
         start=holdout.index.min(),
         end=holdout.index.max(),
-        source=official_source,
+        source=SOURCE_SMARD,
     ).set_index("timestamp_utc")["forecast_mw"]
     aligned = pd.DataFrame({"actual_mw": holdout[TARGET], "model_mw": pred}).join(
         official.rename("official_mw"), how="inner"
@@ -242,7 +231,6 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="python -m src.monitoring.performance")
     p.add_argument("--as-of", default=None)
     p.add_argument("--model-version", default=None)
-    p.add_argument("--official-source", default=OFFICIAL_SOURCE)
     p.add_argument("--backtest-days", type=int, default=0, help="also run an OOS backtest")
     p.add_argument("--database-url", default=None)
     args = p.parse_args(argv)
@@ -252,7 +240,6 @@ def main(argv: list[str] | None = None) -> int:
         engine,
         as_of=pd.Timestamp(args.as_of) if args.as_of else None,
         model_version=args.model_version,
-        official_source=args.official_source,
     )
     print(report.summary())
     if args.backtest_days:
@@ -260,7 +247,6 @@ def main(argv: list[str] | None = None) -> int:
             engine,
             days=args.backtest_days,
             as_of=pd.Timestamp(args.as_of) if args.as_of else None,
-            official_source=args.official_source,
         )
         print()
         print(bt.summary())

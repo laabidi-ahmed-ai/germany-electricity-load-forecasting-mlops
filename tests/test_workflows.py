@@ -74,7 +74,6 @@ def test_jobs_use_secrets_and_never_hardcode_them(name: str) -> None:
     (job,) = wf["jobs"].values()
     env = job["env"]
     assert env["DATABASE_URL"] == "${{ secrets.DATABASE_URL }}"
-    assert env["ENTSOE_API_TOKEN"] == "${{ secrets.ENTSOE_API_TOKEN }}"  # optional at runtime
     text = (WORKFLOWS / name).read_text(encoding="utf-8")
     assert "postgresql://" not in text and "postgres://" not in text  # no inline URLs
     assert any("DATABASE_URL secret is not set" in s.get("run", "") for s in steps(wf))
@@ -165,7 +164,6 @@ def test_lean_requirements_cover_the_ingest_cli_imports() -> None:
         "sqlalchemy",
         "psycopg",
         "pydantic-settings",
-        "entsoe-py",
     } <= listed
     assert not ({"lightgbm", "mlflow", "evidently", "torch"} & listed)
 

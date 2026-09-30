@@ -4,11 +4,9 @@
 every requested source; the default, incremental mode pulls only what is new since the
 latest stored hour, re-fetching a small overlap window (upserts make that safe).
 
-Sources: ``smard`` (actual load and the official day-ahead load forecast, both
-keyless), ``weather`` (Open-Meteo, keyless) and ``entsoe`` (actual load + official
-forecast as a second source; silently skipped without a token). Each source is
-validated before it is written and runs independently, so one failing source never
-blocks the others.
+Sources: ``smard`` (actual load and the official day-ahead load forecast) and
+``weather`` (Open-Meteo), both keyless. Each source is validated before it is written
+and runs independently, so one failing source never blocks the others.
 
 Examples::
 
@@ -33,7 +31,6 @@ from sqlalchemy.engine import Engine
 from config.log import configure_logging
 from config.settings import get_settings
 from src.data import db
-from src.data.entsoe_client import EntsoeClient
 from src.data.smard_client import FORECAST_LOOKAHEAD, SmardClient
 from src.data.validation import DataValidationError, validate_load, validate_weather
 from src.data.weather_client import SOURCE_ARCHIVE, WeatherClient
@@ -41,9 +38,8 @@ from src.data.weather_client import SOURCE_ARCHIVE, WeatherClient
 log = logging.getLogger(__name__)
 
 SOURCE_SMARD = db.SOURCE_SMARD
-SOURCE_ENTSOE = db.SOURCE_ENTSOE
 SOURCE_WEATHER = "weather"
-ALL_SOURCES: tuple[str, ...] = (SOURCE_SMARD, SOURCE_WEATHER, SOURCE_ENTSOE)
+ALL_SOURCES: tuple[str, ...] = (SOURCE_SMARD, SOURCE_WEATHER)
 
 # How far back an incremental run re-fetches, to pick up late corrections.
 LOAD_OVERLAP = pd.Timedelta(hours=48)
@@ -70,7 +66,6 @@ class Clients:
 
     smard: SmardClient = field(default_factory=SmardClient)
     weather: WeatherClient = field(default_factory=WeatherClient)
-    entsoe: EntsoeClient = field(default_factory=EntsoeClient)
 
 
 def _span(df: pd.DataFrame) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
@@ -156,59 +151,17 @@ def ingest_weather_forecast(
     )
 
 
-def ingest_entsoe(
-    engine: Engine,
-    client: EntsoeClient,
-    start: pd.Timestamp,
-    end: pd.Timestamp | None = None,
-    *,
-    forecast_start: pd.Timestamp | None = None,
-    forecast_end: pd.Timestamp | None = None,
-) -> list[IngestResult]:
-    if not client.available:
-        msg = "no ENTSOE_API_TOKEN configured - skipped (SMARD covers actual load)"
-        log.info("ENTSO-E %s", msg)
-        return [
-            IngestResult("entsoe_actual", status="skipped", message=msg),
-            IngestResult("entsoe_forecast", status="skipped", message=msg),
-        ]
-
-    actual = _store(
-        engine,
-        "entsoe_actual",
-        client.fetch_actual_load(start, end),
-        db.LoadActual,
-        validate=validate_load,
-        source=SOURCE_ENTSOE,
-    )
-    forecast = _store(
-        engine,
-        "entsoe_forecast",
-        client.fetch_dayahead_forecast(
-            forecast_start if forecast_start is not None else start,
-            forecast_end if forecast_end is not None else end,
-        ),
-        db.LoadForecastOfficial,
-        validate=_validate_forecast,
-        source=SOURCE_ENTSOE,
-    )
-    return [actual, forecast]
-
-
 # --- Modes ---
-def _guard(
-    source: str, fn: Callable[..., IngestResult | list[IngestResult]], *args: Any, **kwargs: Any
-) -> list[IngestResult]:
+def _guard(source: str, fn: Callable[..., IngestResult], *args: Any, **kwargs: Any) -> IngestResult:
     """Run one ingestion step; convert any failure into a ``failed`` result."""
     try:
-        out = fn(*args, **kwargs)
-        return out if isinstance(out, list) else [out]
+        return fn(*args, **kwargs)
     except DataValidationError as err:
         log.error("%s: validation failed - nothing written: %s", source, err)
-        return [IngestResult(source, status="failed", message=f"validation: {err}")]
+        return IngestResult(source, status="failed", message=f"validation: {err}")
     except Exception as err:  # keep other sources running
         log.exception("%s: ingestion failed", source)
-        return [IngestResult(source, status="failed", message=str(err))]
+        return IngestResult(source, status="failed", message=str(err))
 
 
 def _resume_from(
@@ -240,16 +193,16 @@ def run_backfill(
     db.init_db(engine)
     results: list[IngestResult] = []
     if SOURCE_SMARD in sources:
-        results += _guard("smard", ingest_smard, engine, clients.smard, start_ts, end_ts)
-        results += _guard(
-            "smard_forecast", ingest_smard_forecast, engine, clients.smard, start_ts, end_ts
+        results.append(_guard("smard", ingest_smard, engine, clients.smard, start_ts, end_ts))
+        results.append(
+            _guard("smard_forecast", ingest_smard_forecast, engine, clients.smard, start_ts, end_ts)
         )
     if SOURCE_WEATHER in sources:
-        results += _guard(
-            "weather_archive", ingest_weather_history, engine, clients.weather, start_ts, end_ts
+        results.append(
+            _guard(
+                "weather_archive", ingest_weather_history, engine, clients.weather, start_ts, end_ts
+            )
         )
-    if SOURCE_ENTSOE in sources:
-        results += _guard("entsoe", ingest_entsoe, engine, clients.entsoe, start_ts, end_ts)
     return results
 
 
@@ -277,14 +230,16 @@ def run_incremental(
         fc_start = _resume_from(
             engine, db.LoadForecastOfficial, LOAD_OVERLAP, default_start, source=SOURCE_SMARD
         )
-        results += _guard("smard", ingest_smard, engine, clients.smard, start, now_ts)
-        results += _guard(
-            "smard_forecast",
-            ingest_smard_forecast,
-            engine,
-            clients.smard,
-            fc_start,
-            forecast_end,
+        results.append(_guard("smard", ingest_smard, engine, clients.smard, start, now_ts))
+        results.append(
+            _guard(
+                "smard_forecast",
+                ingest_smard_forecast,
+                engine,
+                clients.smard,
+                fc_start,
+                forecast_end,
+            )
         )
 
     if SOURCE_WEATHER in sources:
@@ -295,28 +250,12 @@ def run_incremental(
             default_start,
             source=SOURCE_ARCHIVE,
         )
-        results += _guard(
-            "weather_archive", ingest_weather_history, engine, clients.weather, start, now_ts
+        results.append(
+            _guard(
+                "weather_archive", ingest_weather_history, engine, clients.weather, start, now_ts
+            )
         )
-        results += _guard("weather_forecast", ingest_weather_forecast, engine, clients.weather)
-
-    if SOURCE_ENTSOE in sources:
-        a_start = _resume_from(
-            engine, db.LoadActual, LOAD_OVERLAP, default_start, source=SOURCE_ENTSOE
-        )
-        f_start = _resume_from(
-            engine, db.LoadForecastOfficial, LOAD_OVERLAP, default_start, source=SOURCE_ENTSOE
-        )
-        results += _guard(
-            "entsoe",
-            ingest_entsoe,
-            engine,
-            clients.entsoe,
-            a_start,
-            now_ts,
-            forecast_start=f_start,
-            forecast_end=forecast_end,
-        )
+        results.append(_guard("weather_forecast", ingest_weather_forecast, engine, clients.weather))
     return results
 
 
@@ -332,7 +271,7 @@ def summarize(results: Sequence[IngestResult]) -> str:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="python -m src.data.ingest",
-        description="Ingest German load (SMARD / ENTSO-E) and weather (Open-Meteo).",
+        description="Ingest German load (SMARD) and weather (Open-Meteo).",
     )
     p.add_argument("--backfill", action="store_true", help="pull full history from --start")
     p.add_argument("--start", type=str, default=None, help="YYYY-MM-DD (default DATA_START_DATE)")

@@ -217,12 +217,11 @@ def expanding_window_splits(
 def load_inputs(
     engine: Engine,
     *,
-    source: str = "smard",
     start: pd.Timestamp | None = None,
     end: pd.Timestamp | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Read load + per-city weather from the DB; return (load, national-average weather)."""
-    load = db.read_load(engine, source=source, start=start, end=end)
+    load = db.read_load(engine, start=start, end=end)
     weather = db.read_table(engine, db.WeatherHourly, start=start, end=end)
     weather_avg = national_average(weather)
     log.info(

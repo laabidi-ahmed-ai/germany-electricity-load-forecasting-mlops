@@ -39,21 +39,21 @@ def test_upsert_updates_existing_values(engine, load_frame) -> None:
     corrected["load_mw"] = corrected["load_mw"] + 1000
     db.upsert_dataframe(engine, db.LoadActual, _rows(corrected))
 
-    out = db.read_load(engine, source="smard")
+    out = db.read_load(engine)
     assert len(out) == len(load_frame)
     assert out["load_mw"].iloc[0] == pytest.approx(load_frame["load_mw"].iloc[0] + 1000)
 
 
 def test_sources_are_independent_keys(engine, load_frame) -> None:
     db.upsert_dataframe(engine, db.LoadActual, _rows(load_frame, "smard"))
-    db.upsert_dataframe(engine, db.LoadActual, _rows(load_frame, "entsoe"))
+    db.upsert_dataframe(engine, db.LoadActual, _rows(load_frame, "other"))
     assert db.count_rows(engine, db.LoadActual) == 2 * len(load_frame)
     assert db.count_rows(engine, db.LoadActual, source="smard") == len(load_frame)
 
 
 def test_timestamps_round_trip_as_utc_across_dst(engine, load_frame) -> None:
     db.upsert_dataframe(engine, db.LoadActual, _rows(load_frame))
-    out = db.read_load(engine, source="smard")
+    out = db.read_load(engine)
 
     assert str(out["timestamp_utc"].dt.tz) == "UTC"
     pd.testing.assert_series_equal(
@@ -84,7 +84,7 @@ def test_latest_timestamp_and_empty_table(engine, load_frame) -> None:
     latest = db.latest_timestamp(engine, db.LoadActual, source="smard")
     assert latest == load_frame["timestamp_utc"].max()
     assert str(latest.tz) == "UTC"
-    assert db.latest_timestamp(engine, db.LoadActual, source="entsoe") is None
+    assert db.latest_timestamp(engine, db.LoadActual, source="other") is None
 
 
 def test_read_table_window(engine, load_frame) -> None:

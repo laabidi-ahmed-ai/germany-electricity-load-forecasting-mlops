@@ -461,6 +461,8 @@ def panel_monitoring(mon: dict[str, Any], tz: str) -> None:
             created_at=timeline["created_at"].map(lambda t: fmt_ts(t, tz)),
             as_of=timeline["as_of"].map(lambda t: fmt_ts(t, tz)),
             model_version=timeline["model_version"].map(lambda v: "" if v is None else f"v{v}"),
+            # stored as a fraction (0.25 = 25 %); may be NULL when the drift check failed
+            drift_share=pd.to_numeric(timeline["drift_share"]) * 100,
         )
         st.dataframe(
             shown,

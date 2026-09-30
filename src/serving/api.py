@@ -28,7 +28,7 @@ from sqlalchemy.engine import Engine
 
 from config.log import configure_logging
 from src.data import db
-from src.data.db import LOAD_SOURCE
+from src.data.db import SOURCE_SMARD
 from src.data.weather_client import WeatherClient
 from src.models.registry import LoadedModel, load_champion
 from src.serving.forecast import DAY_AHEAD_HOURS, NoDataError, make_day_ahead_forecast
@@ -137,7 +137,7 @@ def create_app(state_loader: Callable[[], AppState] = default_state_loader) -> F
 
     @app.get("/health", response_model=HealthResponse)
     def health(state: AppState = Depends(get_state)) -> HealthResponse:
-        last_actual = db.latest_timestamp(state.engine, db.LoadActual, source=LOAD_SOURCE)
+        last_actual = db.latest_timestamp(state.engine, db.LoadActual, source=SOURCE_SMARD)
         latest_fc = db.read_latest_model_forecast(state.engine)
         issued = None if latest_fc.empty else latest_fc["issued_at"].iloc[0].to_pydatetime()
         return HealthResponse(
@@ -177,7 +177,7 @@ def create_app(state_loader: Callable[[], AppState] = default_state_loader) -> F
         if latest.empty:
             raise HTTPException(status_code=404, detail="no batch forecast stored yet")
         last_actual = db.latest_timestamp(
-            state.engine, db.LoadActual, source=LOAD_SOURCE
+            state.engine, db.LoadActual, source=SOURCE_SMARD
         ) or pd.Timestamp(0, tz="UTC")
         version = str(latest["model_version"].iloc[0])
         info = model_info(state.model)

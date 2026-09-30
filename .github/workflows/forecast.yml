@@ -29,7 +29,6 @@ jobs:
     timeout-minutes: 30
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
-      ENTSOE_API_TOKEN: ${{ secrets.ENTSOE_API_TOKEN }}
       LOG_LEVEL: INFO
       PYTHONUNBUFFERED: "1"
       MLFLOW_DISABLE_AGENT_HINT: "1"
@@ -57,7 +56,7 @@ jobs:
           pip install .
 
       - name: Refresh actuals + weather (incremental ingest)
-        run: python -m src.data.ingest --sources smard,weather,entsoe
+        run: python -m src.data.ingest
 
       - name: Show champion
         run: python -m src.models.registry --show

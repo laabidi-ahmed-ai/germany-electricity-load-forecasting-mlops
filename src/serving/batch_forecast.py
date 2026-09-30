@@ -3,7 +3,7 @@
 Meant to run every morning after the incremental ingestion (the GitHub Actions
 cron in ``forecast.yml``). Idempotent: re-running for the same hours and model
 version updates the rows in place. The monitoring jobs compare this table against
-the actuals and the official ENTSO-E forecast.
+the actuals and the official day-ahead forecast.
 
 CLI (``make forecast``)::
 

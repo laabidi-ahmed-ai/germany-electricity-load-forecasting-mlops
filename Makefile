@@ -52,7 +52,7 @@ format:  ## Auto-fix lint issues and reformat
 	$(PY) -m ruff check --fix .
 	$(PY) -m ruff format .
 
-data:  ## Historical backfill from DATA_START_DATE (SMARD + Open-Meteo, + ENTSO-E if token)
+data:  ## Historical backfill from DATA_START_DATE (SMARD + Open-Meteo)
 	$(PY) -m src.data.ingest --backfill
 
 data-update:  ## Incremental ingestion: pull only new hours

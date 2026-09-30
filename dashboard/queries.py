@@ -20,7 +20,7 @@ import pandas as pd
 from sqlalchemy.engine import Engine
 
 from src.data import db
-from src.data.db import LOAD_SOURCE, OFFICIAL_SOURCE
+from src.data.db import SOURCE_SMARD
 from src.models.registry import REGISTERED_MODEL_NAME as MODEL_NAME
 from src.monitoring import metrics
 from src.monitoring.metrics import MIN_WINDOW_HOURS, compute_metrics
@@ -81,9 +81,9 @@ def model_versions(engine: Engine, name: str = MODEL_NAME) -> pd.DataFrame:
 
 def coverage(engine: Engine) -> dict[str, Any]:
     """How much of the hourly history is in the database and how fresh it is."""
-    first = _min_timestamp(engine, db.LoadActual, source=LOAD_SOURCE)
-    last = db.latest_timestamp(engine, db.LoadActual, source=LOAD_SOURCE)
-    n_hours = db.count_rows(engine, db.LoadActual, source=LOAD_SOURCE)
+    first = _min_timestamp(engine, db.LoadActual, source=SOURCE_SMARD)
+    last = db.latest_timestamp(engine, db.LoadActual, source=SOURCE_SMARD)
+    n_hours = db.count_rows(engine, db.LoadActual, source=SOURCE_SMARD)
     expected = int((last - first) / pd.Timedelta(hours=1)) + 1 if first is not None else 0
     return {
         "first_actual": first,
@@ -91,9 +91,7 @@ def coverage(engine: Engine) -> dict[str, Any]:
         "n_hours": n_hours,
         "expected_hours": expected,
         "completeness_pct": (100.0 * n_hours / expected) if expected else None,
-        "last_official": db.latest_timestamp(
-            engine, db.LoadForecastOfficial, source=OFFICIAL_SOURCE
-        ),
+        "last_official": db.latest_timestamp(engine, db.LoadForecastOfficial, source=SOURCE_SMARD),
         "last_model_forecast": db.latest_timestamp(engine, db.LoadForecastModel),
     }
 
@@ -129,11 +127,9 @@ def latest_forecast_frame(engine: Engine, *, context_hours: int = 48) -> pd.Data
     end = forecast["timestamp_utc"].max()
 
     hours = pd.DataFrame({"timestamp_utc": pd.date_range(start, end, freq="h", tz="UTC")})
-    actual = db.read_load(engine, source=LOAD_SOURCE, start=start, end=end).rename(
-        columns={"load_mw": "actual_mw"}
-    )
+    actual = db.read_load(engine, start=start, end=end).rename(columns={"load_mw": "actual_mw"})
     official = db.read_table(
-        engine, db.LoadForecastOfficial, start=start, end=end, source=OFFICIAL_SOURCE
+        engine, db.LoadForecastOfficial, start=start, end=end, source=SOURCE_SMARD
     ).rename(columns={"forecast_mw": "official_mw"})[["timestamp_utc", "official_mw"]]
     out = (
         hours.merge(

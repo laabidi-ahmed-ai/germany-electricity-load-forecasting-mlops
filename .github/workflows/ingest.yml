@@ -1,5 +1,5 @@
 # Hourly ingestion: SMARD actual load + official day-ahead forecast, Open-Meteo weather
-# (+ ENTSO-E when a token is configured) -> the cloud Postgres. README §3 / §14.
+# -> the cloud Postgres. README §3 / §14.
 #
 # Lean by design: installs only requirements/ingest.txt (no ML stack), ~1 min per run.
 # Manual runs can switch to --backfill to (re)seed history.
@@ -20,9 +20,9 @@ on:
         required: false
         default: ""
       sources:
-        description: "comma-separated subset of smard,weather,entsoe"
+        description: "comma-separated subset of smard,weather"
         required: false
-        default: "smard,weather,entsoe"
+        default: "smard,weather"
 
 concurrency:
   group: ingest
@@ -40,7 +40,6 @@ jobs:
     timeout-minutes: 30
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
-      ENTSOE_API_TOKEN: ${{ secrets.ENTSOE_API_TOKEN }} # optional - blank means "skip ENTSO-E"
       LOG_LEVEL: INFO
       PYTHONPATH: .
       PYTHONUNBUFFERED: "1"
@@ -69,7 +68,7 @@ jobs:
 
       - name: Ingest (incremental)
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.mode == 'incremental' }}
-        run: python -m src.data.ingest --sources "${{ inputs.sources || 'smard,weather,entsoe' }}"
+        run: python -m src.data.ingest --sources "${{ inputs.sources || 'smard,weather' }}"
 
       - name: Ingest (backfill)
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'backfill' }}

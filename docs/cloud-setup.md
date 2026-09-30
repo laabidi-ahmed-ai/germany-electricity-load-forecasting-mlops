@@ -23,14 +23,13 @@ boto3 for a 3 MB file that fits in a table row.
 
 | Workflow | Trigger | What it does | Install |
 |---|---|---|---|
-| `ingest.yml` | hourly `:15` UTC + manual (`incremental` / `backfill`) | SMARD load + official day-ahead forecast, Open-Meteo weather, ENTSO-E if token → DB | `requirements/ingest.txt` only (~1 min) |
+| `ingest.yml` | hourly `:15` UTC + manual (`incremental` / `backfill`) | SMARD load + official day-ahead forecast, Open-Meteo weather → DB | `requirements/ingest.txt` only (~1 min) |
 | `forecast.yml` | daily 05:40 UTC + manual | incremental ingest → champion (from DB) → 24 h day-ahead forecast → `load_forecast_model` | full project |
 | `monitor_retrain.yml` | daily 06:00 UTC + manual (`auto` / `check-only` / `force`, `dry_run`) | performance vs actuals & official forecast, Evidently drift, triggers → champion/challenger → promote only if it wins | full project |
 | `bootstrap.yml` | manual, once | backfill 2021-03-01→now → features → train + CV → register & export champion → first forecast → monitoring check | full project |
 | `ci.yml` | push / PR | ruff + pytest (integration tests excluded) | dev extras |
 
-All jobs fail fast with a clear error if `DATABASE_URL` is missing. ENTSO-E is optional
-everywhere: an empty `ENTSOE_API_TOKEN` means "skip ENTSO-E", never a failure.
+All jobs fail fast with a clear error if `DATABASE_URL` is missing.
 
 ## Checklist (what you do once)
 
@@ -44,7 +43,6 @@ everywhere: an empty `ENTSOE_API_TOKEN` means "skip ENTSO-E", never a failure.
    2,000 min/month, the hourly job uses ~30 min/day of that).
 3. **Add the secrets** under *Settings → Secrets and variables → Actions*:
    - `DATABASE_URL` — required
-   - `ENTSOE_API_TOKEN` — optional, add it whenever the token arrives
    - `MLFLOW_TRACKING_URI` — optional (defaults to `DATABASE_URL`)
 4. **Run `bootstrap`** (*Actions → bootstrap → Run workflow*, defaults). ~10 minutes:
    backfills 5½ years, trains, promotes the champion, writes the first forecast, runs the

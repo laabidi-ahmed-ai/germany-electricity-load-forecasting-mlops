@@ -22,11 +22,9 @@ from config.settings import Settings, get_settings
 from src.data import db
 
 _ENV_KEYS = [
-    "ENTSOE_API_TOKEN",
     "DATABASE_URL",
     "OPEN_METEO_BASE_URL",
     "MLFLOW_TRACKING_URI",
-    "BIDDING_ZONE",
     "SMARD_REGION",
     "DATA_START_DATE",
     "LOG_LEVEL",
