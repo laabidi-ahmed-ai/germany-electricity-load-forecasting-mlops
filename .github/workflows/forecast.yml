@@ -1,0 +1,66 @@
+# Daily day-ahead forecast: champion model (from the DB export) -> load_forecast_model.
+# Runs after the morning ingest; also refreshes actuals itself so it never forecasts
+# on stale data if the hourly job was late. README §3 / §14.
+name: forecast
+
+on:
+  schedule:
+    - cron: "40 5 * * *" # 05:40 UTC daily (= 06:40/07:40 Berlin), after the 05:15 ingest
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: "hours to forecast after the latest actual (1-24)"
+        required: false
+        default: "24"
+
+concurrency:
+  group: forecast
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  forecast:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      ENTSOE_API_TOKEN: ${{ secrets.ENTSOE_API_TOKEN }}
+      LOG_LEVEL: INFO
+      PYTHONUNBUFFERED: "1"
+      MLFLOW_DISABLE_AGENT_HINT: "1"
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Require DATABASE_URL secret
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "::error::DATABASE_URL secret is not set"
+            exit 1
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install project
+        run: |
+          python -m pip install --upgrade pip
+          pip install .
+
+      - name: Refresh actuals + weather (incremental ingest)
+        run: python -m src.data.ingest --sources smard,weather,entsoe
+
+      - name: Show champion
+        run: python -m src.models.registry --show
+
+      - name: Day-ahead forecast -> database
+        run: python -m src.serving.batch_forecast --hours "${{ inputs.hours || '24' }}"

@@ -1,0 +1,17 @@
+# Dependencies of the Streamlit dashboard only (dashboard/app.py).
+#
+# Streamlit Community Cloud installs the dependency file that sits next to the
+# entrypoint, so this file - not pyproject.toml - defines the deployed environment.
+# The dashboard reads the database through src/data/db.py and scores forecasts with
+# pandas; it never imports LightGBM, MLflow or Evidently, which keeps the cloud
+# container small and fast to boot. Keep floors in sync with pyproject.toml.
+# (tests/test_dashboard.py checks the dashboard imports nothing beyond this set.)
+streamlit>=1.49
+plotly>=5.18
+pandas>=2.1
+numpy>=1.26
+sqlalchemy>=2.0
+psycopg[binary]>=3.1
+pydantic>=2.5
+pydantic-settings>=2.1
+python-dotenv>=1.0
