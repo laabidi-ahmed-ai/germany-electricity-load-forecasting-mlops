@@ -326,16 +326,42 @@ def weather_update_where(existing: Any, excluded: Any) -> ColumnElement[bool]:
 
 
 # --- Readers ---
+def _frame(rows: Sequence[Any], columns: Sequence[Any]) -> pd.DataFrame:
+    """Query rows -> DataFrame: UTC timestamps tz-aware, booleans as bool (SQLite says 0/1).
+
+    Typed by the table definition, so no reader keeps its own list of datetime columns.
+    """
+    names = [c.name for c in columns]
+    if not rows:
+        return pd.DataFrame(columns=names)
+    df = pd.DataFrame(rows, columns=names)
+    for c in columns:
+        if isinstance(c.type, UTCDateTime):
+            df[c.name] = pd.to_datetime(df[c.name], utc=True)
+        elif isinstance(c.type, Boolean):
+            df[c.name] = df[c.name].astype(bool)
+    return df
+
+
 def latest_timestamp(engine: Engine, model: type[Base], **filters: Any) -> pd.Timestamp | None:
     """Most recent ``timestamp_utc`` in the table (optionally filtered), UTC, or None."""
-    stmt = select(func.max(model.timestamp_utc))
+    return _timestamp_bound(engine, model, func.max, filters)
+
+
+def earliest_timestamp(engine: Engine, model: type[Base], **filters: Any) -> pd.Timestamp | None:
+    """Oldest ``timestamp_utc`` in the table (optionally filtered), UTC, or None."""
+    return _timestamp_bound(engine, model, func.min, filters)
+
+
+def _timestamp_bound(
+    engine: Engine, model: type[Base], agg: Any, filters: dict[str, Any]
+) -> pd.Timestamp | None:
+    stmt = select(agg(model.timestamp_utc))
     for col, val in filters.items():
         stmt = stmt.where(getattr(model, col) == val)
     with engine.connect() as conn:
         value = conn.execute(stmt).scalar()
-    if value is None:
-        return None
-    return to_utc(value)
+    return None if value is None else to_utc(value)
 
 
 def count_rows(engine: Engine, model: type[Base], **filters: Any) -> int:
@@ -364,14 +390,8 @@ def read_table(
         stmt = stmt.where(getattr(model, col) == val)
     stmt = stmt.order_by(model.timestamp_utc)
     with engine.connect() as conn:
-        result = conn.execute(stmt)
-        df = pd.DataFrame(result.mappings().all())
-    if df.empty:
-        return pd.DataFrame(columns=[c.name for c in model.__table__.columns])
-    for col in ("timestamp_utc", "ingested_at", "issued_at"):
-        if col in df.columns:
-            df[col] = pd.to_datetime(df[col], utc=True)
-    return df
+        rows = conn.execute(stmt).mappings().all()
+    return _frame(rows, model.__table__.columns)
 
 
 def read_load(
@@ -387,7 +407,7 @@ def read_latest_model_forecast(engine: Engine) -> pd.DataFrame:
     with engine.connect() as conn:
         latest = conn.execute(select(func.max(LoadForecastModel.issued_at))).scalar()
     if latest is None:
-        return pd.DataFrame(columns=[c.name for c in LoadForecastModel.__table__.columns])
+        return _frame([], LoadForecastModel.__table__.columns)
     return read_table(engine, LoadForecastModel, issued_at=latest)
 
 
@@ -406,12 +426,8 @@ def read_monitoring_events(engine: Engine, *, limit: int = 100) -> pd.DataFrame:
         .limit(limit)
     )
     with engine.connect() as conn:
-        df = pd.DataFrame(conn.execute(stmt).mappings().all())
-    if df.empty:
-        return pd.DataFrame(columns=[c.name for c in MonitoringEvent.__table__.columns])
-    for col in ("created_at", "as_of"):
-        df[col] = pd.to_datetime(df[col], utc=True)
-    return df
+        rows = conn.execute(stmt).mappings().all()
+    return _frame(rows, MonitoringEvent.__table__.columns)
 
 
 # --- Model artifacts (champion persistence) ---
@@ -471,13 +487,8 @@ def list_model_artifacts(engine: Engine, name: str) -> pd.DataFrame:
         .order_by(ModelArtifact.created_at.desc(), ModelArtifact.version.desc())
     )
     with engine.connect() as conn:
-        df = pd.DataFrame(conn.execute(stmt).mappings().all())
-    if df.empty:
-        return pd.DataFrame(columns=[c.name for c in cols])
-    for col in ("train_start", "train_end", "created_at", "promoted_at"):
-        df[col] = pd.to_datetime(df[col], utc=True)
-    df["is_champion"] = df["is_champion"].astype(bool)  # SQLite returns 0/1
-    return df
+        rows = conn.execute(stmt).mappings().all()
+    return _frame(rows, cols)
 
 
 def prune_model_artifacts(engine: Engine, name: str, *, keep: int = 5) -> int:

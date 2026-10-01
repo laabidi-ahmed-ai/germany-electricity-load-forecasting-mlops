@@ -29,7 +29,10 @@ boto3 for a 3 MB file that fits in a table row.
 | `bootstrap.yml` | manual, once | backfill 2021-03-01→now → features → train + CV → register & export champion → first forecast → monitoring check | full project |
 | `ci.yml` | push / PR | ruff + pytest (integration tests excluded) | dev extras |
 
-All jobs fail fast with a clear error if `DATABASE_URL` is missing.
+All jobs fail fast with a clear error if `DATABASE_URL` is missing. The database jobs share
+one setup step (`.github/actions/setup`), and every job runs on a pinned `ubuntu-24.04`
+image rather than `ubuntu-latest`, so a runner-image upgrade happens when it is chosen and
+tested, not on GitHub's schedule.
 
 ## Checklist (what you do once)
 

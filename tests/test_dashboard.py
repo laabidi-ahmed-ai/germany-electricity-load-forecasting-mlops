@@ -397,10 +397,9 @@ def test_make_engine_opens_postgres_read_only(monkeypatch: pytest.MonkeyPatch) -
     assert "connect_args" not in captured["kwargs"]
 
 
-def test_describe_database_never_leaks_credentials() -> None:
+def test_describe_database_never_leaks_credentials_or_the_host() -> None:
     text = q.describe_database("postgresql://alice:s3cret@ep-x.neon.tech/neondb?sslmode=require")
-    assert "s3cret" not in text and "alice" not in text
-    assert "ep-x.neon.tech" in text and "neondb" in text
+    assert text == "PostgreSQL · neondb"
     assert q.describe_database("sqlite:///data/x.db").startswith("SQLite")
 
 

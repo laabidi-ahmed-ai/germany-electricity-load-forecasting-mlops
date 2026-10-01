@@ -30,14 +30,13 @@ permissions:
 
 jobs:
   bootstrap:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
       MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI || secrets.DATABASE_URL }}
       LOG_LEVEL: INFO
       PYTHONUNBUFFERED: "1"
-      MLFLOW_DISABLE_AGENT_HINT: "1"
     steps:
       - name: Check out
         uses: actions/checkout@v7

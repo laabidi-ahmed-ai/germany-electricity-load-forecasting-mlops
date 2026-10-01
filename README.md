@@ -1,5 +1,7 @@
 # Germany Electricity Load Forecasting — An End-to-End MLOps System
 
+**Live dashboard:** https://germany-electricity-load-forecasting.streamlit.app
+
 > A production-style machine-learning system that forecasts **Germany's national electricity demand (load)** for the next 24–48 hours. It continuously ingests fresh grid and weather data, benchmarks itself against the **official grid-operator day-ahead forecast**, and **retrains itself** when data drift or performance decay is detected — all on a fully free-tier, cloud-scheduled stack.
 
 ---

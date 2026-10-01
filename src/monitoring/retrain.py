@@ -47,7 +47,7 @@ from src.models.registry import LoadedModel
 from src.models.tracking import DEFAULT_EXPERIMENT, setup_mlflow
 from src.monitoring import drift as drift_mod
 from src.monitoring import performance as perf_mod
-from src.monitoring.metrics import compute_metrics, improvement_pct
+from src.monitoring.metrics import WindowMetrics, compute_metrics, improvement_pct
 
 log = logging.getLogger(__name__)
 
@@ -130,6 +130,12 @@ class TriggerDecision:
 
 
 # --- Trigger evaluation ---
+def _unjudged(name: str, window: WindowMetrics | None, threshold: float) -> Check:
+    """A performance check that cannot fire yet: too few scored hours in its window."""
+    n = 0 if window is None else window.n_hours
+    return Check(name, False, None, threshold, f"insufficient data ({n} scored hours)")
+
+
 def evaluate_triggers(
     engine: Engine,
     champion: LoadedModel,
@@ -161,16 +167,7 @@ def evaluate_triggers(
             )
         )
     else:
-        n = 0 if w_err is None else w_err.n_hours
-        checks.append(
-            Check(
-                "error",
-                False,
-                None,
-                cfg.mape_threshold_pct,
-                f"insufficient data ({n} scored hours)",
-            )
-        )
+        checks.append(_unjudged("error", w_err, cfg.mape_threshold_pct))
 
     w_off = perf.window(cfg.official_window_days)
     if w_off is not None and w_off.judged:
@@ -188,16 +185,7 @@ def evaluate_triggers(
             )
         )
     else:
-        n = 0 if w_off is None else w_off.n_hours
-        checks.append(
-            Check(
-                "official",
-                False,
-                None,
-                cfg.official_gap_pct,
-                f"insufficient data ({n} scored hours)",
-            )
-        )
+        checks.append(_unjudged("official", w_off, cfg.official_gap_pct))
 
     # 3: drift
     drift_report: drift_mod.DriftReport | None = None
@@ -368,6 +356,15 @@ def run_champion_challenger(
 
 
 # --- Logging of decisions ---
+def _kind_and_reason(
+    decision: TriggerDecision, outcome: ChallengerOutcome | None
+) -> tuple[str, str]:
+    """``(kind, reason)`` of one monitoring pass, shared by the MLflow run and the DB event."""
+    if outcome is not None:
+        return "retrain", outcome.reason
+    return "check", "; ".join(decision.reasons)
+
+
 def log_decision(
     decision: TriggerDecision,
     outcome: ChallengerOutcome | None,
@@ -379,7 +376,7 @@ def log_decision(
     import mlflow
 
     setup_mlflow(experiment)
-    kind = "retrain" if outcome is not None else "check"
+    kind, reason = _kind_and_reason(decision, outcome)
     with mlflow.start_run(run_name=f"{kind}_{decision.as_of:%Y%m%dT%H}") as run:
         mlflow.set_tags(
             {
@@ -388,9 +385,7 @@ def log_decision(
                 "champion_version": decision.champion_version,
                 "triggered": str(decision.triggered),
                 "decision": outcome.decision if outcome else "check-only",
-                "reason": (
-                    outcome.reason if outcome else "; ".join(decision.reasons) or "no trigger"
-                )[:250],
+                "reason": (reason or "no trigger")[:250],
             }
         )
         mlflow.log_params({f"cfg_{k}": v for k, v in asdict(cfg).items() if k != "lgbm_params"})
@@ -432,13 +427,14 @@ def record_event(
     cfg: RetrainConfig = DEFAULT_CONFIG,
 ) -> int:
     w7 = decision.performance.window(cfg.error_window_days) if decision.performance else None
+    kind, reason = _kind_and_reason(decision, outcome)
     return db.insert_monitoring_event(
         engine,
         as_of=decision.as_of.to_pydatetime(),
-        kind="retrain" if outcome is not None else "check",
+        kind=kind,
         triggered=decision.triggered,
         decision=outcome.decision if outcome else None,
-        reason=(outcome.reason if outcome else "; ".join(decision.reasons) or None),
+        reason=reason or None,
         model_version=decision.champion_version,
         model_mape_7d=None if w7 is None else w7.model_mape,
         official_mape_7d=None if w7 is None else w7.official_mape,

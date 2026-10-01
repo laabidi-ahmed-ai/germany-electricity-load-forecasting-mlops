@@ -74,8 +74,8 @@ def load_accuracy(url: str, days: int) -> dict[str, Any]:
     return {
         "aligned": aligned,
         "daily": q.daily_accuracy(aligned),
-        "windows": [q.window_summary(aligned, days=d, as_of=as_of) for d in (7, 30)],
-        "official_only": q.official_only_summary(base, days=30, as_of=as_of),
+        "windows": [q.window_summary(aligned, days=d, as_of=as_of) for d in q.WINDOWS_DAYS],
+        "official_only": q.official_only_summary(base, days=max(q.WINDOWS_DAYS), as_of=as_of),
     }
 
 

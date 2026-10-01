@@ -145,8 +145,9 @@ def export_model_version(
     client = mlflow.MlflowClient()
     mv = client.get_model_version(name, str(version))
     local_dir = Path(mlflow.artifacts.download_artifacts(f"models:/{name}/{mv.version}"))
-    pyfunc = mlflow.pyfunc.load_model(str(local_dir))
-    features = _features_from_signature(pyfunc, f"{name} v{mv.version}")
+    # The MLmodel file carries the signature; no need to deserialize LightGBM for it.
+    mlmodel = mlflow.models.Model.load(str(local_dir))
+    features = _features_from_signature(mlmodel, f"{name} v{mv.version}")
     train_start, train_end, metrics = _run_metadata(mv.run_id)
 
     bundle = _zip_dir(local_dir)
@@ -242,8 +243,8 @@ def load_champion(
 
 
 # --- helpers ---
-def _features_from_signature(pyfunc: Any, label: str) -> list[str]:
-    schema = pyfunc.metadata.get_input_schema()
+def _features_from_signature(mlmodel: Any, label: str) -> list[str]:
+    schema = mlmodel.get_input_schema()
     if schema is None or not schema.input_names():
         raise ValueError(f"{label} has no input signature - cannot recover features")
     return list(schema.input_names())

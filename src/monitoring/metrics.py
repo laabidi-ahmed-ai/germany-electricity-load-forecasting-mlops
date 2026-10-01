@@ -19,6 +19,7 @@ from src.data import db
 from src.data.db import SOURCE_SMARD
 
 MIN_WINDOW_HOURS = 24  # fewer aligned hours than this -> a window is not judged
+WINDOWS_DAYS: tuple[int, ...] = (7, 30)  # the head-to-head windows monitoring and dashboard show
 ALIGNED_COLUMNS = ["timestamp_utc", "actual_mw", "model_mw", "official_mw", "model_version"]
 DAILY_COLUMNS = ["date", "n_hours", "model_mae", "model_mape", "official_mae", "official_mape"]
 

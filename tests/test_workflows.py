@@ -54,7 +54,7 @@ def test_workflow_parses_and_has_a_single_job_with_timeout(name: str) -> None:
     wf = load(name)
     assert "jobs" in wf and len(wf["jobs"]) == 1
     (job,) = wf["jobs"].values()
-    assert job["runs-on"] == "ubuntu-latest"
+    assert job["runs-on"] == "ubuntu-24.04"  # pinned, so image upgrades are deliberate
     assert job["timeout-minutes"] > 0
     assert any(s.get("uses", "").startswith("actions/checkout@") for s in job["steps"])
     assert any(  # directly (CI) or through the shared setup action (the DB jobs)

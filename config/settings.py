@@ -60,8 +60,7 @@ class Settings(BaseSettings):
         default="sqlite:///mlruns/mlflow.db",
         description=(
             "MLflow tracking URI. Default: local SQLite store under mlruns/ "
-            "(relative paths are anchored at the project root). A plain directory "
-            "such as ./mlruns selects MLflow's legacy file store."
+            "(relative paths are anchored at the project root)."
         ),
     )
 

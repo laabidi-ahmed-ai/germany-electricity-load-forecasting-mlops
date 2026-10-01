@@ -23,9 +23,9 @@ from src.data import db
 from src.data.db import SOURCE_SMARD
 from src.models.registry import REGISTERED_MODEL_NAME as MODEL_NAME
 from src.monitoring import metrics
-from src.monitoring.metrics import MIN_WINDOW_HOURS, compute_metrics
+from src.monitoring.metrics import MIN_WINDOW_HOURS, WINDOWS_DAYS, compute_metrics
 
-__all__ = ["MIN_WINDOW_HOURS", "MODEL_NAME", "compute_metrics"]
+__all__ = ["MIN_WINDOW_HOURS", "MODEL_NAME", "WINDOWS_DAYS", "compute_metrics"]
 
 
 # --- Engine ---
@@ -39,14 +39,13 @@ def make_engine(database_url: str | None = None) -> Engine:
 
 
 def describe_database(database_url: str) -> str:
-    """Human-readable, secret-free description of where the data comes from."""
+    """What kind of database the data comes from - no credentials, no server address."""
     from sqlalchemy.engine import make_url
 
     u = make_url(db.normalize_database_url(database_url))
     if u.drivername.startswith("sqlite"):
         return f"SQLite · {PurePosixPath(u.database or '').name or u.database}"
-    host = u.host or "?"
-    return f"{u.drivername.split('+')[0]} · {host}/{u.database}"
+    return f"PostgreSQL · {u.database}"
 
 
 # --- Champion + coverage (headline KPIs) ---
@@ -81,7 +80,7 @@ def model_versions(engine: Engine, name: str = MODEL_NAME) -> pd.DataFrame:
 
 def coverage(engine: Engine) -> dict[str, Any]:
     """How much of the hourly history is in the database and how fresh it is."""
-    first = _min_timestamp(engine, db.LoadActual, source=SOURCE_SMARD)
+    first = db.earliest_timestamp(engine, db.LoadActual, source=SOURCE_SMARD)
     last = db.latest_timestamp(engine, db.LoadActual, source=SOURCE_SMARD)
     n_hours = db.count_rows(engine, db.LoadActual, source=SOURCE_SMARD)
     expected = int((last - first) / pd.Timedelta(hours=1)) + 1 if first is not None else 0
@@ -94,19 +93,6 @@ def coverage(engine: Engine) -> dict[str, Any]:
         "last_official": db.latest_timestamp(engine, db.LoadForecastOfficial, source=SOURCE_SMARD),
         "last_model_forecast": db.latest_timestamp(engine, db.LoadForecastModel),
     }
-
-
-def _min_timestamp(engine: Engine, model: type[db.Base], **filters: Any) -> pd.Timestamp | None:
-    from sqlalchemy import func, select
-
-    stmt = select(func.min(model.timestamp_utc))
-    for col, val in filters.items():
-        stmt = stmt.where(getattr(model, col) == val)
-    with engine.connect() as conn:
-        value = conn.execute(stmt).scalar()
-    if value is None:
-        return None
-    return db.to_utc(value)
 
 
 # --- Latest day-ahead forecast vs actuals ---

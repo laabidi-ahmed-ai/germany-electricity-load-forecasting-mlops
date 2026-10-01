@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import os
-
 import numpy as np
 import pandas as pd
 import pytest
@@ -209,11 +207,9 @@ def test_tracking_uri_resolution(monkeypatch, tmp_path) -> None:
     assert tracking.resolve_tracking_uri(f"sqlite:///{abs_db.as_posix()}") == (
         f"sqlite:///{abs_db.resolve().as_posix()}"
     )
-    # legacy file store: plain paths -> file:// URI + opt-in flag
-    monkeypatch.delenv("MLFLOW_ALLOW_FILE_STORE", raising=False)
-    assert tracking.resolve_tracking_uri("./mlruns") == (PROJECT_ROOT / "mlruns").resolve().as_uri()
-    assert os.environ["MLFLOW_ALLOW_FILE_STORE"] == "true"
-    assert tracking.resolve_tracking_uri(str(tmp_path)) == tmp_path.resolve().as_uri()
+    # a bare directory is not a supported store any more
+    with pytest.raises(ValueError, match="not a URI"):
+        tracking.resolve_tracking_uri("./mlruns")
     # remote / full URIs untouched
     assert tracking.resolve_tracking_uri("http://mlflow:5000") == "http://mlflow:5000"
     # Postgres backends are routed to the psycopg 3 driver we ship (like DATABASE_URL).

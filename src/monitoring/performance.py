@@ -34,6 +34,7 @@ from src.features.build_features import TARGET, build_features
 from src.features.horizons import DAY_AHEAD
 from src.monitoring.metrics import (
     MIN_WINDOW_HOURS,
+    WINDOWS_DAYS,
     HeadToHead,
     WindowMetrics,
     actual_vs_official,
@@ -45,8 +46,6 @@ from src.monitoring.metrics import (
 )
 
 log = logging.getLogger(__name__)
-
-WINDOWS_DAYS: tuple[int, ...] = (7, 30)
 
 
 @dataclass
