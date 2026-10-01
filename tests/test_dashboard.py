@@ -76,7 +76,8 @@ RETRAIN_DETAILS = {
 }
 
 
-def synthetic_load(n: int) -> np.ndarray:
+def daily_curve(n: int) -> np.ndarray:
+    """A noiseless 24-hour cycle: any day-aligned slice equals the actuals of those hours."""
     hours = np.arange(n)
     return 55_000 + 8_000 * np.sin((hours - 6) / 24 * 2 * np.pi)
 
@@ -85,7 +86,7 @@ def synthetic_load(n: int) -> np.ndarray:
 def seeded(engine: Engine) -> Engine:
     """Ten days of actuals + official forecast, two forecast issues, two model versions, events."""
     ts = pd.date_range(START, periods=24 * DAYS, freq="h", tz="UTC")
-    load = synthetic_load(len(ts))
+    load = daily_curve(len(ts))
     rng = np.random.default_rng(0)
     db.upsert_dataframe(
         engine,
@@ -100,7 +101,7 @@ def seeded(engine: Engine) -> Engine:
         pd.DataFrame(
             {
                 "timestamp_utc": ts_off,
-                "forecast_mw": synthetic_load(len(ts_off)) + rng.normal(0, 1_000, len(ts_off)),
+                "forecast_mw": daily_curve(len(ts_off)) + rng.normal(0, 1_000, len(ts_off)),
                 "source": "smard",
             }
         ),
@@ -130,7 +131,7 @@ def seeded(engine: Engine) -> Engine:
                 "timestamp_utc": ts_v2,
                 "model_version": "2",
                 "model_name": q.MODEL_NAME,
-                "forecast_mw": synthetic_load(len(ts_v2)) + rng.normal(0, 300, len(ts_v2)),
+                "forecast_mw": daily_curve(len(ts_v2)) + rng.normal(0, 300, len(ts_v2)),
                 "issued_at": datetime(2024, 1, 10, 5, tzinfo=UTC),
             }
         ),
@@ -312,7 +313,7 @@ def test_daily_accuracy(seeded: Engine) -> None:
 
 def test_official_only_summary_works_before_any_model_forecast(engine: Engine) -> None:
     ts = pd.date_range(START, periods=48, freq="h", tz="UTC")
-    load = synthetic_load(48)
+    load = daily_curve(48)
     db.upsert_dataframe(
         engine,
         db.LoadActual,

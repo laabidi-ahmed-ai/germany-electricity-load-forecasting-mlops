@@ -23,6 +23,7 @@ from src.serving.forecast import (
     make_day_ahead_forecast,
     store_forecast,
 )
+from tests.conftest import fake_loaded_model, load_curve
 
 CITIES = (City("A", 50.0, 8.0), City("B", 52.0, 13.0))
 N_DAYS = 30
@@ -75,10 +76,7 @@ class FakeWeatherClient:
 def seeded(engine):
     """30 days of load + archive weather in the DB."""
     ts = pd.date_range("2024-01-01", periods=24 * N_DAYS, freq="h", tz="UTC")
-    rng = np.random.default_rng(0)
-    h = np.arange(len(ts))
-    load = 55_000 + 10_000 * np.sin(2 * np.pi * (h - 6) / 24) + 3_000 * np.sin(2 * np.pi * h / 168)
-    load += rng.normal(0, 300, len(ts))
+    load = load_curve(len(ts))
     db.upsert_dataframe(
         engine, db.LoadActual, pd.DataFrame({"timestamp_utc": ts, TARGET: load, "source": "smard"})
     )
@@ -86,23 +84,9 @@ def seeded(engine):
     return engine
 
 
-class StubPyfunc:
-    """Stands in for an MLflow pyfunc model: predicts last week's load + 100."""
-
-    def predict(self, X: pd.DataFrame) -> np.ndarray:
-        return X["load_lag_168"].to_numpy() + 100.0
-
-
 def fake_model(features: list[str]) -> LoadedModel:
-    return LoadedModel(
-        name="germany-load-day-ahead",
-        version="7",
-        alias="champion",
-        run_id="run-xyz",
-        features=features,
-        horizon=DAY_AHEAD,
-        pyfunc=StubPyfunc(),
-    )
+    """The champion stand-in: last week's load + 100 MW, version 7."""
+    return fake_loaded_model(features, version="7", bias=100.0)
 
 
 @pytest.fixture

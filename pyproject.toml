@@ -51,18 +51,13 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=7.4",
-    "pytest-cov>=4.1",
     "httpx>=0.25",          # FastAPI TestClient
     "pyyaml>=6.0",          # workflow-contract tests
     "ruff>=0.4",
 ]
-# Deep learning (LSTM/GRU -> TFT, see the README roadmap). Optional: large, platform-specific wheels.
-dl = [
-    "torch>=2.1",
-]
 
 [project.urls]
-Repository = "https://github.com/<your-username>/germany-electricity-load-forecasting-mlops"
+Repository = "https://github.com/laabidi-ahmed-ai/germany-electricity-load-forecasting-mlops"
 
 # --------------------------------------------------------------------------- #
 # setuptools: which top-level packages ship in the wheel

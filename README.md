@@ -285,7 +285,7 @@ LOG_LEVEL=INFO
 
 ```bash
 # 1. Clone and enter
-git clone https://github.com/<your-username>/germany-electricity-load-forecasting-mlops.git
+git clone https://github.com/laabidi-ahmed-ai/germany-electricity-load-forecasting-mlops.git
 cd germany-electricity-load-forecasting-mlops
 
 # 2. Install (Python 3.11+)

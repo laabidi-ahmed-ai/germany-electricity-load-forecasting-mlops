@@ -1,4 +1,5 @@
-"""Shared fixtures: env isolation, a fake HTTP session, synthetic SMARD/Open-Meteo payloads.
+"""Shared fixtures: env isolation, a fake HTTP session, synthetic SMARD/Open-Meteo payloads,
+and the synthetic load / weather / model stand-ins the modelling tests share.
 
 No unit test here touches the network. Real-network tests live in
 ``tests/test_integration_network.py`` and carry the ``integration`` marker.
@@ -20,6 +21,9 @@ from sqlalchemy.engine import Engine
 
 from config.settings import Settings, get_settings
 from src.data import db
+from src.features.build_features import TARGET, WEATHER_COLUMNS, build_feature_frame
+from src.features.horizons import DAY_AHEAD
+from src.models.registry import LoadedModel
 
 _ENV_KEYS = [
     "DATABASE_URL",
@@ -96,7 +100,7 @@ DST_WEEK_STARTS_MS = [1_616_367_600_000, 1_616_968_800_000]
 DST_WEEK_LENGTHS = [167, 168]
 
 
-def synthetic_load(ts_ms: int) -> float:
+def smard_value(ts_ms: int) -> float:
     """A plausible German load curve (~55 GW mean, daily cycle)."""
     hour = (ts_ms // MS_PER_HOUR) % 24
     return 55_000 + 10_000 * math.sin((hour - 6) / 24 * 2 * math.pi)
@@ -111,7 +115,7 @@ def smard_week_payload(
     series = []
     for i in range(n_points):
         ts = week_start_ms + i * MS_PER_HOUR
-        val = None if (null_from is not None and i >= null_from) else synthetic_load(ts) * factor
+        val = None if (null_from is not None and i >= null_from) else smard_value(ts) * factor
         series.append([ts, val])
     return {"meta_data": None, "series": series}
 
@@ -179,5 +183,81 @@ def engine(tmp_path) -> Engine:
 def load_frame() -> pd.DataFrame:
     """A clean 2-week hourly UTC load frame spanning the DST switch."""
     ts = pd.date_range("2021-03-21T23:00Z", periods=335, freq="h")
-    values = [synthetic_load(int(t.timestamp() * 1000)) for t in ts]
+    values = [smard_value(int(t.timestamp() * 1000)) for t in ts]
     return pd.DataFrame({"timestamp_utc": ts, "load_mw": values})
+
+
+# --- Synthetic modelling data shared by the model / serving / monitoring tests ---
+FAST_LGBM = {"n_estimators": 60, "learning_rate": 0.2, "num_leaves": 15, "min_child_samples": 5}
+
+
+def load_curve(n_hours: int, *, seed: int = 0, noise: float = 300.0) -> np.ndarray:
+    """German-like hourly load (~55 GW): daily + weekly cycle plus Gaussian noise."""
+    rng = np.random.default_rng(seed)
+    h = np.arange(n_hours)
+    return (
+        55_000
+        + 10_000 * np.sin(2 * np.pi * (h - 6) / 24)
+        + 3_000 * np.sin(2 * np.pi * h / 168)
+        + rng.normal(0, noise, n_hours)
+    )
+
+
+def random_weather(timestamps: pd.Series, *, seed: int) -> pd.DataFrame:
+    """National-average weather columns drawn from N(10, 5) - pure noise for the model."""
+    rng = np.random.default_rng(seed)
+    weather = pd.DataFrame({"timestamp_utc": timestamps})
+    for col in WEATHER_COLUMNS:
+        weather[col] = rng.normal(10, 5, len(timestamps))
+    return weather
+
+
+def synthetic_frame(days: int = 45, seed: int = 0) -> pd.DataFrame:
+    """Load with daily + weekly cycles and a temperature effect, so a model can learn."""
+    ts = pd.date_range("2024-01-01", periods=24 * days, freq="h", tz="UTC")
+    rng = np.random.default_rng(seed)
+    h = np.arange(len(ts))
+    temp = 5 + 10 * np.sin(2 * np.pi * h / (24 * 30)) + rng.normal(0, 1, len(ts))
+    load = (
+        55_000
+        + 10_000 * np.sin(2 * np.pi * (h - 6) / 24)
+        + 3_000 * np.sin(2 * np.pi * h / 168)
+        - 300 * temp
+        + rng.normal(0, 400, len(ts))
+    )
+    load_df = pd.DataFrame({"timestamp_utc": ts, TARGET: load})
+    weather = pd.DataFrame({"timestamp_utc": ts})
+    for col in WEATHER_COLUMNS:
+        weather[col] = temp if col.startswith("temperature") else rng.normal(10, 5, len(ts))
+    return build_feature_frame(load_df, weather)
+
+
+class StubPyfunc:
+    """Stands in for an MLflow pyfunc model: last week's load (+ ``bias``)."""
+
+    def __init__(self, bias: float = 0.0) -> None:
+        self.bias = bias
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        return X["load_lag_168"].to_numpy() + self.bias
+
+
+def fake_loaded_model(
+    features: list[str],
+    *,
+    version: str = "1",
+    bias: float = 0.0,
+    pyfunc: Any = None,
+    train_end: pd.Timestamp | None = None,
+) -> LoadedModel:
+    """A champion as ``registry.load_champion`` would return it, without MLflow."""
+    return LoadedModel(
+        name="germany-load-day-ahead",
+        version=version,
+        alias="champion",
+        run_id=f"run-{version}",
+        features=features,
+        horizon=DAY_AHEAD,
+        pyfunc=pyfunc if pyfunc is not None else StubPyfunc(bias),
+        train_end=train_end,
+    )

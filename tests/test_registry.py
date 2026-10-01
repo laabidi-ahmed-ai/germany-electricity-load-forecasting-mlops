@@ -18,7 +18,7 @@ from src.data import db
 from src.features.horizons import DAY_AHEAD, select_features
 from src.models import evaluate, registry, train
 from src.models.baselines import BASELINE_FACTORIES
-from tests.test_models import FAST_LGBM, synthetic_frame
+from tests.conftest import FAST_LGBM, synthetic_frame
 
 
 @pytest.fixture(scope="module")

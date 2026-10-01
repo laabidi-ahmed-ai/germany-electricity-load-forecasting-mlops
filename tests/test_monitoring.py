@@ -12,11 +12,10 @@ from config.settings import get_settings
 from src.data import db
 from src.features.build_features import TARGET, WEATHER_COLUMNS, build_feature_frame
 from src.features.horizons import DAY_AHEAD, select_features
-from src.models.registry import LoadedModel
 from src.monitoring import drift as drift_mod
 from src.monitoring import metrics, retrain
 from src.monitoring import performance as perf
-from tests.test_models import FAST_LGBM
+from tests.conftest import FAST_LGBM, fake_loaded_model, load_curve, random_weather
 
 N_DAYS = 40
 START = pd.Timestamp("2024-01-01T00:00Z")
@@ -24,17 +23,6 @@ AS_OF = START + pd.Timedelta(days=N_DAYS) - pd.Timedelta(hours=1)  # last hour o
 
 
 # --- Helpers ---
-def synthetic_load(n_hours: int, seed: int = 0) -> np.ndarray:
-    rng = np.random.default_rng(seed)
-    h = np.arange(n_hours)
-    return (
-        55_000
-        + 10_000 * np.sin(2 * np.pi * (h - 6) / 24)
-        + 3_000 * np.sin(2 * np.pi * h / 168)
-        + rng.normal(0, 300, n_hours)
-    )
-
-
 def seed_db(
     engine,
     *,
@@ -46,7 +34,7 @@ def seed_db(
     with_model: bool = True,
 ) -> pd.DataFrame:
     ts = pd.date_range(START, periods=24 * days, freq="h", tz="UTC")
-    load = synthetic_load(len(ts))
+    load = load_curve(len(ts))
     rng = np.random.default_rng(1)
     db.upsert_dataframe(
         engine, db.LoadActual, pd.DataFrame({"timestamp_utc": ts, TARGET: load, "source": "smard"})
@@ -80,40 +68,7 @@ def seed_db(
 
 
 def feature_frame(load: pd.DataFrame, seed: int = 2) -> pd.DataFrame:
-    rng = np.random.default_rng(seed)
-    weather = pd.DataFrame({"timestamp_utc": load["timestamp_utc"]})
-    for col in WEATHER_COLUMNS:
-        weather[col] = rng.normal(10, 5, len(load))
-    return build_feature_frame(load, weather)
-
-
-class StubPyfunc:
-    """Predicts last week's load (a strong-ish but beatable stand-in for the champion)."""
-
-    def __init__(self, bias: float = 0.0) -> None:
-        self.bias = bias
-
-    def predict(self, X: pd.DataFrame) -> np.ndarray:
-        return X["load_lag_168"].to_numpy() + self.bias
-
-
-def fake_champion(
-    features: list[str],
-    *,
-    bias: float = 0.0,
-    version: str = "1",
-    train_end: pd.Timestamp | None = None,
-) -> LoadedModel:
-    return LoadedModel(
-        name="germany-load-day-ahead",
-        version=version,
-        alias="champion",
-        run_id="run-champ",
-        features=features,
-        horizon=DAY_AHEAD,
-        pyfunc=StubPyfunc(bias),
-        train_end=train_end,
-    )
+    return build_feature_frame(load, random_weather(load["timestamp_utc"], seed=seed))
 
 
 def fake_runner(drifted: set[str], *, score_ok: float = 0.02, score_bad: float = 0.5):
@@ -281,7 +236,7 @@ def test_drift_columns_exclude_calendar_and_nowcast_features() -> None:
         pd.DataFrame(
             {
                 "timestamp_utc": pd.date_range(START, periods=24 * 10, freq="h", tz="UTC"),
-                TARGET: synthetic_load(240),
+                TARGET: load_curve(240),
             }
         )
     )
@@ -326,7 +281,7 @@ def test_summarize_metrics_reads_evidently_structure() -> None:
 def test_compute_drift_flags_and_prediction_drift(engine) -> None:
     load = seed_db(engine, days=120, with_model=False)
     frame = feature_frame(load)
-    champ = fake_champion(select_features(frame.columns, DAY_AHEAD))
+    champ = fake_loaded_model(select_features(frame.columns, DAY_AHEAD))
     training = frame[frame.index < frame.index.max() - pd.Timedelta(days=40)]
 
     # no drift
@@ -406,7 +361,7 @@ def test_compute_drift_flags_and_prediction_drift(engine) -> None:
 def test_drift_reference_defaults_to_the_champions_training_window(engine) -> None:
     load = seed_db(engine, days=120, with_model=False)
     frame = feature_frame(load)
-    champ = fake_champion(select_features(frame.columns, DAY_AHEAD))
+    champ = fake_loaded_model(select_features(frame.columns, DAY_AHEAD))
     champ.train_end = frame.index.max() - pd.Timedelta(days=40)
     seen: dict[str, pd.DataFrame] = {}
 
@@ -461,7 +416,7 @@ def cfg() -> retrain.RetrainConfig:
 def test_triggers_insufficient_data_do_not_fire(engine, cfg) -> None:
     load = seed_db(engine, days=60, with_model=False)
     frame = feature_frame(load)
-    champ = fake_champion(select_features(frame.columns, DAY_AHEAD))
+    champ = fake_loaded_model(select_features(frame.columns, DAY_AHEAD))
     d = retrain.evaluate_triggers(
         engine, champ, cfg, as_of=AS_OF, frame=frame, drift_runner=fake_runner(set())
     )
@@ -474,7 +429,7 @@ def test_triggers_insufficient_data_do_not_fire(engine, cfg) -> None:
 def test_error_trigger_fires_on_high_mape(engine, cfg) -> None:
     load = seed_db(engine, days=60, model_noise=100, model_bias=4_000)  # ~7% MAPE
     frame = feature_frame(load)
-    champ = fake_champion(select_features(frame.columns, DAY_AHEAD))
+    champ = fake_loaded_model(select_features(frame.columns, DAY_AHEAD))
     as_of = load["timestamp_utc"].max()
     d = retrain.evaluate_triggers(
         engine, champ, cfg, as_of=as_of, frame=frame, drift_runner=fake_runner(set())
@@ -487,7 +442,7 @@ def test_error_trigger_fires_on_high_mape(engine, cfg) -> None:
 def test_official_trigger_fires_when_benchmark_is_much_better(engine, cfg) -> None:
     load = seed_db(engine, days=60, model_noise=1_500, official_noise=300)
     frame = feature_frame(load)
-    champ = fake_champion(select_features(frame.columns, DAY_AHEAD))
+    champ = fake_loaded_model(select_features(frame.columns, DAY_AHEAD))
     d = retrain.evaluate_triggers(
         engine,
         champ,
@@ -504,7 +459,7 @@ def test_official_trigger_fires_when_benchmark_is_much_better(engine, cfg) -> No
 def test_drift_trigger_fires_and_drift_errors_are_contained(engine, cfg) -> None:
     load = seed_db(engine, days=120, with_model=False)
     frame = feature_frame(load)
-    champ = fake_champion(select_features(frame.columns, DAY_AHEAD))
+    champ = fake_loaded_model(select_features(frame.columns, DAY_AHEAD))
     d = retrain.evaluate_triggers(
         engine,
         champ,
@@ -531,7 +486,9 @@ def test_drift_trigger_fires_and_drift_errors_are_contained(engine, cfg) -> None
 def test_challenger_skipped_without_fresh_data(engine, cfg) -> None:
     load = seed_db(engine, days=60, with_model=False)
     frame = feature_frame(load)
-    champ = fake_champion(select_features(frame.columns, DAY_AHEAD), train_end=frame.index.max())
+    champ = fake_loaded_model(
+        select_features(frame.columns, DAY_AHEAD), train_end=frame.index.max()
+    )
     out = retrain.run_champion_challenger(engine, champ, cfg, frame=frame)
     assert out.decision == "skipped" and "need 72h" in out.reason
     assert out.champion_mae is None
@@ -540,7 +497,7 @@ def test_challenger_skipped_without_fresh_data(engine, cfg) -> None:
 def test_challenger_skipped_without_train_end(engine, cfg) -> None:
     load = seed_db(engine, days=60, with_model=False)
     frame = feature_frame(load)
-    champ = fake_champion(select_features(frame.columns, DAY_AHEAD))  # no train_end recorded
+    champ = fake_loaded_model(select_features(frame.columns, DAY_AHEAD))  # no train_end recorded
     assert retrain.run_champion_challenger(engine, champ, cfg, frame=frame).decision == "skipped"
 
 
@@ -548,7 +505,7 @@ def test_challenger_promoted_when_it_beats_champion_by_margin(engine, cfg, monke
     load = seed_db(engine, days=90, with_model=False)
     frame = feature_frame(load)
     train_end = frame.index.max() - pd.Timedelta(days=5)
-    champ = fake_champion(  # a weak champion
+    champ = fake_loaded_model(  # a weak champion
         select_features(frame.columns, DAY_AHEAD), bias=3_000, train_end=train_end
     )
 
@@ -595,16 +552,7 @@ def test_challenger_kept_when_margin_not_met(engine, cfg) -> None:
         def predict(self, X):
             return twin.predict(X)
 
-    champ = LoadedModel(
-        "germany-load-day-ahead",
-        "1",
-        "champion",
-        "r",
-        cols,
-        DAY_AHEAD,
-        TwinPyfunc(),
-        train_end=train_end,
-    )
+    champ = fake_loaded_model(cols, pyfunc=TwinPyfunc(), train_end=train_end)
     strict = retrain.RetrainConfig(
         min_holdout_hours=24 * 3, holdout_days=5, lgbm_params=FAST_LGBM, min_improvement_pct=50.0
     )
@@ -621,7 +569,7 @@ def test_decisions_are_logged_to_mlflow_and_db(engine, cfg, tmp_path, monkeypatc
     get_settings.cache_clear()
     load = seed_db(engine, days=60, model_noise=100, model_bias=4_000)
     frame = feature_frame(load)
-    champ = fake_champion(select_features(frame.columns, DAY_AHEAD))
+    champ = fake_loaded_model(select_features(frame.columns, DAY_AHEAD))
     d = retrain.evaluate_triggers(
         engine,
         champ,
@@ -667,7 +615,7 @@ def test_decisions_are_logged_to_mlflow_and_db(engine, cfg, tmp_path, monkeypatc
 def test_cli_check_only_and_force_dry_run(engine, cfg, monkeypatch, capsys) -> None:
     load = seed_db(engine, days=90, with_model=False)
     frame = feature_frame(load)
-    champ = fake_champion(
+    champ = fake_loaded_model(
         select_features(frame.columns, DAY_AHEAD),
         bias=3_000,
         train_end=frame.index.max() - pd.Timedelta(days=10),

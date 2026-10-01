@@ -20,11 +20,12 @@ from src.features.build_features import (
     feature_columns,
     make_calendar_features,
 )
+from tests.conftest import random_weather
 
 N_HOURS = 24 * 30  # 30 days
 
 
-def synthetic_load(start="2024-03-01", n=N_HOURS, *, seed=0) -> pd.DataFrame:
+def ramp_load(start="2024-03-01", n=N_HOURS, *, seed=0) -> pd.DataFrame:
     """Load = row position + noise, so lag/rolling values are exactly predictable."""
     ts = pd.date_range(start, periods=n, freq="h", tz="UTC")
     rng = np.random.default_rng(seed)
@@ -32,22 +33,14 @@ def synthetic_load(start="2024-03-01", n=N_HOURS, *, seed=0) -> pd.DataFrame:
     return pd.DataFrame({"timestamp_utc": ts, TARGET: values})
 
 
-def synthetic_weather(load: pd.DataFrame, *, seed=1) -> pd.DataFrame:
-    rng = np.random.default_rng(seed)
-    w = pd.DataFrame({"timestamp_utc": load["timestamp_utc"]})
-    for col in WEATHER_COLUMNS:
-        w[col] = rng.normal(10, 5, len(load))
-    return w
-
-
 @pytest.fixture
 def load() -> pd.DataFrame:
-    return synthetic_load()
+    return ramp_load()
 
 
 @pytest.fixture
 def weather(load) -> pd.DataFrame:
-    return synthetic_weather(load)
+    return random_weather(load["timestamp_utc"], seed=1)
 
 
 # --- Lags & rolling ---

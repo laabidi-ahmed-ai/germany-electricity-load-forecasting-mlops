@@ -8,33 +8,12 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.features.build_features import TARGET, WEATHER_COLUMNS, build_feature_frame
+from src.features.build_features import TARGET
 from src.features.horizons import DAY_AHEAD, NOWCAST, select_features
 from src.models import evaluate, tracking, train
 from src.models.baselines import BASELINE_FACTORIES, SeasonalNaive
 from src.models.evaluate import compute_metrics, cross_validate
-
-FAST_LGBM = {"n_estimators": 60, "learning_rate": 0.2, "num_leaves": 15, "min_child_samples": 5}
-
-
-def synthetic_frame(days: int = 45, seed: int = 0) -> pd.DataFrame:
-    """Load with daily + weekly cycles and a temperature effect, so a model can learn."""
-    ts = pd.date_range("2024-01-01", periods=24 * days, freq="h", tz="UTC")
-    rng = np.random.default_rng(seed)
-    h = np.arange(len(ts))
-    temp = 5 + 10 * np.sin(2 * np.pi * h / (24 * 30)) + rng.normal(0, 1, len(ts))
-    load = (
-        55_000
-        + 10_000 * np.sin(2 * np.pi * (h - 6) / 24)
-        + 3_000 * np.sin(2 * np.pi * h / 168)
-        - 300 * temp
-        + rng.normal(0, 400, len(ts))
-    )
-    load_df = pd.DataFrame({"timestamp_utc": ts, TARGET: load})
-    weather = pd.DataFrame({"timestamp_utc": ts})
-    for col in WEATHER_COLUMNS:
-        weather[col] = temp if col.startswith("temperature") else rng.normal(10, 5, len(ts))
-    return build_feature_frame(load_df, weather)
+from tests.conftest import FAST_LGBM, synthetic_frame
 
 
 @pytest.fixture(scope="module")

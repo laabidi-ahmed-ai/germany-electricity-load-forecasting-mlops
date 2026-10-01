@@ -2,7 +2,7 @@
 #
 # `python -m src.data.ingest` only needs the data layer: HTTP clients, pandas,
 # SQLAlchemy + the Postgres driver, and pydantic-settings for config. No LightGBM,
-# MLflow, Evidently, FastAPI, Streamlit or PyTorch - that keeps a run at ~1 minute
+# MLflow, Evidently, FastAPI or Streamlit - that keeps a run at ~1 minute
 # and well inside the free Actions quota. Keep in sync with pyproject.toml floors.
 # (tests/test_workflows.py checks the ingest CLI imports nothing beyond this set.)
 requests>=2.31
