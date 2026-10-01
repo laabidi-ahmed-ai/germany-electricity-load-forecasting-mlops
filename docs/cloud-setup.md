@@ -11,7 +11,7 @@ Three things must survive between runs, and all three live in the cloud Postgres
 
 | What | Where | Why |
 |---|---|---|
-| Data (load, official forecast, weather, model forecasts, monitoring events) | our tables (`src/data/db.py`) | idempotent upserts, TimescaleDB hypertables when available |
+| Data (load, official forecast, weather, model forecasts, monitoring events) | our tables (`src/data/db.py`) | idempotent upserts |
 | **The champion model** | `model_artifacts` table: zipped MLflow pyfunc bundle (~3.4 MB) + features / horizon / train window / CV metrics, one row flagged `is_champion` | `registry.promote()` exports it; `registry.load_champion(engine)` loads it. The forecast job, the API and the monitor need **only `DATABASE_URL`**. Rollback = `--promote <old version>`. Old exports are pruned (last 5 kept, champion never). |
 | MLflow lineage (runs, params, metrics, model versions, aliases) | MLflow's own tables in the same Postgres (`MLFLOW_TRACKING_URI` = `DATABASE_URL`) | browse it locally with `mlflow ui --backend-store-uri "<DATABASE_URL>"`. MLflow *artifact files* stay on the runner — they are not needed, the DB export is the serving copy. |
 

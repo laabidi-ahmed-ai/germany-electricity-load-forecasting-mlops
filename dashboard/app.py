@@ -69,12 +69,13 @@ def load_latest_forecast(url: str) -> pd.DataFrame:
 def load_accuracy(url: str, days: int) -> dict[str, Any]:
     eng = engine_for(url)
     as_of = pd.Timestamp.now(tz="UTC").floor("h")
-    aligned = q.aligned_frame(eng, days=days, as_of=as_of)
+    base = q.actual_vs_official(eng, days=days, as_of=as_of)  # days >= 30 (slider minimum)
+    aligned = q.aligned_frame(eng, base)
     return {
         "aligned": aligned,
         "daily": q.daily_accuracy(aligned),
         "windows": [q.window_summary(aligned, days=d, as_of=as_of) for d in (7, 30)],
-        "official_only": q.official_only_summary(eng, days=30, as_of=as_of),
+        "official_only": q.official_only_summary(base, days=30, as_of=as_of),
     }
 
 

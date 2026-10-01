@@ -181,7 +181,6 @@ def promote(
     import mlflow
 
     engine = engine or db.get_engine()
-    db.init_db(engine)
     setup_mlflow(experiment)
     if db.get_model_artifact(engine, name, str(version)) is None:
         export_model_version(engine, version, name=name, experiment=experiment)
@@ -206,7 +205,6 @@ def load_champion(
     import mlflow
 
     engine = engine or db.get_engine()
-    db.init_db(engine)
     row = champion_record(engine, name=name)
     if row is None:
         raise LookupError(

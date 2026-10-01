@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------------------
-# Local stack (README §13): Postgres (TimescaleDB image) + forecast API + Streamlit dashboard.
+# Local stack (README §13): Postgres + forecast API + Streamlit dashboard.
 #
 #   docker compose up --build
 #   -> API      http://localhost:8000/docs
@@ -12,7 +12,7 @@
 # ---------------------------------------------------------------------------
 services:
   db:
-    image: timescale/timescaledb:latest-pg16
+    image: postgres:16
     environment:
       POSTGRES_USER: load
       POSTGRES_PASSWORD: load

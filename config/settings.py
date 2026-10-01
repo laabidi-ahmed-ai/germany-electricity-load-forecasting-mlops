@@ -54,7 +54,7 @@ class Settings(BaseSettings):
     # --- storage ------------------------------------------------------------
     database_url: str = Field(
         default=f"sqlite:///{(PROJECT_ROOT / 'data' / 'load_forecasting.db').as_posix()}",
-        description="SQLAlchemy URL. Postgres/TimescaleDB in the cloud; SQLite locally.",
+        description="SQLAlchemy URL. Postgres in the cloud; SQLite locally.",
     )
     mlflow_tracking_uri: str = Field(
         default="sqlite:///mlruns/mlflow.db",

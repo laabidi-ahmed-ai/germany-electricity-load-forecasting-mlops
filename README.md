@@ -212,7 +212,7 @@ This loop is why the system is designed to run continuously: a retraining trigge
 |---|---|
 | Language | Python 3.11+ |
 | Data ingestion | `requests` (SMARD, Open-Meteo) |
-| Storage | Postgres (Neon / Supabase free tier), TimescaleDB hypertables when the extension is available; SQLite for local dev |
+| Storage | Postgres (Neon / Supabase free tier); SQLite for local dev |
 | Feature engineering | pandas, `holidays` |
 | Modeling | LightGBM |
 | Experiment tracking + registry | MLflow (Postgres-backed) |

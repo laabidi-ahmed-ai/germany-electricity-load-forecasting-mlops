@@ -14,8 +14,8 @@ from src.features.build_features import TARGET, WEATHER_COLUMNS, build_feature_f
 from src.features.horizons import DAY_AHEAD, select_features
 from src.models.registry import LoadedModel
 from src.monitoring import drift as drift_mod
+from src.monitoring import metrics, retrain
 from src.monitoring import performance as perf
-from src.monitoring import retrain
 from tests.test_models import FAST_LGBM
 
 N_DAYS = 40
@@ -143,6 +143,11 @@ def fake_runner(drifted: set[str], *, score_ok: float = 0.02, score_bad: float =
     return _run
 
 
+def align(engine, **kwargs) -> pd.DataFrame:
+    """Actual x official x model forecast over everything stored."""
+    return metrics.with_model_forecast(engine, metrics.actual_vs_official(engine), **kwargs)
+
+
 # --- Performance ---
 def test_aligned_frame_inner_joins_on_common_hours(engine) -> None:
     seed_db(engine)
@@ -156,7 +161,7 @@ def test_aligned_frame_inner_joins_on_common_hours(engine) -> None:
                 db.LoadForecastOfficial.timestamp_utc < cut.to_pydatetime()
             )
         )
-    a = perf.aligned_frame(engine)
+    a = align(engine)
     assert list(a.columns) == [
         "timestamp_utc",
         "actual_mw",
@@ -182,11 +187,11 @@ def test_aligned_frame_uses_latest_issued_forecast_per_hour(engine) -> None:
         }
     )
     db.upsert_dataframe(engine, db.LoadForecastModel, later)
-    a = perf.aligned_frame(engine)
+    a = align(engine)
     row = a[a["timestamp_utc"] == ts].iloc[0]
     assert row["model_mw"] == 99_999.0 and row["model_version"] == "2"
     assert len(a) == 24 * N_DAYS  # still one row per hour
-    only_v1 = perf.aligned_frame(engine, model_version="1")
+    only_v1 = align(engine, model_version="1")
     assert only_v1[only_v1["timestamp_utc"] == ts]["model_mw"].iloc[0] != 99_999.0
 
 
@@ -228,10 +233,26 @@ def test_report_without_model_forecasts_is_honest(engine) -> None:
     assert "no scorable model forecasts yet" in report.summary()
 
 
+def test_report_reads_each_table_once(engine, monkeypatch) -> None:
+    """Actual and official load are read once and shared by every window and score."""
+    seed_db(engine)
+    reads: list[str] = []
+    original = db.read_table
+
+    def counting(eng, model, **kwargs):
+        reads.append(model.__tablename__)
+        return original(eng, model, **kwargs)
+
+    monkeypatch.setattr(db, "read_table", counting)
+    report = perf.compute_report(engine, as_of=AS_OF)
+    assert report.has_data and report.official_only
+    assert sorted(reads) == ["load_actual", "load_forecast_model", "load_forecast_official"]
+
+
 def test_window_needs_minimum_hours(engine) -> None:
     seed_db(engine, days=2)
     as_of = START + pd.Timedelta(hours=10)
-    w = perf.window_metrics(perf.aligned_frame(engine), as_of, 7)
+    w = perf.window_metrics(align(engine), as_of, 7)
     assert w.n_hours == 11 and not w.judged
 
 

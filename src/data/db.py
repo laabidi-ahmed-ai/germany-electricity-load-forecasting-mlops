@@ -7,9 +7,8 @@
 * Upserts are idempotent. Re-running any ingestion never creates duplicates:
   every table has a natural primary key and ``upsert_dataframe`` uses
   ``INSERT ... ON CONFLICT DO UPDATE`` on both dialects.
-* Postgres is the production store (README §10), with TimescaleDB hypertables when
-  the extension is available; SQLite is the zero-config local fallback that the
-  default ``DATABASE_URL`` points at.
+* Postgres is the production store (README §10); SQLite is the zero-config local
+  fallback that the default ``DATABASE_URL`` points at.
 """
 
 from __future__ import annotations
@@ -35,7 +34,6 @@ from sqlalchemy import (
     insert,
     or_,
     select,
-    text,
     update,
 )
 from sqlalchemy.dialects import postgresql, sqlite
@@ -212,14 +210,6 @@ class ModelArtifact(Base):
     promoted_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
 
 
-TIME_SERIES_TABLES: tuple[type[Base], ...] = (
-    LoadActual,
-    LoadForecastOfficial,
-    WeatherHourly,
-    LoadForecastModel,
-)
-
-
 # --- Engine / schema ---
 def get_engine(database_url: str | None = None, **kwargs: Any) -> Engine:
     """Create an engine for ``database_url`` (default: ``settings.database_url``).
@@ -245,32 +235,8 @@ def normalize_database_url(url: str) -> str:
 
 
 def init_db(engine: Engine) -> None:
-    """Create all tables (no-op if they exist) and, on TimescaleDB, hypertables."""
+    """Create all tables (no-op if they exist). Called once by each entry point."""
     Base.metadata.create_all(engine)
-    if engine.dialect.name == "postgresql":
-        _maybe_enable_timescale(engine)
-
-
-def _maybe_enable_timescale(engine: Engine) -> None:
-    """Best effort: turn the time-series tables into hypertables if TimescaleDB exists."""
-    try:
-        with engine.begin() as conn:
-            conn.execute(text("CREATE EXTENSION IF NOT EXISTS timescaledb"))
-    except Exception as err:  # extension is optional
-        log.info("TimescaleDB extension not available (%s); using plain Postgres tables", err)
-        return
-    for model in TIME_SERIES_TABLES:
-        try:
-            with engine.begin() as conn:
-                conn.execute(
-                    text(
-                        "SELECT create_hypertable(:table, 'timestamp_utc', "
-                        "if_not_exists => TRUE, migrate_data => TRUE)"
-                    ),
-                    {"table": model.__tablename__},
-                )
-        except Exception as err:
-            log.warning("could not create hypertable for %s: %s", model.__tablename__, err)
 
 
 # --- Upsert ---

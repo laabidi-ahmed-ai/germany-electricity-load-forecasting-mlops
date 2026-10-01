@@ -27,7 +27,7 @@ dependencies = [
     "numpy>=1.26",
     "pyarrow>=14",
     "holidays>=0.40",
-    # Storage (Postgres, optionally with TimescaleDB hypertables; SQLite for local dev)
+    # Storage (Postgres; SQLite for local dev)
     "sqlalchemy>=2.0",
     "psycopg[binary]>=3.1",
     # Config / secrets

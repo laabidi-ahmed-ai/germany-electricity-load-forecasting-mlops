@@ -43,33 +43,48 @@ def compute_metrics(
     }
 
 
-def aligned_frame(
-    engine: Engine,
-    *,
-    start: pd.Timestamp | None = None,
-    end: pd.Timestamp | None = None,
-    model_version: str | None = None,
+def actual_vs_official(
+    engine: Engine, *, start: pd.Timestamp | None = None, end: pd.Timestamp | None = None
 ) -> pd.DataFrame:
-    """Hours where actual, model forecast and official forecast all exist (inner join).
+    """Hours with both an actual and an official forecast: ``timestamp_utc, actual_mw, official_mw``.
+
+    Read once per report: the official-only score comes straight from it, and
+    ``with_model_forecast`` adds the model's forecast for the head-to-head.
+    """
+    actual = db.read_load(engine, start=start, end=end).rename(columns={"load_mw": "actual_mw"})
+    official = db.read_table(
+        engine, db.LoadForecastOfficial, start=start, end=end, source=SOURCE_SMARD
+    ).rename(columns={"forecast_mw": "official_mw"})[["timestamp_utc", "official_mw"]]
+    out = actual.merge(official, on="timestamp_utc")
+    return out.sort_values("timestamp_utc").reset_index(drop=True)
+
+
+def with_model_forecast(
+    engine: Engine, base: pd.DataFrame, *, model_version: str | None = None
+) -> pd.DataFrame:
+    """Inner-join the model forecast onto ``actual_vs_official`` rows -> ``ALIGNED_COLUMNS``.
 
     With ``model_version=None`` the most recently *issued* model forecast per hour is
     used, so re-issued hours and a new champion count exactly once.
     """
-    actual = db.read_load(engine, start=start, end=end).rename(columns={"load_mw": "actual_mw"})
+    if base.empty:
+        return pd.DataFrame(columns=ALIGNED_COLUMNS)
     filters = {"model_version": model_version} if model_version else {}
-    model = db.read_table(engine, db.LoadForecastModel, start=start, end=end, **filters)
-    official = db.read_table(
-        engine, db.LoadForecastOfficial, start=start, end=end, source=SOURCE_SMARD
-    ).rename(columns={"forecast_mw": "official_mw"})[["timestamp_utc", "official_mw"]]
-
-    if model.empty or actual.empty or official.empty:
+    model = db.read_table(
+        engine,
+        db.LoadForecastModel,
+        start=base["timestamp_utc"].min(),
+        end=base["timestamp_utc"].max(),
+        **filters,
+    )
+    if model.empty:
         return pd.DataFrame(columns=ALIGNED_COLUMNS)
     model = (
         model.sort_values(["timestamp_utc", "issued_at"])
         .drop_duplicates("timestamp_utc", keep="last")
         .rename(columns={"forecast_mw": "model_mw"})[["timestamp_utc", "model_mw", "model_version"]]
     )
-    out = actual.merge(model, on="timestamp_utc").merge(official, on="timestamp_utc")
+    out = base.merge(model, on="timestamp_utc")
     return out.sort_values("timestamp_utc").reset_index(drop=True)[ALIGNED_COLUMNS]
 
 
@@ -136,24 +151,17 @@ def daily_metrics(aligned: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=DAILY_COLUMNS)
 
 
-def official_accuracy(
-    engine: Engine,
-    as_of: pd.Timestamp,
-    days: int,
-) -> dict[str, Any]:
+def official_accuracy(base: pd.DataFrame, as_of: pd.Timestamp, days: int) -> dict[str, Any]:
     """The official forecast scored alone over ``(as_of - days, as_of]`` - the bar to beat.
 
-    Available from day one, because the official forecast is ingested with the actuals
-    long before any model forecast exists. Metrics are None below ``MIN_WINDOW_HOURS``.
+    ``base`` comes from ``actual_vs_official``. Available from day one, because the
+    official forecast is ingested with the actuals long before any model forecast
+    exists. Metrics are None below ``MIN_WINDOW_HOURS``.
     """
     start = as_of - pd.Timedelta(days=days)
-    actual = db.read_load(engine, start=start, end=as_of)
-    official = db.read_table(
-        engine, db.LoadForecastOfficial, start=start, end=as_of, source=SOURCE_SMARD
-    )
-    joined = actual.merge(official[["timestamp_utc", "forecast_mw"]], on="timestamp_utc")
-    joined = joined[joined["timestamp_utc"] > start]
-    if len(joined) < MIN_WINDOW_HOURS:
-        return {"n_hours": len(joined), "mae": None, "mape": None}
-    s = compute_metrics(joined["load_mw"], joined["forecast_mw"])
-    return {"n_hours": len(joined), "mae": s["mae"], "mape": s["mape"]}
+    ts = base["timestamp_utc"]
+    win = base[(ts > start) & (ts <= as_of)]
+    if len(win) < MIN_WINDOW_HOURS:
+        return {"n_hours": len(win), "mae": None, "mape": None}
+    s = compute_metrics(win["actual_mw"], win["official_mw"])
+    return {"n_hours": len(win), "mae": s["mae"], "mape": s["mape"]}

@@ -35,11 +35,12 @@ from src.features.horizons import DAY_AHEAD
 from src.monitoring.metrics import (
     MIN_WINDOW_HOURS,
     WindowMetrics,
-    aligned_frame,
+    actual_vs_official,
     daily_metrics,
     official_accuracy,
     score_pair,
     window_metrics,
+    with_model_forecast,
 )
 
 log = logging.getLogger(__name__)
@@ -115,8 +116,9 @@ def compute_report(
 ) -> PerformanceReport:
     as_of = db.to_utc(as_of) if as_of is not None else pd.Timestamp.now(tz="UTC").floor("h")
     start = as_of - pd.Timedelta(days=max(windows))
-    aligned = aligned_frame(engine, start=start, end=as_of, model_version=model_version)
-    aligned = aligned[aligned["timestamp_utc"] > start].reset_index(drop=True)
+    base = actual_vs_official(engine, start=start, end=as_of)
+    base = base[base["timestamp_utc"] > start].reset_index(drop=True)
+    aligned = with_model_forecast(engine, base, model_version=model_version)
     report = PerformanceReport(
         as_of=as_of,
         windows=[window_metrics(aligned, as_of, d) for d in windows],
@@ -125,7 +127,7 @@ def compute_report(
         model_versions=[] if aligned.empty else sorted(aligned["model_version"].unique()),
     )
     for d in windows:
-        oa = official_accuracy(engine, as_of, d)
+        oa = official_accuracy(base, as_of, d)
         if oa["mae"] is not None:
             report.official_only[d] = oa
     log.info("performance report:\n%s", report.summary())

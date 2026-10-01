@@ -144,10 +144,17 @@ def latest_forecast_frame(engine: Engine, *, context_hours: int = 48) -> pd.Data
 
 
 # --- Accuracy over time: model vs the official forecast (shared with monitoring) ---
-def aligned_frame(engine: Engine, *, days: int, as_of: pd.Timestamp | None = None) -> pd.DataFrame:
-    """Hours in the last ``days`` where actual, model and official forecast all exist."""
+def actual_vs_official(
+    engine: Engine, *, days: int, as_of: pd.Timestamp | None = None
+) -> pd.DataFrame:
+    """Hours in the last ``days`` with both an actual and an official forecast."""
     as_of = as_of if as_of is not None else pd.Timestamp.now(tz="UTC").floor("h")
-    return metrics.aligned_frame(engine, start=as_of - pd.Timedelta(days=days), end=as_of)
+    return metrics.actual_vs_official(engine, start=as_of - pd.Timedelta(days=days), end=as_of)
+
+
+def aligned_frame(engine: Engine, base: pd.DataFrame) -> pd.DataFrame:
+    """The ``base`` hours that also have a model forecast (latest issue per hour)."""
+    return metrics.with_model_forecast(engine, base)
 
 
 def window_summary(
@@ -169,11 +176,11 @@ def daily_accuracy(aligned: pd.DataFrame) -> pd.DataFrame:
 
 
 def official_only_summary(
-    engine: Engine, *, days: int, as_of: pd.Timestamp | None = None
+    base: pd.DataFrame, *, days: int, as_of: pd.Timestamp | None = None
 ) -> dict[str, Any]:
-    """The official forecast scored alone over the last ``days`` - the bar to beat."""
+    """The official forecast scored alone over the last ``days`` of ``base`` - the bar to beat."""
     as_of = as_of if as_of is not None else pd.Timestamp.now(tz="UTC").floor("h")
-    return {"days": days, **metrics.official_accuracy(engine, as_of, days)}
+    return {"days": days, **metrics.official_accuracy(base, as_of, days)}
 
 
 # --- Monitoring events: drift signals + retraining timeline ---

@@ -241,23 +241,27 @@ def test_latest_forecast_frame_is_the_latest_issue_with_context(seeded: Engine) 
     assert frame["issued_at"].notna().all()
 
 
+def aligned_last(engine: Engine, *, days: int, as_of: pd.Timestamp | None = None) -> pd.DataFrame:
+    return q.aligned_frame(engine, q.actual_vs_official(engine, days=days, as_of=as_of))
+
+
 # --- Accuracy ---
 def test_aligned_frame_scores_only_observed_hours_with_the_latest_issue(seeded: Engine) -> None:
     as_of = START + pd.Timedelta(days=DAYS)
-    aligned = q.aligned_frame(seeded, days=30, as_of=as_of)
+    aligned = aligned_last(seeded, days=30, as_of=as_of)
     # v1 covered days 3-9 (7 days), v2 re-issued days 8-9; day 10 has no actuals yet.
     assert len(aligned) == 24 * 7
     by_version = aligned.groupby("model_version").size().to_dict()
     assert by_version == {"1": 24 * 5, "2": 24 * 2}
     assert aligned["actual_mw"].notna().all() and aligned["official_mw"].notna().all()
 
-    only_two_days = q.aligned_frame(seeded, days=2, as_of=as_of)
+    only_two_days = aligned_last(seeded, days=2, as_of=as_of)
     assert set(only_two_days["model_version"]) == {"2"}
 
 
 def test_window_summary_matches_the_training_metrics(seeded: Engine) -> None:
     as_of = START + pd.Timedelta(days=DAYS, hours=-1)  # "now" = the last observed hour
-    aligned = q.aligned_frame(seeded, days=30, as_of=as_of)
+    aligned = aligned_last(seeded, days=30, as_of=as_of)
     w = q.window_summary(aligned, days=7, as_of=as_of)
     assert w["judged"] and w["n_hours"] == 24 * 7
     ref = compute_metrics(aligned["actual_mw"], aligned["model_mw"])
@@ -296,7 +300,7 @@ def test_window_summary_refuses_to_judge_on_too_few_hours() -> None:
 
 
 def test_daily_accuracy(seeded: Engine) -> None:
-    aligned = q.aligned_frame(seeded, days=30, as_of=START + pd.Timedelta(days=DAYS))
+    aligned = aligned_last(seeded, days=30, as_of=START + pd.Timedelta(days=DAYS))
     daily = q.daily_accuracy(aligned)
     assert len(daily) == 7 and (daily["n_hours"] == 24).all()
     assert daily["date"].is_monotonic_increasing
@@ -319,9 +323,10 @@ def test_official_only_summary_works_before_any_model_forecast(engine: Engine) -
         db.LoadForecastOfficial,
         pd.DataFrame({"timestamp_utc": ts, "forecast_mw": load * 1.02, "source": "smard"}),
     )
-    s = q.official_only_summary(engine, days=30, as_of=ts[-1])
+    base = q.actual_vs_official(engine, days=30, as_of=ts[-1])
+    s = q.official_only_summary(base, days=30, as_of=ts[-1])
     assert s["n_hours"] == 48 and s["mape"] == pytest.approx(2.0)
-    assert q.aligned_frame(engine, days=30, as_of=ts[-1]).empty
+    assert aligned_last(engine, days=30, as_of=ts[-1]).empty
 
 
 # --- Monitoring ---
@@ -367,8 +372,9 @@ def test_everything_handles_an_empty_database(engine: Engine) -> None:
     cov = q.coverage(engine)
     assert cov["first_actual"] is None and cov["n_hours"] == 0 and cov["completeness_pct"] is None
     assert q.latest_forecast_frame(engine).empty
-    assert q.aligned_frame(engine, days=30).empty
-    assert q.official_only_summary(engine, days=30)["mape"] is None
+    assert aligned_last(engine, days=30).empty
+    base = q.actual_vs_official(engine, days=30)
+    assert base.empty and q.official_only_summary(base, days=30)["mape"] is None
     events = q.monitoring_events(engine)
     assert events.empty and q.latest_check(events) is None and q.event_timeline(events).empty
 
