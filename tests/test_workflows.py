@@ -13,6 +13,7 @@ import yaml
 from config.settings import PROJECT_ROOT
 
 WORKFLOWS = PROJECT_ROOT / ".github" / "workflows"
+SETUP_ACTION = "./.github/actions/setup"
 SCHEDULED = {"ingest.yml", "forecast.yml", "monitor_retrain.yml"}
 HEAVY_MODULES = (
     "lightgbm",
@@ -43,6 +44,11 @@ def run_lines(wf: dict) -> str:
     return "\n".join(s.get("run", "") for s in steps(wf))
 
 
+def setup_step(wf: dict) -> dict:
+    """The shared setup step (secret check, Python, dependencies) every DB job uses."""
+    return next(s for s in steps(wf) if s.get("uses") == SETUP_ACTION)
+
+
 @pytest.mark.parametrize("name", sorted(SCHEDULED | {"bootstrap.yml", "ci.yml"}))
 def test_workflow_parses_and_has_a_single_job_with_timeout(name: str) -> None:
     wf = load(name)
@@ -51,7 +57,10 @@ def test_workflow_parses_and_has_a_single_job_with_timeout(name: str) -> None:
     assert job["runs-on"] == "ubuntu-latest"
     assert job["timeout-minutes"] > 0
     assert any(s.get("uses", "").startswith("actions/checkout@") for s in job["steps"])
-    assert any(s.get("uses", "").startswith("actions/setup-python@") for s in job["steps"])
+    assert any(  # directly (CI) or through the shared setup action (the DB jobs)
+        s.get("uses", "").startswith("actions/setup-python@") or s.get("uses") == SETUP_ACTION
+        for s in job["steps"]
+    )
 
 
 @pytest.mark.parametrize("name", sorted(SCHEDULED))
@@ -76,8 +85,32 @@ def test_jobs_use_secrets_and_never_hardcode_them(name: str) -> None:
     assert env["DATABASE_URL"] == "${{ secrets.DATABASE_URL }}"
     text = (WORKFLOWS / name).read_text(encoding="utf-8")
     assert "postgresql://" not in text and "postgres://" not in text  # no inline URLs
-    assert any("DATABASE_URL secret is not set" in s.get("run", "") for s in steps(wf))
+    names = [s.get("uses", s.get("name")) for s in steps(wf)]
+    assert names.index(SETUP_ACTION) == 1  # right after the checkout
     assert job.get("permissions", wf.get("permissions")) == {"contents": "read"}
+
+
+def test_setup_action_checks_the_secret_and_installs_lean_or_full() -> None:
+    action = yaml.safe_load(
+        (PROJECT_ROOT / ".github" / "actions" / "setup" / "action.yml").read_text(encoding="utf-8")
+    )
+    assert action["runs"]["using"] == "composite"
+    assert action["inputs"]["requirements"]["default"] == ""
+    action_steps = action["runs"]["steps"]
+    assert "DATABASE_URL secret is not set" in action_steps[0]["run"]
+    python = next(s for s in action_steps if s.get("uses", "").startswith("actions/setup-python@"))
+    assert python["with"]["python-version"] == "3.11"
+    assert "inputs.requirements" in python["with"]["cache-dependency-path"]  # lean jobs cache lean
+    install = action_steps[-1]["run"]
+    assert 'pip install -r "$REQUIREMENTS"' in install and "pip install ." in install
+
+
+def test_actions_run_on_node_24() -> None:
+    """checkout v4 / setup-python v5 run on the deprecated Node 20 runtime."""
+    texts = [p.read_text(encoding="utf-8") for p in WORKFLOWS.glob("*.yml")]
+    texts.append((PROJECT_ROOT / ".github" / "actions" / "setup" / "action.yml").read_text())
+    for text in texts:
+        assert "actions/checkout@v4" not in text and "actions/setup-python@v5" not in text
 
 
 def test_schedule_order_ingest_then_forecast_then_monitor() -> None:
@@ -98,19 +131,18 @@ def test_schedule_order_ingest_then_forecast_then_monitor() -> None:
 def test_ingest_workflow_installs_only_the_lean_requirements() -> None:
     wf = load("ingest.yml")
     text = run_lines(wf)
-    assert "pip install -r requirements/ingest.txt" in text
-    assert "pip install ." not in text and "pip install -e" not in text
+    assert setup_step(wf)["with"] == {"requirements": "requirements/ingest.txt"}
+    assert "pip install" not in text
     (job,) = wf["jobs"].values()
     assert job["env"]["PYTHONPATH"] == "."
     assert "python -m src.data.ingest --backfill" in text
     assert "python -m src.data.ingest --sources" in text
-    setup = next(s for s in steps(wf) if s.get("uses", "").startswith("actions/setup-python@"))
-    assert setup["with"]["cache-dependency-path"] == "requirements/ingest.txt"
 
 
 def test_heavy_workflows_install_the_project_and_run_the_right_entrypoints() -> None:
+    for name in ("forecast.yml", "monitor_retrain.yml", "bootstrap.yml"):
+        assert "with" not in setup_step(load(name)), name  # full project install
     fc = run_lines(load("forecast.yml"))
-    assert "pip install ." in fc
     assert "python -m src.data.ingest" in fc and "python -m src.serving.batch_forecast" in fc
 
     mon = load("monitor_retrain.yml")

@@ -1,0 +1,41 @@
+# Shared setup for the jobs that talk to the database (ingest, forecast, monitor, bootstrap):
+# fail fast without DATABASE_URL, install Python, then the job's dependencies.
+# The calling job checks the repository out first (a local action lives in it).
+name: Set up the project
+description: Require DATABASE_URL, install Python and the job's dependencies.
+
+inputs:
+  requirements:
+    description: "requirements file to install instead of the full project (lean jobs)"
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Require DATABASE_URL secret
+      shell: bash
+      run: |
+        if [ -z "$DATABASE_URL" ]; then
+          echo "::error::DATABASE_URL secret is not set (Settings > Secrets and variables > Actions)"
+          exit 1
+        fi
+
+    - name: Set up Python
+      uses: actions/setup-python@v7
+      with:
+        python-version: "3.11"
+        cache: pip
+        cache-dependency-path: ${{ inputs.requirements || 'pyproject.toml' }}
+
+    - name: Install dependencies
+      shell: bash
+      env:
+        REQUIREMENTS: ${{ inputs.requirements }}
+      run: |
+        python -m pip install --upgrade pip
+        if [ -n "$REQUIREMENTS" ]; then
+          pip install -r "$REQUIREMENTS"
+        else
+          pip install .
+        fi
