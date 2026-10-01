@@ -40,7 +40,9 @@ from sqlalchemy.engine import Engine
 from config.log import configure_logging
 from config.settings import PROJECT_ROOT, get_settings
 from src.data import db
-from src.data.weather_client import WEATHER_VARS, national_average
+from src.data.weather_client import NATIONAL_COLUMNS as WEATHER_COLUMNS
+from src.data.weather_client import national_average
+from src.features.horizons import most_recent_load_lag
 
 log = logging.getLogger(__name__)
 
@@ -52,8 +54,6 @@ ROLLING_WINDOWS: tuple[int, ...] = (24, 168)
 ROLLING_STATS: tuple[str, ...] = ("mean", "std", "min", "max")
 # A rolling window still produces a value when a few hours are missing inside it.
 ROLLING_MIN_PERIODS_FRAC = 0.75
-
-WEATHER_COLUMNS: tuple[str, ...] = tuple(f"{v}_de_avg" for v in WEATHER_VARS)
 
 DEFAULT_OUTPUT = PROJECT_ROOT / "data" / "processed" / "features.parquet"
 
@@ -166,19 +166,13 @@ def build_feature_frame(
     df.index.name = "timestamp_utc"
 
     if dropna:
-        required = [TARGET, *lag_and_rolling_columns()]
+        required = [TARGET, *(c for c in df.columns if most_recent_load_lag(c) is not None)]
         before = len(df)
         df = df.dropna(subset=required)
         log.info(
             "feature frame: %d rows (dropped %d without full history)", len(df), before - len(df)
         )
     return df
-
-
-def lag_and_rolling_columns() -> list[str]:
-    cols = [f"load_lag_{k}" for k in LAG_HOURS]
-    cols += [f"load_roll_{s}_{w}" for w in ROLLING_WINDOWS for s in ROLLING_STATS]
-    return cols
 
 
 def feature_columns(df: pd.DataFrame) -> list[str]:

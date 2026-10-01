@@ -29,7 +29,7 @@ from sqlalchemy.engine import Engine
 from src.data import db
 from src.data.db import SOURCE_SMARD
 from src.data.weather_client import WeatherClient, national_average
-from src.features.build_features import TARGET, build_feature_frame
+from src.features.build_features import TARGET, WEATHER_COLUMNS, build_feature_frame
 from src.features.horizons import DAY_AHEAD, most_recent_load_lag, select_features
 from src.models.registry import LoadedModel
 
@@ -134,13 +134,15 @@ def build_serving_features(
     served = frame.loc[target]
 
     # Every day-ahead feature must be fully observed (no NaN lags); weather may be NaN.
-    lag_cols = [c for c in select_features(served.columns, DAY_AHEAD) if most_recent_load_lag(c)]
+    lag_cols = [
+        c for c in select_features(served.columns, DAY_AHEAD) if most_recent_load_lag(c) is not None
+    ]
     if served[lag_cols].isna().any().any():
         bad = served[lag_cols].isna().sum()
         raise NoDataError(
             f"gaps in recent actual load break lag features: {bad[bad > 0].to_dict()}"
         )
-    n_nan_weather = int(served.filter(like="_de_avg").isna().sum().sum())
+    n_nan_weather = int(served[list(WEATHER_COLUMNS)].isna().sum().sum())
     if n_nan_weather:
         log.warning("%d NaN weather values in served features (model handles NaN)", n_nan_weather)
     return served, last_actual

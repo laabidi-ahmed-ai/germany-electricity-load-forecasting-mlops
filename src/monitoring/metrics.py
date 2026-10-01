@@ -88,8 +88,16 @@ def with_model_forecast(
     return out.sort_values("timestamp_utc").reset_index(drop=True)[ALIGNED_COLUMNS]
 
 
+def improvement_pct(reference_mae: float, candidate_mae: float) -> float:
+    """How much lower the candidate's MAE is, in % of the reference (+x% = candidate better)."""
+    return float((reference_mae - candidate_mae) / reference_mae * 100.0)
+
+
 def score_pair(aligned: pd.DataFrame) -> dict[str, Any]:
-    """Model and official forecast scored against the actuals of an aligned frame."""
+    """Model and official forecast scored against the actuals of an aligned frame.
+
+    The keys are the fields of ``HeadToHead``.
+    """
     m = compute_metrics(aligned["actual_mw"], aligned["model_mw"])
     o = compute_metrics(aligned["actual_mw"], aligned["official_mw"])
     return {
@@ -98,22 +106,28 @@ def score_pair(aligned: pd.DataFrame) -> dict[str, Any]:
         "official_mae": o["mae"],
         "official_mape": o["mape"],
         "model_beats_official": bool(m["mae"] < o["mae"]),
-        "improvement_pct": float((o["mae"] - m["mae"]) / o["mae"] * 100.0),
+        "improvement_pct": improvement_pct(o["mae"], m["mae"]),
     }
 
 
-@dataclass
-class WindowMetrics:
-    window_days: int
-    start: pd.Timestamp
-    end: pd.Timestamp
-    n_hours: int
+@dataclass(kw_only=True)
+class HeadToHead:
+    """Model vs official forecast on the same hours (MAE in MW, MAPE in %)."""
+
     model_mae: float | None = None
     model_mape: float | None = None
     official_mae: float | None = None
     official_mape: float | None = None
     model_beats_official: bool | None = None
     improvement_pct: float | None = None  # +x% = model MAE is x% lower than official
+
+
+@dataclass(kw_only=True)
+class WindowMetrics(HeadToHead):
+    window_days: int
+    start: pd.Timestamp
+    end: pd.Timestamp
+    n_hours: int
 
     @property
     def judged(self) -> bool:
@@ -124,11 +138,8 @@ def window_metrics(aligned: pd.DataFrame, as_of: pd.Timestamp, days: int) -> Win
     """Head-to-head over ``(as_of - days, as_of]``; unjudged below ``MIN_WINDOW_HOURS``."""
     start = as_of - pd.Timedelta(days=days)
     win = aligned[(aligned["timestamp_utc"] > start) & (aligned["timestamp_utc"] <= as_of)]
-    wm = WindowMetrics(window_days=days, start=start, end=as_of, n_hours=len(win))
-    if len(win) >= MIN_WINDOW_HOURS:
-        for k, v in score_pair(win).items():
-            setattr(wm, k, v)
-    return wm
+    score = score_pair(win) if len(win) >= MIN_WINDOW_HOURS else {}
+    return WindowMetrics(window_days=days, start=start, end=as_of, n_hours=len(win), **score)
 
 
 def daily_metrics(aligned: pd.DataFrame) -> pd.DataFrame:

@@ -54,7 +54,9 @@ WEATHER_VARS: tuple[str, ...] = (
     "relative_humidity_2m",  # %
 )
 
-WEATHER_COLUMNS = ["timestamp_utc", "city", "source", *WEATHER_VARS]
+CITY_COLUMNS = ["timestamp_utc", "city", "source", *WEATHER_VARS]
+# National averages (``national_average``) - the weather features of the model.
+NATIONAL_COLUMNS: tuple[str, ...] = tuple(f"{var}_de_avg" for var in WEATHER_VARS)
 
 SOURCE_ARCHIVE = "archive"
 SOURCE_FORECAST = "forecast"
@@ -77,7 +79,7 @@ def _hourly_payload_to_frame(payload: dict, city: City, source: str) -> pd.DataF
     df["timestamp_utc"] = pd.to_datetime(hourly["time"], utc=True)
     df["city"] = city.name
     df["source"] = source
-    return df.loc[:, WEATHER_COLUMNS]
+    return df.loc[:, CITY_COLUMNS]
 
 
 def _finalise(frames: list[pd.DataFrame]) -> pd.DataFrame:
@@ -166,13 +168,13 @@ class WeatherClient:
 def national_average(df: pd.DataFrame) -> pd.DataFrame:
     """Collapse per-city rows into one row per hour (mean across cities).
 
-    Output columns: ``timestamp_utc`` plus ``<var>_de_avg`` for each weather variable.
+    Output columns: ``timestamp_utc`` plus ``NATIONAL_COLUMNS`` (``<var>_de_avg``).
     """
     if df.empty:
         out = pd.DataFrame({"timestamp_utc": pd.Series(dtype="datetime64[ns, UTC]")})
-        for var in WEATHER_VARS:
-            out[f"{var}_de_avg"] = pd.Series(dtype="float64")
+        for col in NATIONAL_COLUMNS:
+            out[col] = pd.Series(dtype="float64")
         return out
     avg = df.groupby("timestamp_utc", sort=True)[list(WEATHER_VARS)].mean()
-    avg = avg.rename(columns={var: f"{var}_de_avg" for var in WEATHER_VARS})
+    avg.columns = list(NATIONAL_COLUMNS)
     return avg.reset_index()

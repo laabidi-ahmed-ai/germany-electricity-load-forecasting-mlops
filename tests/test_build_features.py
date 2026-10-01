@@ -8,7 +8,6 @@ import pandas as pd
 import pytest
 
 from src.data import db
-from src.features import build_features as bf
 from src.features.build_features import (
     LAG_HOURS,
     ROLLING_STATS,
@@ -108,7 +107,9 @@ def test_rolling_max_never_sees_current_hour() -> None:
 def test_dropna_removes_rows_without_full_history(load, weather) -> None:
     df = build_feature_frame(load, weather)
     assert len(df) == N_HOURS - max(LAG_HOURS)
-    assert not df[[TARGET, *bf.lag_and_rolling_columns()]].isna().any().any()
+    load_derived = [c for c in df.columns if c.startswith(("load_lag_", "load_roll_"))]
+    assert len(load_derived) == 12
+    assert not df[[TARGET, *load_derived]].isna().any().any()
 
 
 # --- Calendar ---

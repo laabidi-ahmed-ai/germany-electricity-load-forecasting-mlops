@@ -47,7 +47,7 @@ from src.models.registry import LoadedModel
 from src.models.tracking import DEFAULT_EXPERIMENT, setup_mlflow
 from src.monitoring import drift as drift_mod
 from src.monitoring import performance as perf_mod
-from src.monitoring.metrics import compute_metrics
+from src.monitoring.metrics import compute_metrics, improvement_pct
 
 log = logging.getLogger(__name__)
 
@@ -318,7 +318,7 @@ def run_champion_challenger(
     )
     champ_m = compute_metrics(holdout[TARGET], champion.predict(holdout))
     cand_m = compute_metrics(holdout[TARGET], candidate.predict(holdout[cols]))
-    improvement = (champ_m["mae"] - cand_m["mae"]) / champ_m["mae"] * 100.0
+    improvement = improvement_pct(champ_m["mae"], cand_m["mae"])
 
     outcome = ChallengerOutcome(
         decision="kept",

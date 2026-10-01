@@ -42,7 +42,7 @@ from sqlalchemy.engine import Engine
 
 from config.log import configure_logging
 from src.data import db
-from src.features.build_features import TARGET, build_features
+from src.features.build_features import TARGET, WEATHER_COLUMNS, build_features
 from src.features.horizons import DAY_AHEAD, most_recent_load_lag, select_features
 from src.models.registry import LoadedModel
 
@@ -64,7 +64,7 @@ def drift_columns(feature_columns: list[str]) -> list[str]:
     return [
         c
         for c in select_features(feature_columns, DAY_AHEAD)
-        if most_recent_load_lag(c) is not None or c.endswith("_de_avg")
+        if most_recent_load_lag(c) is not None or c in WEATHER_COLUMNS
     ]
 
 

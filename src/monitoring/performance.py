@@ -34,6 +34,7 @@ from src.features.build_features import TARGET, build_features
 from src.features.horizons import DAY_AHEAD
 from src.monitoring.metrics import (
     MIN_WINDOW_HOURS,
+    HeadToHead,
     WindowMetrics,
     actual_vs_official,
     daily_metrics,
@@ -135,19 +136,13 @@ def compute_report(
 
 
 # --- Out-of-sample backtest vs the official forecast ---
-@dataclass
-class BacktestReport:
+@dataclass(kw_only=True)
+class BacktestReport(HeadToHead):
     start: pd.Timestamp
     end: pd.Timestamp
     n_hours: int
     train_rows: int
     train_end: pd.Timestamp
-    model_mae: float
-    model_mape: float
-    official_mae: float
-    official_mape: float
-    model_beats_official: bool
-    improvement_pct: float
     daily: pd.DataFrame
     by_hour: pd.DataFrame  # hour-of-day (local) breakdown
 

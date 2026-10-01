@@ -6,8 +6,8 @@ import pandas as pd
 import pytest
 
 from src.data.weather_client import (
+    CITY_COLUMNS,
     GERMAN_CITIES,
-    WEATHER_COLUMNS,
     WEATHER_VARS,
     City,
     WeatherClient,
@@ -48,7 +48,7 @@ def test_fetch_historical_long_format_utc() -> None:
     client, session = make_client()
     df = client.fetch_historical("2021-03-27", "2021-03-28")
 
-    assert list(df.columns) == WEATHER_COLUMNS
+    assert list(df.columns) == CITY_COLUMNS
     assert len(df) == 48 * 2
     assert set(df["city"]) == {"A", "B"}
     assert (df["source"] == "archive").all()

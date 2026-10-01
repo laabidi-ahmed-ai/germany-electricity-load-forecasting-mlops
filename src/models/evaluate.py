@@ -23,7 +23,7 @@ import pandas as pd
 
 from src.features.build_features import TARGET, expanding_window_splits
 from src.features.horizons import DAY_AHEAD, Horizon, select_features
-from src.monitoring.metrics import compute_metrics
+from src.monitoring.metrics import compute_metrics, improvement_pct
 
 log = logging.getLogger(__name__)
 
@@ -81,7 +81,7 @@ class CVResult:
             if b not in self.summary.index:
                 continue
             bv = self.mean(b, metric)
-            out[b] = {"beats": bool(c < bv), "improvement_pct": float((bv - c) / bv * 100.0)}
+            out[b] = {"beats": bool(c < bv), "improvement_pct": improvement_pct(bv, c)}
         return out
 
     def beats_all_baselines(self, metric: str = "mae") -> bool:
