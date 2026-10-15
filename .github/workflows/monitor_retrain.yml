@@ -1,15 +1,22 @@
-# Daily monitoring + drift-triggered retraining (README §9).
+# Daily monitoring + drift-triggered retraining (README §9 / §16).
 #
 # Scores yesterday's forecasts against the actuals and the official forecast, runs the
 # Evidently drift check, and - only if a trigger fires - trains a challenger and promotes
 # it if it beats the champion by the configured margin. Every decision is written to
 # the monitoring_events table and to MLflow (backend store = the cloud Postgres, so the
 # lineage survives the ephemeral runner; the promoted model is exported to the DB).
+#
+# Chained: starts when the forecast workflow completes (whatever its result - scoring
+# and drift matter most when the forecast failed). The cron is a backup; automatic runs
+# pass --once-per-day, so at most one monitoring pass is recorded per UTC day.
 name: monitor-retrain
 
 on:
+  workflow_run:
+    workflows: [forecast]
+    types: [completed]
   schedule:
-    - cron: "0 6 * * *" # 06:00 UTC daily, after the forecast job
+    - cron: "30 8 * * *" # backup if the forecast chain did not run
   workflow_dispatch:
     inputs:
       mode:
@@ -57,6 +64,7 @@ jobs:
             force)      FLAGS="--force" ;;
           esac
           if [ "${{ inputs.dry_run }}" = "true" ]; then FLAGS="$FLAGS --dry-run"; fi
+          if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then FLAGS="$FLAGS --once-per-day"; fi
           python -m src.monitoring.retrain $FLAGS
 
       - name: Champion after this run

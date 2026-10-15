@@ -345,20 +345,38 @@ def _frame(rows: Sequence[Any], columns: Sequence[Any]) -> pd.DataFrame:
 
 def latest_timestamp(engine: Engine, model: type[Base], **filters: Any) -> pd.Timestamp | None:
     """Most recent ``timestamp_utc`` in the table (optionally filtered), UTC, or None."""
-    return _timestamp_bound(engine, model, func.max, filters)
+    return _timestamp_bound(engine, model.timestamp_utc, func.max, filters)
 
 
 def earliest_timestamp(engine: Engine, model: type[Base], **filters: Any) -> pd.Timestamp | None:
     """Oldest ``timestamp_utc`` in the table (optionally filtered), UTC, or None."""
-    return _timestamp_bound(engine, model, func.min, filters)
+    return _timestamp_bound(engine, model.timestamp_utc, func.min, filters)
+
+
+def latest_issued_at(engine: Engine) -> pd.Timestamp | None:
+    """When the most recent model forecast was issued (any version), UTC, or None."""
+    return _timestamp_bound(engine, LoadForecastModel.issued_at, func.max, {})
+
+
+def latest_event_at(engine: Engine) -> pd.Timestamp | None:
+    """When the most recent monitoring event was recorded, UTC, or None."""
+    return _timestamp_bound(engine, MonitoringEvent.created_at, func.max, {})
+
+
+def happened_today(ts: pd.Timestamp | None, now: pd.Timestamp | None = None) -> bool:
+    """True if ``ts`` falls on the same UTC calendar day as ``now`` (default: the current time)."""
+    if ts is None:
+        return False
+    now = pd.Timestamp.now(tz="UTC") if now is None else to_utc(now)
+    return to_utc(ts).normalize() == now.normalize()
 
 
 def _timestamp_bound(
-    engine: Engine, model: type[Base], agg: Any, filters: dict[str, Any]
+    engine: Engine, column: Any, agg: Any, filters: dict[str, Any]
 ) -> pd.Timestamp | None:
-    stmt = select(agg(model.timestamp_utc))
+    stmt = select(agg(column))
     for col, val in filters.items():
-        stmt = stmt.where(getattr(model, col) == val)
+        stmt = stmt.where(getattr(column.class_, col) == val)
     with engine.connect() as conn:
         value = conn.execute(stmt).scalar()
     return None if value is None else to_utc(value)
@@ -404,8 +422,7 @@ def read_load(
 
 def read_latest_model_forecast(engine: Engine) -> pd.DataFrame:
     """Rows of the most recently *issued* model forecast (all hours of that issue)."""
-    with engine.connect() as conn:
-        latest = conn.execute(select(func.max(LoadForecastModel.issued_at))).scalar()
+    latest = latest_issued_at(engine)
     if latest is None:
         return _frame([], LoadForecastModel.__table__.columns)
     return read_table(engine, LoadForecastModel, issued_at=latest)

@@ -10,10 +10,14 @@ The target window is ``(L, L + 24h]`` for the latest stored actual load L: with 
 whose day-ahead lags are fully observed. Predictions are never fed back in as lags
 to reach further.
 
-Per request / batch run: read the last ``HISTORY_HOURS`` of load, make sure per-city
-weather covers the target hours (fetching the Open-Meteo forecast if not; archive rows
-always win), append the target hours with NaN load, build the frame with
-``dropna=False``, select the day-ahead features and predict.
+Per request / batch run: read the last ``HISTORY_HOURS`` of load, bridge gaps of at
+most ``MAX_FILLED_GAP_HOURS`` missing hours by linear interpolation (a late SMARD
+publication otherwise breaks a lag feature and stops the whole forecast), make sure
+per-city weather covers the target hours (fetching the Open-Meteo forecast if not;
+archive rows always win), append the target hours with NaN load, build the frame with
+``dropna=False``, select the day-ahead features and predict. Interpolated hours live
+only in the served frame - they are never written back to ``load_actual`` - and a
+longer gap that reaches a lag feature still raises ``NoDataError``.
 """
 
 from __future__ import annotations
@@ -37,6 +41,7 @@ log = logging.getLogger(__name__)
 
 DAY_AHEAD_HOURS = 24
 HISTORY_HOURS = 24 * 10  # lag_168 for the last target hour needs L + 24 - 168 = L - 144h
+MAX_FILLED_GAP_HOURS = 3  # longer runs of missing hours are a data problem, not a delay
 
 
 class NoDataError(RuntimeError):
@@ -61,6 +66,34 @@ class ForecastResult:
 
 
 # --- Feature reconstruction ---
+def fill_short_gaps(
+    history: pd.DataFrame, end: pd.Timestamp, max_gap: int = MAX_FILLED_GAP_HOURS
+) -> pd.DataFrame:
+    """Interpolate runs of at most ``max_gap`` missing hours inside ``history`` (up to ``end``).
+
+    Longer runs stay missing so the lag check downstream rejects them; hours before the
+    first observation are never invented.
+    """
+    load = history.set_index("timestamp_utc")[TARGET]
+    hours = pd.date_range(load.index.min(), end, freq="h", tz="UTC", name="timestamp_utc")
+    load = load.reindex(hours)
+    missing = load.isna()
+    if not missing.any():
+        return history
+    run_len = missing.groupby((missing != missing.shift()).cumsum()).transform("sum")
+    short = missing & (run_len <= max_gap)
+    filled = load.where(~short, load.interpolate(method="time", limit_area="inside"))
+    n_filled = int((short & filled.notna()).sum())
+    if n_filled:
+        log.warning(
+            "interpolated %d missing load hour(s) for serving (gaps <= %dh): %s",
+            n_filled,
+            max_gap,
+            [f"{t:%Y-%m-%d %H:%M}" for t in filled.index[short & filled.notna()]],
+        )
+    return filled.rename(TARGET).reset_index().dropna(subset=[TARGET])
+
+
 def forecast_window(last_actual: pd.Timestamp, hours: int = DAY_AHEAD_HOURS) -> pd.DatetimeIndex:
     """Target hours ``(last_actual, last_actual + hours]``; capped at the horizon cutoff."""
     if hours < 1 or hours > DAY_AHEAD.min_lag_hours:
@@ -121,6 +154,7 @@ def build_serving_features(
     history = db.read_load(engine, start=hist_start, end=last_actual)
     if history.empty or history["timestamp_utc"].max() != last_actual:
         raise NoDataError(f"could not read actual load up to {last_actual}")
+    history = fill_short_gaps(history, last_actual)
 
     ensure_weather(engine, target, weather_client)
     weather = db.read_table(engine, db.WeatherHourly, start=hist_start, end=target.max())
@@ -140,7 +174,8 @@ def build_serving_features(
     if served[lag_cols].isna().any().any():
         bad = served[lag_cols].isna().sum()
         raise NoDataError(
-            f"gaps in recent actual load break lag features: {bad[bad > 0].to_dict()}"
+            f"gaps longer than {MAX_FILLED_GAP_HOURS}h in recent actual load break lag "
+            f"features: {bad[bad > 0].to_dict()}"
         )
     n_nan_weather = int(served[list(WEATHER_COLUMNS)].isna().sum().sum())
     if n_nan_weather:

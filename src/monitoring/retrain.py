@@ -23,6 +23,7 @@ CLI::
     python -m src.monitoring.retrain --check-only      # make monitor
     python -m src.monitoring.retrain                   # make retrain (acts only if triggered)
     python -m src.monitoring.retrain --force [--dry-run]
+    python -m src.monitoring.retrain --once-per-day    # automatic runs: one pass per UTC day
 """
 
 from __future__ import annotations
@@ -172,6 +173,7 @@ def evaluate_triggers(
     w_off = perf.window(cfg.official_window_days)
     if w_off is not None and w_off.judged:
         gap = -w_off.improvement_pct  # +x% = official is x% better than the model
+        leader = "official" if gap > 0 else "model"
         checks.append(
             Check(
                 "official",
@@ -180,7 +182,7 @@ def evaluate_triggers(
                 threshold=cfg.official_gap_pct,
                 detail=(
                     f"{cfg.official_window_days}d: model MAE {w_off.model_mae:,.0f} vs official "
-                    f"{w_off.official_mae:,.0f} MW (official better by {gap:+.1f}%)"
+                    f"{w_off.official_mae:,.0f} MW ({leader} better by {abs(gap):.1f}%)"
                 ),
             )
         )
@@ -463,6 +465,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--holdout-days", type=int, default=RetrainConfig.holdout_days)
     p.add_argument("--min-improvement", type=float, default=RetrainConfig.min_improvement_pct)
     p.add_argument("--no-mlflow", action="store_true")
+    p.add_argument(
+        "--once-per-day",
+        action="store_true",
+        help="skip if a monitoring pass was already recorded today (automatic runs)",
+    )
     p.add_argument("--database-url", default=None)
     args = p.parse_args(argv)
 
@@ -476,6 +483,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     engine = db.get_engine(args.database_url)
     db.init_db(engine)
+    if args.once_per_day and db.happened_today(db.latest_event_at(engine)):
+        print("Monitoring already ran today (UTC) - nothing to do.")
+        return 0
     champion = registry.load_champion(engine)
     as_of = pd.Timestamp(args.as_of) if args.as_of else None
     frame = build_features(engine, output=None)

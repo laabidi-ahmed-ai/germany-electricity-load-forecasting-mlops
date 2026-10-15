@@ -128,6 +128,20 @@ def test_schedule_order_ingest_then_forecast_then_monitor() -> None:
     assert (int(forecast[1]), int(forecast[0])) < (int(monitor[1]), int(monitor[0]))
 
 
+def test_daily_jobs_run_once_per_day_and_monitor_follows_the_forecast() -> None:
+    """GitHub's cron is only a backup (it ran 5-8 h late); a late backup must not re-issue."""
+    fc = load("forecast.yml")
+    assert fc["name"] == "forecast"  # workflow_run below matches on this name
+    assert fc["on"]["workflow_dispatch"]["inputs"]["force"]["type"] == "boolean"
+    fc_text = run_lines(fc)
+    assert 'FLAGS="--once-per-day"' in fc_text and "inputs.force" in fc_text
+
+    mon = load("monitor_retrain.yml")
+    assert mon["on"]["workflow_run"] == {"workflows": ["forecast"], "types": ["completed"]}
+    mon_text = run_lines(mon)
+    assert "--once-per-day" in mon_text and '!= "workflow_dispatch"' in mon_text
+
+
 def test_ingest_workflow_installs_only_the_lean_requirements() -> None:
     wf = load("ingest.yml")
     text = run_lines(wf)

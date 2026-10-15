@@ -487,7 +487,7 @@ def main() -> None:
     with st.sidebar:
         st.title("⚡ Germany load forecast")
         st.caption(
-            "Day-ahead hourly national load (DE_LU), scored live against the official grid-operator forecast."
+            "Day-ahead hourly load for Germany (SMARD region DE), scored live against the official grid-operator forecast."
         )
         tz = st.radio("Display times in", ["Europe/Berlin", "UTC"], horizontal=True)
         days = st.select_slider(

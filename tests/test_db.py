@@ -87,6 +87,33 @@ def test_latest_timestamp_and_empty_table(engine, load_frame) -> None:
     assert db.latest_timestamp(engine, db.LoadActual, source="other") is None
 
 
+def test_last_run_helpers_and_happened_today(engine) -> None:
+    assert db.latest_issued_at(engine) is None and db.latest_event_at(engine) is None
+    issued = pd.Timestamp("2026-10-15T05:41Z")
+    db.upsert_dataframe(
+        engine,
+        db.LoadForecastModel,
+        pd.DataFrame(
+            {
+                "timestamp_utc": pd.date_range("2026-10-15T04:00Z", periods=2, freq="h"),
+                "model_version": "1",
+                "model_name": "m",
+                "forecast_mw": 50_000.0,
+                "issued_at": issued,
+            }
+        ),
+    )
+    assert db.latest_issued_at(engine) == issued
+    db.insert_monitoring_event(
+        engine, created_at=issued.to_pydatetime(), as_of=issued.to_pydatetime(), kind="check"
+    )
+    assert db.latest_event_at(engine) == issued
+
+    assert db.happened_today(issued, now="2026-10-15T23:59Z")
+    assert not db.happened_today(issued, now="2026-10-16T00:00Z")  # UTC days, not Berlin
+    assert not db.happened_today(None)
+
+
 def test_read_table_window(engine, load_frame) -> None:
     db.upsert_dataframe(engine, db.LoadActual, _rows(load_frame))
     start = pd.Timestamp("2021-03-28T00:00Z")

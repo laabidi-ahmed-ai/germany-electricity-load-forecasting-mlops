@@ -121,7 +121,9 @@ def create_app(state_loader: Callable[[], AppState] = default_state_loader) -> F
     app = FastAPI(
         title="Germany electricity load forecast API",
         version=API_VERSION,
-        description="Day-ahead hourly national load forecast (DE_LU) from the champion model.",
+        description=(
+            "Day-ahead hourly load forecast for Germany (SMARD region DE) from the champion model."
+        ),
         lifespan=lifespan,
     )
 

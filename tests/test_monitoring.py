@@ -625,7 +625,10 @@ def test_cli_check_only_and_force_dry_run(engine, cfg, monkeypatch, capsys) -> N
     monkeypatch.setattr(retrain.drift_mod, "run_evidently", fake_runner(set()))
     url = str(engine.url)
 
-    assert retrain.main(["--check-only", "--no-mlflow", "--database-url", url]) == 0
+    # --once-per-day only skips when a pass was already recorded today (none yet).
+    assert (
+        retrain.main(["--check-only", "--once-per-day", "--no-mlflow", "--database-url", url]) == 0
+    )
     out = capsys.readouterr().out
     assert "RETRAIN not triggered" in out and "Champion/challenger" not in out
     assert db.read_monitoring_events(engine).iloc[0]["kind"] == "check"
@@ -655,3 +658,8 @@ def test_cli_check_only_and_force_dry_run(engine, cfg, monkeypatch, capsys) -> N
     assert (
         events.iloc[0]["kind"] == "retrain" and events.iloc[0]["decision"] == "promoted (dry-run)"
     )
+
+    # An automatic (backup / chained) run on the same UTC day records nothing new.
+    assert retrain.main(["--once-per-day", "--no-mlflow", "--database-url", url]) == 0
+    assert "already ran today" in capsys.readouterr().out
+    assert len(db.read_monitoring_events(engine)) == len(events)

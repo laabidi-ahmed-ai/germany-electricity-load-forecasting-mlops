@@ -19,6 +19,7 @@ from src.serving.forecast import (
     NoDataError,
     build_serving_features,
     ensure_weather,
+    fill_short_gaps,
     forecast_window,
     make_day_ahead_forecast,
     store_forecast,
@@ -154,13 +155,39 @@ def test_nowcast_only_features_are_nan_for_the_served_hours(seeded) -> None:
     # contain unobserved hours and are excluded for day-ahead just the same.)
 
 
-def test_gap_in_recent_load_is_rejected(seeded) -> None:
+def _delete_load_hours(engine, start: str, hours: int) -> pd.DatetimeIndex:
     from sqlalchemy import delete
 
-    gap = pd.Timestamp("2024-01-20T05:00Z")  # t-24 for the target hour 2024-01-21T05
-    with seeded.begin() as conn:
-        conn.execute(delete(db.LoadActual).where(db.LoadActual.timestamp_utc == gap))
-    with pytest.raises(NoDataError, match="load_lag_24"):
+    gap = pd.date_range(start, periods=hours, freq="h", tz="UTC")
+    with engine.begin() as conn:
+        conn.execute(delete(db.LoadActual).where(db.LoadActual.timestamp_utc.in_(list(gap))))
+    return gap
+
+
+def test_fill_short_gaps_bridges_short_runs_only() -> None:
+    ts = pd.date_range("2024-01-01", periods=20, freq="h", tz="UTC")
+    full = pd.DataFrame({"timestamp_utc": ts, TARGET: np.arange(20, dtype=float) * 10})
+    history = full.drop(index=[3, 4, 5, 10, 11, 12, 13])  # a 3 h and a 4 h gap
+
+    out = fill_short_gaps(history, end=ts[-1]).set_index("timestamp_utc")[TARGET]
+    assert out.loc[ts[3:6]].tolist() == [30.0, 40.0, 50.0]  # linear between neighbours
+    assert ts[10:14].isin(out.index).sum() == 0  # too long: left missing for the lag check
+    assert fill_short_gaps(full, end=ts[-1]) is full  # nothing missing -> untouched
+
+
+def test_one_missing_hour_is_interpolated_for_serving_only(seeded) -> None:
+    (gap,) = _delete_load_hours(seeded, "2024-01-20T05:00Z", 1)  # t-24 for 2024-01-21T05
+    served, _ = build_serving_features(seeded, as_of="2024-01-20T23:00Z")
+    lag = served.loc[pd.Timestamp("2024-01-21T05:00Z"), "load_lag_24"]
+    load = db.read_load(seeded).set_index("timestamp_utc")[TARGET]
+    neighbours = load.loc[[gap - pd.Timedelta(hours=1), gap + pd.Timedelta(hours=1)]]
+    assert lag == pytest.approx(neighbours.mean())
+    assert gap not in load.index  # the interpolated value is never stored as an actual
+
+
+def test_long_gap_in_recent_load_is_still_rejected(seeded) -> None:
+    _delete_load_hours(seeded, "2024-01-20T03:00Z", 6)  # covers t-24 for the first targets
+    with pytest.raises(NoDataError, match=r"gaps longer than 3h .*load_lag_24"):
         build_serving_features(seeded, as_of="2024-01-20T23:00Z")
 
 
@@ -271,6 +298,28 @@ def test_batch_cli_dry_run_and_write(
 
     assert batch_forecast.main(["--database-url", url, "--hours", "12"]) == 0
     assert db.count_rows(seeded, db.LoadForecastModel) == 12
+
+
+def test_batch_once_per_day_skips_when_today_is_already_issued(
+    seeded, day_ahead_features, monkeypatch, capsys
+) -> None:
+    monkeypatch.setattr(
+        batch_forecast, "load_champion", lambda engine: fake_model(day_ahead_features)
+    )
+    monkeypatch.setattr(batch_forecast, "WeatherClient", lambda: FakeWeatherClient(LAST_ACTUAL))
+    url = str(seeded.url)
+
+    assert batch_forecast.main(["--database-url", url, "--once-per-day"]) == 0  # first issue
+    first = db.latest_issued_at(seeded)
+    assert first is not None and db.count_rows(seeded, db.LoadForecastModel) == 24
+
+    capsys.readouterr()
+    assert batch_forecast.main(["--database-url", url, "--once-per-day"]) == 0  # late backup
+    assert "already issued" in capsys.readouterr().out
+    assert db.latest_issued_at(seeded) == first  # nothing re-issued
+
+    assert batch_forecast.main(["--database-url", url]) == 0  # a forced run re-issues
+    assert db.latest_issued_at(seeded) > first
 
 
 # --- API ---

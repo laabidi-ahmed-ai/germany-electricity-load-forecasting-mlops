@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import pandas as pd
 import pytest
 
@@ -125,3 +127,31 @@ def test_week_overlap_math() -> None:
     client, session = make_client()
     client.fetch_load(start, start + pd.Timedelta(hours=1))
     assert any(str(week) in u for u, _ in session.calls)
+
+
+def test_get_json_retries_rate_limits_with_growing_waits() -> None:
+    url = f"{BASE}/x.json"
+    session = FakeSession(
+        routes={url: [FakeResponse({}, status_code=429), FakeResponse({}, status_code=503), {}]}
+    )
+    sleeps: list[float] = []
+    assert get_json(session, url, retries=3, sleep=sleeps.append) == {}
+    assert sleeps == [3.0, 9.0]  # default backoff rides out a short provider hiccup
+
+
+class HtmlResponse(FakeResponse):
+    """A body that is not JSON (ingest run #95 only logged "Expecting value" for one)."""
+
+    headers: ClassVar[dict[str, str]] = {"Content-Type": "text/html"}
+    text = "<html>502 Bad Gateway</html>"
+
+    def json(self):
+        raise ValueError("Expecting value: line 1 column 1 (char 0)")
+
+
+def test_get_json_names_what_came_back_when_the_body_is_not_json() -> None:
+    url = f"{BASE}/x.json"
+    session = FakeSession(routes={url: [HtmlResponse(None)] * 2})
+    with pytest.raises(RuntimeError, match=r"non-JSON response \(HTTP 200, text/html, body") as e:
+        get_json(session, url, retries=2, sleep=lambda _: None)
+    assert "502 Bad Gateway" in str(e.value)

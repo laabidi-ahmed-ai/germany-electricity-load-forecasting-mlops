@@ -23,9 +23,10 @@
 13. [Running it locally](#13-running-it-locally)
 14. [Running it in the cloud](#14-running-it-in-the-cloud)
 15. [Results](#15-results)
-16. [Roadmap](#16-roadmap)
-17. [Glossary](#17-glossary)
-18. [License, sources & acknowledgements](#18-license-sources--acknowledgements)
+16. [Operating it: problems found in production and how they were fixed](#16-operating-it-problems-found-in-production-and-how-they-were-fixed)
+17. [Roadmap](#17-roadmap)
+18. [Glossary](#18-glossary)
+19. [License, sources & acknowledgements](#19-license-sources--acknowledgements)
 
 ---
 
@@ -54,7 +55,7 @@ Demand is always moving. It rises on cold winter evenings (heating) and hot summ
 Once deployed, the system runs on its own:
 
 - **Every hour** — a scheduled job pulls the newest electricity-load figures (SMARD), the official day-ahead forecast, and the latest weather (Open-Meteo), and stores them in a cloud database. This is the continuous data collection that runs unattended.
-- **Every morning** — a batch job produces the day-ahead forecast: expected load for each hour of the next 24 hours. It stores the forecast alongside the official grid-operator forecast for the same hours, so the two sit side by side.
+- **Every morning (05:40 UTC)** — a batch job produces the day-ahead forecast: expected load for each hour of the next 24 hours. It stores the forecast alongside the official grid-operator forecast for the same hours, so the two sit side by side. The monitoring job starts as soon as the forecast finishes.
 - **On demand** — a serving API returns the latest forecast instantly.
 - **Every day, looking back** — because yesterday's *actual* load has now been published, a job computes the model's error and the official forecast's error over the same period and updates the accuracy history.
 - **Continuously** — a monitor watches for data drift (incoming data moving away from the training distribution) and rising error. If either crosses a calibrated threshold, it triggers a retraining job: a fresh *challenger* model is trained on the latest data and promoted to production **only if it beats the current *champion*** on a held-out out-of-time window — with the previous model retained for rollback.
@@ -82,7 +83,7 @@ flowchart TD
     end
 
     subgraph Ingestion["Ingestion (scheduled, cloud)"]
-        B1["Hourly ingestion job<br/>(GitHub Actions cron)"]
+        B1["Hourly ingestion job<br/>(GitHub Actions)"]
     end
 
     subgraph Storage["Storage layer (cloud)"]
@@ -170,7 +171,7 @@ The project is organized around the canonical MLOps loop; each stage maps to a f
 
 Electricity data is reported by **grid zones, not cities**, so there is no per-city ("Berlin", "Dortmund") series.
 
-- **Primary target:** the **DE-LU bidding zone** (Germany + Luxembourg, merged since 2018) — Germany's total national load.
+- **Primary target:** Germany's national load as published by SMARD for **region `DE`** (Germany only). The official day-ahead forecast used as the benchmark comes from the same SMARD region, so the comparison is like-for-like in geography. (The electricity *market* is the DE-LU bidding zone, Germany + Luxembourg; Luxembourg's load is not in this target.)
 - **Future extension:** the **four German control areas**, each run by a different TSO — **50Hertz** (east), **Amprion** (west), **TenneT DE** (north–south), **TransnetBW** (south-west) — forecast separately, mirroring real TSO operations.
 
 Weather is sampled at **city level** (several major German cities) as *input features*; the prediction target is always the zone's total load.
@@ -220,7 +221,7 @@ This loop is why the system is designed to run continuously: a retraining trigge
 | Experiment tracking + registry | MLflow (Postgres-backed) |
 | Serving | FastAPI (real-time) + scheduled batch job |
 | Containerization | Docker / docker-compose |
-| Orchestration / scheduling | GitHub Actions (cron) |
+| Orchestration / scheduling | GitHub Actions, started on time by an external scheduler (cron-job.org); GitHub cron as backup |
 | Monitoring / drift | Evidently |
 | CI/CD | GitHub Actions + pytest + ruff |
 | Dashboard | Streamlit |
@@ -240,13 +241,13 @@ germany-electricity-load-forecasting-mlops/
 ├── docker-compose.yml             # local Postgres + API + dashboard
 ├── .env.example                   # template for secrets (no real values)
 ├── requirements/                  # lean per-job dependency sets (e.g. ingest)
-├── docs/                          # design notes (e.g. cloud setup)
+├── docs/                          # cloud setup, operations runbook
 ├── notebooks/                     # exploration only, never the source of truth
 ├── .github/workflows/
 │   ├── ci.yml                     # tests + lint on push
-│   ├── ingest.yml                 # hourly ingestion (cron)
-│   ├── forecast.yml               # daily day-ahead forecast (cron)
-│   ├── monitor_retrain.yml        # daily monitoring + drift-triggered retrain
+│   ├── ingest.yml                 # hourly ingestion
+│   ├── forecast.yml               # daily day-ahead forecast
+│   ├── monitor_retrain.yml        # monitoring + drift-triggered retrain, after each forecast
 │   └── bootstrap.yml              # one-time cloud seed (backfill → train → register)
 ├── config/
 │   └── settings.py                # typed configuration
@@ -314,7 +315,7 @@ make dashboard    # Streamlit at http://localhost:8501
 
 The system is designed so **no personal machine needs to stay on**:
 
-- **Scheduling** lives in **GitHub Actions** (cron): `ingest.yml` hourly, `forecast.yml` and `monitor_retrain.yml` daily. GitHub spins up a temporary runner, executes the job, and shuts it down — free (unlimited for public repos).
+- **Scheduling** lives in **GitHub Actions**: `ingest.yml` hourly, `forecast.yml` daily at 05:40 UTC, and `monitor_retrain.yml` right after each forecast (a `workflow_run` chain). GitHub spins up a temporary runner, executes the job, and shuts it down — free (unlimited for public repos). An external scheduler starts the hourly and daily jobs on time through GitHub's `workflow_dispatch` API, with GitHub's own cron kept as a backup — see §16 for why, and `docs/operations.md` for the setup.
 - **The database is cloud-hosted** (Neon / Supabase free tier), and the model registry and artifacts persist there too, so every job works on a fresh runner with only `DATABASE_URL`.
 - **The dashboard** is hosted on Streamlit Community Cloud with a public URL.
 
@@ -324,7 +325,7 @@ A one-time `bootstrap` workflow seeds the cloud database (backfill → features 
 
 ## 15. Results
 
-Measured with expanding-window time-series cross-validation and out-of-sample day-ahead backtests over 2021–2026 (German national load, DE-LU):
+Measured with expanding-window time-series cross-validation and out-of-sample day-ahead backtests over 2021–2026 (German national load, SMARD region DE):
 
 | Model | MAE (MW) | MAPE (%) |
 |---|---:|---:|
@@ -336,13 +337,73 @@ Measured with expanding-window time-series cross-validation and out-of-sample da
 - LightGBM reduces MAE by ~56% vs. the best naive baseline and wins on every cross-validation fold.
 - In an out-of-sample day-ahead backtest, the model beats the **official grid-operator forecast in 12 of 12 monthly windows** (2.43% vs. 3.85% MAPE). Read with the caveat in §8: the model's window starts right after the latest published actual and uses fresher weather than a true previous-day issue would have.
 
-*Live accuracy against fresh actuals, uptime, and retraining events accumulate as the deployed system runs, and are surfaced on the dashboard.*
+**Live, on fresh actuals** (as of 15 October 2026, four weeks after go-live; the dashboard updates these continuously):
+
+| Window | Hours scored | Model MAPE | Official MAPE | Model MAE vs official |
+|---|---:|---:|---:|---:|
+| Last 7 days | 163 | 3.16 % | 3.17 % | 2.5 % lower |
+| Last 30 days | 636 | 2.81 % | 3.24 % | 13.5 % lower |
+
+Live accuracy is worse than the backtest (2.81 % vs 2.43 % MAPE over 30 days) and the last week is essentially a tie: the first half of October was hard for both forecasts (see §16.3). The live record is still short; it is the number to watch, not the backtest.
 
 ---
 
-## 16. Roadmap
+## 16. Operating it: problems found in production and how they were fixed
+
+The system went live on 17 September 2026. Some problems only show up when a system runs unattended for weeks, so the approach was: **observe first, measure, then fix** — as long as a problem could not corrupt data. Every job is incremental and idempotent (it re-reads from the last stored hour and upserts), so a late or failed run delays data but never loses or duplicates it. That made it safe to leave the system alone and collect real evidence before changing anything.
+
+### 16.1 GitHub's scheduler ran the daily jobs 4–8 hours late
+
+**What we observed (18 Sep – 14 Oct, measured from the Actions run history).** GitHub's `schedule` trigger is best-effort, and on the free runners it was consistently late:
+
+| Job | Scheduled | What actually happened |
+|---|---|---|
+| `forecast` | daily 05:40 UTC | ran on all 27 days, but **4.0–7.8 h late** (median 5.6 h; typically 11:00–13:30 UTC) |
+| `monitor-retrain` | daily 06:00 UTC | ran on all 27 days, 4.1–8.1 h late |
+| `ingest` | 24 runs/day | **4.5 runs/day on average** (2–7); median gap 5.1 h, longest 10.5 h |
+
+**Why it was left running for four weeks.** Nothing was lost: the forecast job ingests fresh data itself before forecasting, and ingestion catches up on every run. Waiting turned "cron is sometimes late" into numbers — it was *always* late, by a stable 4–8 hours, rather than occasionally skipped — which decided the fix (a platform limitation, not a bug in our code, so no amount of retrying inside GitHub helps).
+
+**How it affected the work.**
+
+1. **The forecast arrived too late to be useful.** Germany's day-ahead electricity auction closes at 12:00 Berlin time. A forecast meant to inform that decision was published after the auction closed on 26 of 27 days.
+2. **Coverage and scoring.** Each forecast covers the 24 hours after the latest published actual. Because the start time wandered by up to ~3 hours from one day to the next, consecutive forecast windows sometimes overlapped and sometimes left hours with no forecast at all (those hours are simply never scored). Where windows overlapped, the later forecast replaced the earlier one for the same hour — a shorter lead time that slightly flatters the live score.
+3. **Freshness.** With ~4–5 ingests a day, the actuals on the dashboard were often 5–10 hours old.
+
+**The fix.**
+
+- An **external scheduler** (cron-job.org, free) calls GitHub's `workflow_dispatch` API on time: `ingest` every hour, `forecast` at 05:40 UTC. It uses a fine-grained token that can only run this repository's workflows. GitHub's cron stays as a backup.
+- **`monitor-retrain` is chained** to the forecast (`workflow_run`), so it starts the moment the forecast finishes instead of guessing a time slot. A later cron remains as a backup.
+- **Once-per-day guards** (`batch_forecast --once-per-day`, `retrain --once-per-day`): a late backup run sees that today's forecast / monitoring pass already exists and exits without doing anything. Without them, the backup would re-issue the forecast at midday and bring back problem 2. A manual run with `force` still re-forecasts on purpose.
+
+**Still open:** forecasting the 24 hours *after the latest actual* is not the same as forecasting *tomorrow's calendar day*, which is what the official forecast and the auction use. Moving to a fixed calendar-day (D+1) target removes the remaining overlap/gap effect and makes the official comparison exactly like-for-like; it is the next planned change (§17).
+
+### 16.2 Incident log
+
+| Date (2026) | What happened | Root cause | Fix |
+|---|---|---|---|
+| 18 Sep | `forecast` failed with `NoDataError` (`load_lag_24` missing) | SMARD published one hour of load late, leaving a hole in recent history; the job correctly refused to forecast from incomplete data | Now **bridges gaps of up to 3 missing hours** by interpolation for serving only (never written back as actuals) and logs which hours it filled; longer gaps still stop the forecast, because they mean a data problem, not a delay |
+| 18 Sep – 14 Oct | Scheduled jobs 4–8 h late, ingest ~4–5×/day | GitHub's best-effort cron (§16.1) | External trigger + chained monitor + once-per-day guards |
+| 1 Oct | `ingest` #74 failed: "Could not parse SQLAlchemy URL" | The `DATABASE_URL` secret was pasted in TOML form (with quotes) and with the dashboard's read-only user | Secret replaced with the writer URL, no quotes; jobs and the public dashboard now use separate database roles (write vs read-only) |
+| 1 Oct | Dashboard error after a deploy: `module 'dashboard.queries' has no attribute 'WINDOWS_DAYS'` | Streamlit Cloud reloaded the new `app.py` but kept the previous version of an imported module in memory | Rebooting the app; after any deploy that changes `dashboard/`, reboot once and check it loads |
+| 5 Oct | `ingest` #95 failed on the Open-Meteo forecast request | Open-Meteo returned a body that was not JSON four times in ~7 s; the old retry waits (1.5 s, 2.3 s, 3.4 s) were too short to ride out the hiccup. The next run succeeded and backfilled, so no data was lost | Retries now wait 3 s, 9 s and 27 s, also retry HTTP 429 (rate limited), and the error names the HTTP status, content type and start of the body instead of only "Expecting value" |
+
+### 16.3 The retraining loop, exercised on live data
+
+The guarded retraining path ran for real in October:
+
+- **5–8 October:** the 7-day MAPE rose above the 3.5 % trigger (up to 3.94 %). **11 October:** half of the monitored columns drifted, which fired the drift trigger (this autumn it is mostly weather columns — wind speed, cloud cover, humidity — that move away from the reference period).
+- Each time a **challenger was trained** and compared with the champion on hours neither had trained on. It did not beat the champion by the required 3 % margin, so the **champion (v1) was kept** and the decision was logged to MLflow and the events table.
+- Both forecasts were worse in that period: the official forecast's 7-day MAPE reached 4.75 %, against 3.94 % for the model. A week that is hard for everyone, rather than a model that has gone stale, is exactly the case the anti-churn margin exists for: retraining on it would not have helped.
+
+---
+
+## 17. Roadmap
 
 Planned technical extensions, in rough order:
+
+- **Calendar-day (D+1) forecast** — forecast tomorrow 00:00–24:00 Berlin time every morning, as the official forecast does: an exactly like-for-like benchmark and no window drift (§16.1).
+- **Alerting & observability** — job metrics (data freshness, rows ingested, live MAPE, drift share, run duration) and alerts on "no fresh data" or "no forecast by 10:00 UTC", beyond GitHub's failure e-mails.
 
 - **Deep learning** — LSTM/GRU and a Temporal Fusion Transformer, compared rigorously against the LightGBM baseline.
 - **Multi-region forecasting** — the four German control areas (50Hertz, Amprion, TenneT, TransnetBW) forecast separately.
@@ -353,10 +414,10 @@ Planned technical extensions, in rough order:
 
 ---
 
-## 17. Glossary
+## 18. Glossary
 
 - **Load** — electricity demand / consumption, in megawatts (MW).
-- **Bidding zone** — a market area with a single electricity price (Germany + Luxembourg = `DE_LU`).
+- **Bidding zone** — a market area with a single electricity price (Germany + Luxembourg = `DE_LU`); the forecast target here is Germany alone (SMARD region `DE`).
 - **Control area / TSO** — the region operated by one Transmission System Operator (Germany has four).
 - **Day-ahead forecast** — a forecast made today for each hour of tomorrow.
 - **Drift** — when incoming data's statistical pattern moves away from the training data.
@@ -366,7 +427,7 @@ Planned technical extensions, in rough order:
 
 ---
 
-## 18. License, sources & acknowledgements
+## 19. License, sources & acknowledgements
 
 **License:** MIT (see `LICENSE`).
 

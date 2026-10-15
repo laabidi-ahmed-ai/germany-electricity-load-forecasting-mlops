@@ -1,17 +1,25 @@
 # Daily day-ahead forecast: champion model (from the DB export) -> load_forecast_model.
-# Runs after the morning ingest; also refreshes actuals itself so it never forecasts
-# on stale data if the hourly job was late. README §3 / §14.
+# Refreshes actuals itself so it never forecasts on stale data. README §3 / §14 / §16.
+#
+# Started on time at 05:40 UTC by an external scheduler calling workflow_dispatch
+# (docs/operations.md): GitHub's own cron ran this job 5-8 h late every day. The cron
+# below stays as a backup; --once-per-day turns it into a no-op once today's forecast
+# exists. monitor-retrain starts when this workflow completes.
 name: forecast
 
 on:
   schedule:
-    - cron: "40 5 * * *" # 05:40 UTC daily (= 06:40/07:40 Berlin), after the 05:15 ingest
+    - cron: "40 5 * * *" # backup for the external 05:40 UTC trigger
   workflow_dispatch:
     inputs:
       hours:
         description: "hours to forecast after the latest actual (1-24)"
         required: false
         default: "24"
+      force:
+        description: "forecast again even if today's forecast was already issued"
+        type: boolean
+        default: false
 
 concurrency:
   group: forecast
@@ -42,4 +50,7 @@ jobs:
         run: python -m src.models.registry --show
 
       - name: Day-ahead forecast -> database
-        run: python -m src.serving.batch_forecast --hours "${{ inputs.hours || '24' }}"
+        run: |
+          FLAGS="--once-per-day"
+          if [ "${{ inputs.force }}" = "true" ]; then FLAGS=""; fi
+          python -m src.serving.batch_forecast --hours "${{ inputs.hours || '24' }}" $FLAGS

@@ -1,13 +1,17 @@
 # Hourly ingestion: SMARD actual load + official day-ahead forecast, Open-Meteo weather
-# -> the cloud Postgres. README §3 / §14.
+# -> the cloud Postgres. README §3 / §14 / §16.
 #
 # Lean by design: installs only requirements/ingest.txt (no ML stack), ~1 min per run.
 # Manual runs can switch to --backfill to (re)seed history.
+#
+# Started hourly by an external scheduler calling workflow_dispatch (docs/operations.md);
+# GitHub's own cron delivered only ~4-5 of 24 runs a day and stays as a backup. Runs are
+# incremental and idempotent, and the concurrency group queues overlapping ones.
 name: ingest
 
 on:
   schedule:
-    - cron: "15 * * * *" # hourly at :15 UTC - SMARD publishes the previous hour with a short lag
+    - cron: "15 * * * *" # backup for the external hourly trigger (SMARD lags ~1 h)
   workflow_dispatch:
     inputs:
       mode:
