@@ -462,6 +462,8 @@ def report_metrics(
             metrics.gauge("model.improvement_pct", w.improvement_pct, **tags)
     if decision.drift is not None:
         metrics.gauge("drift.share", decision.drift.share_drifted, model_version=champion)
+    # The drift check never takes the monitor down, so its failure must be visible here.
+    metrics.gauge("drift.unavailable", int(decision.drift is None), model_version=champion)
     for c in decision.checks:
         metrics.gauge("trigger.fired", int(c.fired), trigger=c.name, model_version=champion)
     metrics.gauge("retrain.ran", int(outcome is not None), model_version=champion)

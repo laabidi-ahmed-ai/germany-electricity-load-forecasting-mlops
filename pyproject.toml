@@ -23,7 +23,9 @@ dependencies = [
     # Data pull
     "requests>=2.31",
     # Data handling
-    "pandas>=2.1",
+    # <3: Evidently (drift) cannot import under pandas 3 yet; jobs install fresh on every
+    # run, so an unbounded floor let a new major break the drift check (README §16.2).
+    "pandas>=2.1,<3",
     "numpy>=1.26",
     "pyarrow>=14",
     "holidays>=0.40",

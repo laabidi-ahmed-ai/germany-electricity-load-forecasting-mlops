@@ -191,8 +191,19 @@ def test_monitor_metrics_accuracy_drift_triggers_and_decision() -> None:
     assert value(got, "model.mape", window="7d", model_version="v1") == 2.8
     assert value(got, "official.mape", window="7d") == 3.04
     assert value(got, "drift.share") == 0.375
+    assert value(got, "drift.unavailable") == 0
     assert value(got, "trigger.fired", trigger="drift") == 1
     assert value(got, "trigger.fired", trigger="error") == 0
     assert value(got, "retrain.ran") == 1
     # a dry-run "promotion" never counts as a real one
     assert value(got, "retrain.promoted", decision="promoted", dry_run="true") == 0
+
+
+def test_monitor_metrics_flag_a_drift_check_that_could_not_run() -> None:
+    decision = SimpleNamespace(champion_version="1", performance=None, drift=None, checks=[])
+    m, rec = enabled("monitor")
+    monitor_metrics(m, decision, None)
+    m.flush()
+    got = rec.metrics()
+    assert value(got, "drift.unavailable") == 1 and "drift.share" not in got
+    assert value(got, "retrain.ran") == 0

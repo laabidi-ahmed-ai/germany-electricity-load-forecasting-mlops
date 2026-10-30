@@ -26,6 +26,7 @@ and `runner:github` (or `runner:local` from a laptop — filter on `runner:githu
 | `forecast.skipped` | forecast | a backup run found today's forecast already issued |
 | `model.mape`, `official.mape`, `model.improvement_pct` (tag `window:7d|30d`) | monitor | live accuracy head-to-head |
 | `drift.share` | monitor | share of monitored columns that drifted |
+| `drift.unavailable` | monitor | 1 if the drift check could not run (it never fails the job, so this is the only signal) |
 | `trigger.fired` (tag `trigger:error|official|drift`) | monitor | 1 if that retrain trigger fired |
 | `retrain.ran`, `retrain.promoted` | monitor | a challenger was trained / promoted |
 | `monitor.skipped` | monitor | a backup run found today's pass already recorded |
@@ -70,8 +71,9 @@ so the alert e-mails you. Create them in this order.
 | 3 | No forecast today | `min(last_1h):max:germany_load.forecast.age_hours{runner:github} > 25` | above 25 (warning 24.5) | off |
 | 4 | Model error above retrain threshold | `max(last_1d):max:germany_load.model.mape{window:7d,runner:github} > 3.5` | above 3.5 (warning 3.2) | off |
 | 5 | A job failed | `max(last_1h):max:germany_load.job.failed{runner:github} by {job} > 0.5` | above 0.5 — choose **Multi Alert** (one alert per job) | off |
+| 6 | Drift check unavailable | `max(last_1d):max:germany_load.drift.unavailable{runner:github} > 0.5` | above 0.5 | off |
 
-Why these five:
+Why these six:
 1. **Ingest stopped** — the external scheduler or the token broke; nothing else notices.
    No metrics at all for 3 h is itself the alert (the "no data" option).
 2. **Stale data** — ingest runs but SMARD stopped publishing (or a step keeps failing).
@@ -83,6 +85,10 @@ Why these five:
 4. **Model error** — the same 3.5 % 7-day MAPE the retrain trigger uses; the retrain loop
    reacts on its own, this tells a human it is happening.
 5. **A job failed** — overlaps with GitHub's e-mails, but puts every signal in one place.
+6. **Drift check unavailable** — the drift check is allowed to fail without failing the
+   monitor job (so accuracy is still scored), which also means a broken drift check stays
+   green on GitHub. This happened once: a new pandas major broke Evidently's import
+   (README §16.2).
 
 Use **Test Notifications** (bottom of the monitor page) once to check the e-mail arrives.
 
@@ -101,7 +107,7 @@ widgets (*Add widgets* → type → paste the query in the code editor):
 | Rows ingested per step | Timeseries (bars) | `sum:germany_load.ingest.rows{runner:github} by {step}` |
 | Job duration (s) | Timeseries | `max:germany_load.job.duration_seconds{runner:github} by {job}` |
 | Failed jobs | Timeseries (bars) | `sum:germany_load.job.failed{runner:github} by {job}` |
-| Monitor status | Monitor Summary | the five monitors above |
+| Monitor status | Monitor Summary | the six monitors above |
 
 ## Turning it off
 Delete the `DD_API_KEY` secret: the jobs keep working and simply stop sending metrics.

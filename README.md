@@ -389,6 +389,7 @@ The system went live on 17 September 2026. Some problems only show up when a sys
 | 1 Oct | `ingest` #74 failed: "Could not parse SQLAlchemy URL" | The `DATABASE_URL` secret was pasted in TOML form (with quotes) and with the dashboard's read-only user | Secret replaced with the writer URL, no quotes; jobs and the public dashboard now use separate database roles (write vs read-only) |
 | 1 Oct | Dashboard error after a deploy: `module 'dashboard.queries' has no attribute 'WINDOWS_DAYS'` | Streamlit Cloud reloaded the new `app.py` but kept the previous version of an imported module in memory | Rebooting the app; after any deploy that changes `dashboard/`, reboot once and check it loads |
 | 5 Oct | `ingest` #95 failed on the Open-Meteo forecast request | Open-Meteo returned a body that was not JSON four times in ~7 s; the old retry waits (1.5 s, 2.3 s, 3.4 s) were too short to ride out the hiccup. The next run succeeded and backfilled, so no data was lost | Retries now wait 3 s, 9 s and 27 s, also retry HTTP 429 (rate limited), and the error names the HTTP status, content type and start of the body instead of only "Expecting value" |
+| 30 Oct (detected) | Drift check silently unavailable; CI #17 failed on `test_compute_drift_with_real_evidently` | Every job installs its dependencies fresh, and `pandas>=2.1` had no upper bound: pip picked up pandas 3, whose removed internals Evidently still imports. The monitor job is designed to survive a drift error (accuracy is still scored), so it stayed green; only CI's fresh install exposed it. A laptop with an older environment passed | `pandas>=2.1,<3` in every dependency file until Evidently supports pandas 3, and a `drift.unavailable` metric with its own Datadog alert, so a broken drift check can no longer look green |
 
 ### 16.3 The retraining loop, exercised on live data
 
@@ -402,7 +403,7 @@ The guarded retraining path ran for real in October:
 
 The scheduler problem in §16.1 ran for four weeks and was found by reading the Actions history by hand: no job ever *failed*, so nothing alerted. The same blind spot covers a job that never starts, an ingest that runs but writes nothing, data that stops arriving, or a model that slowly degrades. Crash e-mails cannot see any of those.
 
-So each job now reports a few metrics to **Datadog** when it ends — rows written per step, data freshness, forecast age, job duration and outcome, live model and official MAPE, drift share, trigger states and retrain decisions (`src/observability.py`). There is no agent (runners are temporary); the job POSTs to Datadog's HTTP API, and a Datadog outage is logged but can never fail a job. Five monitors alert by e-mail:
+So each job now reports a few metrics to **Datadog** when it ends — rows written per step, data freshness, forecast age, job duration and outcome, live model and official MAPE, drift share, trigger states and retrain decisions (`src/observability.py`). There is no agent (runners are temporary); the job POSTs to Datadog's HTTP API, and a Datadog outage is logged but can never fail a job. Six monitors alert by e-mail:
 
 | Monitor | Catches |
 |---|---|
@@ -411,6 +412,7 @@ So each job now reports a few metrics to **Datadog** when it ends — rows writt
 | No forecast today (forecast older than 25 h) | the forecast job never ran — reported by the *hourly ingest*, so it works even when the forecast job cannot report anything |
 | 7-day MAPE above 3.5 % | the model is degrading (the retrain loop reacts; this tells a human) |
 | A job failed | any failure, per job, in the same place as everything else |
+| Drift check unavailable | a drift check that errors but, by design, does not fail the monitor job |
 
 Setup and the exact monitor queries: `docs/observability.md`. Without the `DD_API_KEY` secret nothing is sent, so local runs, tests and forks are unaffected.
 
