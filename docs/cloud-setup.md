@@ -56,6 +56,8 @@ tested, not on GitHub's schedule.
    green before the first cron.)
 6. **Set up the external scheduler** (`docs/operations.md`): GitHub's cron alone runs the
    daily jobs hours late.
+7. **Optional: alerting.** Add the `DD_API_KEY` secret and create the Datadog monitors
+   (`docs/observability.md`).
 
 Local development is unchanged: SQLite data DB + SQLite MLflow by default. To point
 your laptop at the cloud, put the same `DATABASE_URL` in `.env`.

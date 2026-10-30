@@ -223,6 +223,7 @@ This loop is why the system is designed to run continuously: a retraining trigge
 | Containerization | Docker / docker-compose |
 | Orchestration / scheduling | GitHub Actions, started on time by an external scheduler (cron-job.org); GitHub cron as backup |
 | Monitoring / drift | Evidently |
+| Observability / alerting | Datadog (job metrics over its HTTP API, monitors, dashboard) |
 | CI/CD | GitHub Actions + pytest + ruff |
 | Dashboard | Streamlit |
 | Config / secrets | pydantic-settings, `.env`, GitHub Secrets |
@@ -241,7 +242,7 @@ germany-electricity-load-forecasting-mlops/
 ├── docker-compose.yml             # local Postgres + API + dashboard
 ├── .env.example                   # template for secrets (no real values)
 ├── requirements/                  # lean per-job dependency sets (e.g. ingest)
-├── docs/                          # cloud setup, operations runbook
+├── docs/                          # cloud setup, operations runbook, observability
 ├── notebooks/                     # exploration only, never the source of truth
 ├── .github/workflows/
 │   ├── ci.yml                     # tests + lint on push
@@ -256,7 +257,8 @@ germany-electricity-load-forecasting-mlops/
 │   ├── features/                  # build_features, horizons (leakage-safe, horizon-aware)
 │   ├── models/                    # baselines, train, evaluate, registry, tracking
 │   ├── serving/                   # api (FastAPI), forecast, batch_forecast
-│   └── monitoring/                # drift, performance, retrain
+│   ├── monitoring/                # drift, performance, retrain
+│   └── observability.py           # optional job metrics -> Datadog
 ├── dashboard/
 │   ├── app.py                     # Streamlit dashboard
 │   ├── queries.py                 # read-only queries behind it
@@ -396,6 +398,22 @@ The guarded retraining path ran for real in October:
 - Each time a **challenger was trained** and compared with the champion on hours neither had trained on. It did not beat the champion by the required 3 % margin, so the **champion (v1) was kept** and the decision was logged to MLflow and the events table.
 - Both forecasts were worse in that period: the official forecast's 7-day MAPE reached 4.75 %, against 3.94 % for the model. A week that is hard for everyone, rather than a model that has gone stale, is exactly the case the anti-churn margin exists for: retraining on it would not have helped.
 
+### 16.4 Alerting: from "GitHub e-mails me on a crash" to monitors on what the jobs do
+
+The scheduler problem in §16.1 ran for four weeks and was found by reading the Actions history by hand: no job ever *failed*, so nothing alerted. The same blind spot covers a job that never starts, an ingest that runs but writes nothing, data that stops arriving, or a model that slowly degrades. Crash e-mails cannot see any of those.
+
+So each job now reports a few metrics to **Datadog** when it ends — rows written per step, data freshness, forecast age, job duration and outcome, live model and official MAPE, drift share, trigger states and retrain decisions (`src/observability.py`). There is no agent (runners are temporary); the job POSTs to Datadog's HTTP API, and a Datadog outage is logged but can never fail a job. Five monitors alert by e-mail:
+
+| Monitor | Catches |
+|---|---|
+| Ingest stopped (no run for 3 h) | the external scheduler or its token broke |
+| Actual load data stale (> 6 h) | SMARD stopped publishing, or an ingest step keeps failing |
+| No forecast today (forecast older than 25 h) | the forecast job never ran — reported by the *hourly ingest*, so it works even when the forecast job cannot report anything |
+| 7-day MAPE above 3.5 % | the model is degrading (the retrain loop reacts; this tells a human) |
+| A job failed | any failure, per job, in the same place as everything else |
+
+Setup and the exact monitor queries: `docs/observability.md`. Without the `DD_API_KEY` secret nothing is sent, so local runs, tests and forks are unaffected.
+
 ---
 
 ## 17. Roadmap
@@ -403,7 +421,6 @@ The guarded retraining path ran for real in October:
 Planned technical extensions, in rough order:
 
 - **Calendar-day (D+1) forecast** — forecast tomorrow 00:00–24:00 Berlin time every morning, as the official forecast does: an exactly like-for-like benchmark and no window drift (§16.1).
-- **Alerting & observability** — job metrics (data freshness, rows ingested, live MAPE, drift share, run duration) and alerts on "no fresh data" or "no forecast by 10:00 UTC", beyond GitHub's failure e-mails.
 
 - **Deep learning** — LSTM/GRU and a Temporal Fusion Transformer, compared rigorously against the LightGBM baseline.
 - **Multi-region forecasting** — the four German control areas (50Hertz, Amprion, TenneT, TransnetBW) forecast separately.

@@ -20,7 +20,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Repository root (this file lives in <root>/config/settings.py).
@@ -74,6 +74,16 @@ class Settings(BaseSettings):
         description="First day of usable data (post-COVID cutoff: pandemic demand patterns are unrepresentative).",
     )
 
+    # --- observability (optional) ----------------------------------------------
+    dd_api_key: SecretStr | None = Field(
+        default=None,
+        description="Datadog API key; unset = job metrics are not sent (src/observability.py).",
+    )
+    dd_site: str = Field(
+        default="datadoghq.eu",
+        description="Datadog site the account lives on (datadoghq.eu, datadoghq.com, ...).",
+    )
+
     # --- misc ---------------------------------------------------------------
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
 
@@ -82,6 +92,11 @@ class Settings(BaseSettings):
     @classmethod
     def _upper(cls, value: str) -> str:
         return value.strip().upper()
+
+    @field_validator("dd_site")
+    @classmethod
+    def _site_or_default(cls, value: str) -> str:
+        return value.strip() or "datadoghq.eu"  # an unset workflow variable arrives as ""
 
 
 @lru_cache(maxsize=1)

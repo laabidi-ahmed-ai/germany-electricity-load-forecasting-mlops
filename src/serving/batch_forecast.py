@@ -25,6 +25,7 @@ from config.log import configure_logging
 from src.data import db
 from src.data.weather_client import WeatherClient
 from src.models.registry import load_champion
+from src.observability import JobMetrics, job_metrics
 from src.serving.forecast import (
     DAY_AHEAD_HOURS,
     ForecastResult,
@@ -75,13 +76,15 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--database-url", default=None)
     args = p.parse_args(argv)
 
-    result = run(
-        hours=args.hours,
-        as_of=pd.Timestamp(args.as_of) if args.as_of else None,
-        dry_run=args.dry_run,
-        once_per_day=args.once_per_day,
-        database_url=args.database_url,
-    )
+    with job_metrics("forecast") as metrics:
+        result = run(
+            hours=args.hours,
+            as_of=pd.Timestamp(args.as_of) if args.as_of else None,
+            dry_run=args.dry_run,
+            once_per_day=args.once_per_day,
+            database_url=args.database_url,
+        )
+        report_metrics(metrics, result, dry_run=args.dry_run)
     if result is None:
         print("Today's forecast was already issued - nothing to do.")
         return 0
@@ -91,6 +94,20 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(result.forecast.to_string(index=False))
     return 0
+
+
+def report_metrics(metrics: JobMetrics, result: ForecastResult | None, *, dry_run: bool) -> None:
+    """``forecast.issued`` only for a stored forecast: its absence is what alerting watches."""
+    if result is None:
+        metrics.gauge("forecast.skipped", 1)
+        return
+    if dry_run:
+        return
+    version = f"v{result.model_version}"
+    metrics.gauge("forecast.issued", 1, model_version=version)
+    metrics.gauge("forecast.hours", len(result.frame), model_version=version)
+    data_age = (result.issued_at - result.last_actual) / pd.Timedelta(hours=1)
+    metrics.gauge("forecast.data_age_hours", data_age, model_version=version)
 
 
 if __name__ == "__main__":

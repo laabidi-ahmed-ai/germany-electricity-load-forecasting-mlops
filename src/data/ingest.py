@@ -6,7 +6,9 @@ latest stored hour, re-fetching a small overlap window (upserts make that safe).
 
 Sources: ``smard`` (actual load and the official day-ahead load forecast) and
 ``weather`` (Open-Meteo), both keyless. Each source is validated before it is written
-and runs independently, so one failing source never blocks the others.
+and runs independently, so one failing source never blocks the others. With
+``DD_API_KEY`` set, each run also reports rows per step, failed steps and the age of
+the newest actual load and model forecast to Datadog (``src.observability``).
 
 Examples::
 
@@ -34,6 +36,7 @@ from src.data import db
 from src.data.smard_client import FORECAST_LOOKAHEAD, SmardClient
 from src.data.validation import DataValidationError, validate_load, validate_weather
 from src.data.weather_client import SOURCE_ARCHIVE, WeatherClient
+from src.observability import JobMetrics, job_metrics
 
 log = logging.getLogger(__name__)
 
@@ -296,15 +299,39 @@ def main(argv: Sequence[str] | None = None) -> int:
         log.error("unknown sources: %s (choose from %s)", sorted(unknown), ALL_SOURCES)
         return 2
 
-    engine = db.get_engine(args.database_url)
-    clients = Clients()
-    if args.backfill:
-        results = run_backfill(engine, clients, start=args.start, end=args.end, sources=sources)
-    else:
-        results = run_incremental(engine, clients, sources=sources)
+    with job_metrics("ingest") as metrics:
+        engine = db.get_engine(args.database_url)
+        clients = Clients()
+        if args.backfill:
+            results = run_backfill(engine, clients, start=args.start, end=args.end, sources=sources)
+        else:
+            results = run_incremental(engine, clients, sources=sources)
 
-    log.info("ingestion summary:\n%s", summarize(results))
+        log.info("ingestion summary:\n%s", summarize(results))
+        report_metrics(metrics, engine, results)
     return 1 if any(r.failed for r in results) else 0
+
+
+def report_metrics(metrics: JobMetrics, engine: Engine, results: Sequence[IngestResult]) -> None:
+    """Rows per step, failed steps, and how old the newest actual load and forecast are.
+
+    The hourly ingest doubles as a watchdog for the daily forecast: alerting on the
+    forecast's age catches a forecast job that never started, which the job itself
+    cannot report.
+    """
+    for r in results:
+        metrics.gauge("ingest.rows", r.rows, step=r.source)
+        metrics.gauge("ingest.step_failed", int(r.failed), step=r.source)
+    if any(r.failed for r in results):
+        metrics.fail()
+    latest = db.latest_timestamp(engine, db.LoadActual, source=SOURCE_SMARD)
+    if latest is not None:
+        age = (pd.Timestamp.now(tz="UTC") - latest) / pd.Timedelta(hours=1)
+        metrics.gauge("data.freshness_hours", age)
+    issued = db.latest_issued_at(engine)
+    if issued is not None:
+        age = (pd.Timestamp.now(tz="UTC") - issued) / pd.Timedelta(hours=1)
+        metrics.gauge("forecast.age_hours", age)
 
 
 if __name__ == "__main__":

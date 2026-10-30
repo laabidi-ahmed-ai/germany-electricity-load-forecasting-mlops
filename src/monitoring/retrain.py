@@ -49,6 +49,7 @@ from src.models.tracking import DEFAULT_EXPERIMENT, setup_mlflow
 from src.monitoring import drift as drift_mod
 from src.monitoring import performance as perf_mod
 from src.monitoring.metrics import WindowMetrics, compute_metrics, improvement_pct
+from src.observability import JobMetrics, job_metrics
 
 log = logging.getLogger(__name__)
 
@@ -448,6 +449,33 @@ def record_event(
     )
 
 
+def report_metrics(
+    metrics: JobMetrics, decision: TriggerDecision, outcome: ChallengerOutcome | None
+) -> None:
+    """Live accuracy, drift, trigger states and the retrain decision, tagged by champion."""
+    champion = f"v{decision.champion_version}"
+    if decision.performance is not None:
+        for w in decision.performance.windows:
+            tags = {"window": f"{w.window_days}d", "model_version": champion}
+            metrics.gauge("model.mape", w.model_mape, **tags)
+            metrics.gauge("official.mape", w.official_mape, **tags)
+            metrics.gauge("model.improvement_pct", w.improvement_pct, **tags)
+    if decision.drift is not None:
+        metrics.gauge("drift.share", decision.drift.share_drifted, model_version=champion)
+    for c in decision.checks:
+        metrics.gauge("trigger.fired", int(c.fired), trigger=c.name, model_version=champion)
+    metrics.gauge("retrain.ran", int(outcome is not None), model_version=champion)
+    if outcome is not None:  # decision: promoted | promoted (dry-run) | kept | skipped
+        decision_tag = outcome.decision.split(" ")[0]
+        dry_run = str("dry-run" in outcome.decision).lower()
+        metrics.gauge(
+            "retrain.promoted",
+            int(outcome.decision == "promoted"),  # a dry-run promotion is not a real one
+            decision=decision_tag,
+            dry_run=dry_run,
+        )
+
+
 # --- CLI ---
 def main(argv: list[str] | None = None) -> int:
     configure_logging()
@@ -481,43 +509,48 @@ def main(argv: list[str] | None = None) -> int:
         holdout_days=args.holdout_days,
         min_improvement_pct=args.min_improvement,
     )
-    engine = db.get_engine(args.database_url)
-    db.init_db(engine)
-    if args.once_per_day and db.happened_today(db.latest_event_at(engine)):
-        print("Monitoring already ran today (UTC) - nothing to do.")
-        return 0
-    champion = registry.load_champion(engine)
-    as_of = pd.Timestamp(args.as_of) if args.as_of else None
-    frame = build_features(engine, output=None)
+    with job_metrics("monitor") as metrics:
+        engine = db.get_engine(args.database_url)
+        db.init_db(engine)
+        if args.once_per_day and db.happened_today(db.latest_event_at(engine)):
+            print("Monitoring already ran today (UTC) - nothing to do.")
+            metrics.gauge("monitor.skipped", 1)
+            return 0
+        champion = registry.load_champion(engine)
+        as_of = pd.Timestamp(args.as_of) if args.as_of else None
+        frame = build_features(engine, output=None)
 
-    decision = evaluate_triggers(engine, champion, cfg, as_of=as_of, frame=frame)
-    print(decision.performance.summary() if decision.performance else "no performance data")
-    print()
-    print(
-        decision.drift.summary() if decision.drift else f"drift unavailable: {decision.drift_error}"
-    )
-    print()
-    print(decision.summary())
-
-    outcome: ChallengerOutcome | None = None
-    if not args.check_only and (decision.triggered or args.force):
-        outcome = run_champion_challenger(
-            engine,
-            champion,
-            cfg,
-            as_of=as_of,
-            frame=frame,
-            triggers=decision.reasons or (["forced"] if args.force else []),
-            dry_run=args.dry_run,
+        decision = evaluate_triggers(engine, champion, cfg, as_of=as_of, frame=frame)
+        print(decision.performance.summary() if decision.performance else "no performance data")
+        print()
+        print(
+            decision.drift.summary()
+            if decision.drift
+            else f"drift unavailable: {decision.drift_error}"
         )
         print()
-        print(outcome.summary())
-    elif not args.check_only:
-        print("\nNo trigger fired - champion kept, nothing retrained.")
+        print(decision.summary())
 
-    record_event(engine, decision, outcome, cfg)
-    if not args.no_mlflow:
-        print(f"\nMLflow run: {log_decision(decision, outcome, cfg)}")
+        outcome: ChallengerOutcome | None = None
+        if not args.check_only and (decision.triggered or args.force):
+            outcome = run_champion_challenger(
+                engine,
+                champion,
+                cfg,
+                as_of=as_of,
+                frame=frame,
+                triggers=decision.reasons or (["forced"] if args.force else []),
+                dry_run=args.dry_run,
+            )
+            print()
+            print(outcome.summary())
+        elif not args.check_only:
+            print("\nNo trigger fired - champion kept, nothing retrained.")
+
+        record_event(engine, decision, outcome, cfg)
+        report_metrics(metrics, decision, outcome)
+        if not args.no_mlflow:
+            print(f"\nMLflow run: {log_decision(decision, outcome, cfg)}")
     return 0
 
 

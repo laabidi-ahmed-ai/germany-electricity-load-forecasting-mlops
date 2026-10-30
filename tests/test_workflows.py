@@ -90,6 +90,13 @@ def test_jobs_use_secrets_and_never_hardcode_them(name: str) -> None:
     assert job.get("permissions", wf.get("permissions")) == {"contents": "read"}
 
 
+@pytest.mark.parametrize("name", sorted(SCHEDULED))
+def test_scheduled_jobs_pass_the_optional_datadog_key(name: str) -> None:
+    (job,) = load(name)["jobs"].values()
+    assert job["env"]["DD_API_KEY"] == "${{ secrets.DD_API_KEY }}"
+    assert job["env"]["DD_SITE"] == "${{ vars.DD_SITE }}"  # a repository variable, not a secret
+
+
 def test_setup_action_checks_the_secret_and_installs_lean_or_full() -> None:
     action = yaml.safe_load(
         (PROJECT_ROOT / ".github" / "actions" / "setup" / "action.yml").read_text(encoding="utf-8")

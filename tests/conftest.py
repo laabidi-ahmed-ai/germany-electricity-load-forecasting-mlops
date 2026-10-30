@@ -32,6 +32,9 @@ _ENV_KEYS = [
     "SMARD_REGION",
     "DATA_START_DATE",
     "LOG_LEVEL",
+    "DD_API_KEY",
+    "DD_SITE",
+    "GITHUB_ACTIONS",
 ]
 
 

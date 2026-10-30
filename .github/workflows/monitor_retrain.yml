@@ -42,6 +42,9 @@ jobs:
     timeout-minutes: 60
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      # Optional job metrics -> Datadog (docs/observability.md); unset = nothing is sent.
+      DD_API_KEY: ${{ secrets.DD_API_KEY }}
+      DD_SITE: ${{ vars.DD_SITE }}
       # MLflow lineage lives in Postgres too; a dedicated store can be given via MLFLOW_TRACKING_URI.
       MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI || secrets.DATABASE_URL }}
       LOG_LEVEL: INFO

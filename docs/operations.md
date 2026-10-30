@@ -57,9 +57,10 @@ Any service that can send a scheduled HTTP POST works; these steps use
 
 ## Routine procedures
 
-- **Health check.** Actions tab (all green), and the dashboard's *Data coverage* (latest
-  actual) and *last model forecast* timestamps. `python -m src.models.registry --show`
-  prints the champion.
+- **Health check.** Datadog alerts by e-mail on a stopped ingest, stale data, a missing
+  forecast, a rising error or a failed job (`docs/observability.md`). By hand: the Actions
+  tab (all green), and the dashboard's *Data coverage* (latest actual) and *last model
+  forecast* timestamps. `python -m src.models.registry --show` prints the champion.
 - **Forecast again today on purpose.** Actions → *forecast* → *Run workflow* → tick
   **force**. (Without it, the run exits because today's forecast exists.)
 - **Rehearse a retrain without touching the champion.** Actions → *monitor-retrain* →

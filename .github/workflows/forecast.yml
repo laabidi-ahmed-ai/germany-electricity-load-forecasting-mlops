@@ -34,6 +34,9 @@ jobs:
     timeout-minutes: 30
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      # Optional job metrics -> Datadog (docs/observability.md); unset = nothing is sent.
+      DD_API_KEY: ${{ secrets.DD_API_KEY }}
+      DD_SITE: ${{ vars.DD_SITE }}
       LOG_LEVEL: INFO
       PYTHONUNBUFFERED: "1"
     steps:
