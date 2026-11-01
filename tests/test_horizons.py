@@ -15,6 +15,7 @@ from src.features.build_features import (
     feature_columns,
 )
 from src.features.horizons import (
+    D_PLUS_1,
     DAY_AHEAD,
     HORIZONS,
     NOWCAST,
@@ -82,6 +83,17 @@ def test_selection_preserves_order_and_is_generic() -> None:
 
 
 def test_registry_and_constants() -> None:
-    assert HORIZONS == {"day_ahead": DAY_AHEAD, "nowcast": NOWCAST}
+    assert HORIZONS == {"day_ahead": DAY_AHEAD, "d_plus_1": D_PLUS_1, "nowcast": NOWCAST}
     assert DAY_AHEAD.min_lag_hours == 24 and NOWCAST.min_lag_hours == 1
+    assert D_PLUS_1.min_lag_hours == 48 and D_PLUS_1.calendar_day
+    assert not DAY_AHEAD.calendar_day
     assert min(LAG_HOURS) == 1  # the frame really does contain the nowcast-only lag
+
+
+def test_calendar_day_d_plus_1_drops_the_24h_lag(frame) -> None:
+    """Tomorrow's hours are up to ~44 h after the latest actual: load 24 h ago is unknown."""
+    cols = select_features(frame.columns, D_PLUS_1)
+    load_cols = [c for c in cols if most_recent_load_lag(c) is not None]
+    assert load_cols == ["load_lag_48", "load_lag_168"]
+    assert "load_lag_24" in excluded_features(frame.columns, D_PLUS_1)
+    assert set(cols) == set(select_features(frame.columns, DAY_AHEAD)) - {"load_lag_24"}

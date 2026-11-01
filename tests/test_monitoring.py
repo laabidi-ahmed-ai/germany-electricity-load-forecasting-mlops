@@ -11,7 +11,7 @@ import pytest
 from config.settings import get_settings
 from src.data import db
 from src.features.build_features import TARGET, WEATHER_COLUMNS, build_feature_frame
-from src.features.horizons import DAY_AHEAD, select_features
+from src.features.horizons import D_PLUS_1, DAY_AHEAD, select_features
 from src.monitoring import drift as drift_mod
 from src.monitoring import metrics, retrain
 from src.monitoring import performance as perf
@@ -243,6 +243,9 @@ def test_drift_columns_exclude_calendar_and_nowcast_features() -> None:
     cols = drift_mod.drift_columns(list(frame.columns))
     assert cols == ["load_lag_24", "load_lag_48", "load_lag_168", *WEATHER_COLUMNS]
     assert not any(c in cols for c in ("hour", "day_of_week", "month", "is_holiday", "load_lag_1"))
+    # A D+1 champion is monitored on what it actually uses.
+    d1 = drift_mod.drift_columns(list(frame.columns), D_PLUS_1)
+    assert d1 == ["load_lag_48", "load_lag_168", *WEATHER_COLUMNS]
 
 
 def test_seasonal_reference_selects_same_season_of_past_years() -> None:
@@ -559,6 +562,27 @@ def test_challenger_kept_when_margin_not_met(engine, cfg) -> None:
     out = retrain.run_champion_challenger(engine, champ, strict, frame=frame)
     assert out.decision == "kept" and "< required 50.0% margin" in out.reason
     assert out.challenger_version is None
+
+
+def test_challenger_competes_on_the_champions_horizon(engine, cfg, monkeypatch) -> None:
+    """A D+1 champion is challenged by a D+1 model - never by one that sees load_lag_24."""
+    load = seed_db(engine, days=90, with_model=False)
+    frame = feature_frame(load)
+    cols = select_features(frame.columns, D_PLUS_1)
+    champ = fake_loaded_model(
+        cols, horizon=D_PLUS_1, train_end=frame.index.max() - pd.Timedelta(days=10)
+    )
+    seen: list[str] = []
+    real_fit = retrain.train.fit_model
+
+    def spy_fit(df, horizon, params=None):
+        seen.append(horizon.name)
+        return real_fit(df, horizon, params)
+
+    monkeypatch.setattr(retrain.train, "fit_model", spy_fit)
+    out = retrain.run_champion_challenger(engine, champ, cfg, frame=frame)
+    assert seen and set(seen) == {"d_plus_1"}
+    assert out.decision in {"kept", "promoted (dry-run)", "promoted"}
 
 
 # --- Logging + CLI ---

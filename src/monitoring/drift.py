@@ -43,7 +43,7 @@ from sqlalchemy.engine import Engine
 from config.log import configure_logging
 from src.data import db
 from src.features.build_features import TARGET, WEATHER_COLUMNS, build_features
-from src.features.horizons import DAY_AHEAD, most_recent_load_lag, select_features
+from src.features.horizons import DAY_AHEAD, Horizon, most_recent_load_lag, select_features
 from src.models.registry import LoadedModel
 
 log = logging.getLogger(__name__)
@@ -59,11 +59,11 @@ Runner = Callable[[pd.DataFrame, pd.DataFrame, list[str], float], list[dict[str,
 
 
 # --- Column selection + seasonal reference ---
-def drift_columns(feature_columns: list[str]) -> list[str]:
-    """Load-derived + weather features of the day-ahead set (calendar excluded)."""
+def drift_columns(feature_columns: list[str], horizon: Horizon = DAY_AHEAD) -> list[str]:
+    """Load-derived + weather features the horizon's model uses (calendar excluded)."""
     return [
         c
-        for c in select_features(feature_columns, DAY_AHEAD)
+        for c in select_features(feature_columns, horizon)
         if most_recent_load_lag(c) is not None or c in WEATHER_COLUMNS
     ]
 
@@ -268,7 +268,7 @@ def compute_drift(
         notes.append("seasonal reference too small - falling back to all past training rows")
         reference = training[training.index < current.index.min()]
 
-    columns = drift_columns(list(frame.columns))
+    columns = drift_columns(list(frame.columns), model.horizon if model else DAY_AHEAD)
     extra: list[str] = []
     if model is not None:
         current = current.assign(**{PREDICTION_COL: model.predict(current)})

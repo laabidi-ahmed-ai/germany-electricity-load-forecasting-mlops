@@ -17,6 +17,14 @@ For the frame built in ``build_features`` that means:
 * weather features                      -> valid; at serving time they are weather
   forecasts for t, which is a train/serve skew (forecast error), not leakage
 
+Calendar day D+1 (``d_plus_1``): the forecast issued on the morning of day D for every
+hour of day D+1 in local (Berlin) time - the same target as the official day-ahead
+forecast and the noon auction. Issued around 05:40 UTC with actuals up to ~04:00 UTC,
+the last target hour is ~43 h after the latest actual (44 h on the 25-hour autumn day),
+so the information cutoff is 48 h: ``load_lag_48 / 168`` stay, ``load_lag_24`` goes, and
+the 4-5 h of slack absorb a late SMARD publication. The target hours come from the
+calendar (``Horizon.calendar_day``), not from the latest actual.
+
 Nowcast (a possible future model): information cutoff of 1 hour, the full feature
 set is valid.
 
@@ -39,10 +47,15 @@ _ROLLING_MOST_RECENT_LAG = 1
 
 @dataclass(frozen=True)
 class Horizon:
-    """A forecast horizon = the minimum age (hours) of any load observation a feature may use."""
+    """A forecast horizon = the minimum age (hours) of any load observation a feature may use.
+
+    ``calendar_day``: the target is the next local calendar day instead of the hours right
+    after the latest actual.
+    """
 
     name: str
     min_lag_hours: int
+    calendar_day: bool = False
 
     def is_valid(self, column: str) -> bool:
         """True if ``column`` may be used by a model for this horizon."""
@@ -51,9 +64,10 @@ class Horizon:
 
 
 DAY_AHEAD = Horizon("day_ahead", min_lag_hours=24)
+D_PLUS_1 = Horizon("d_plus_1", min_lag_hours=48, calendar_day=True)
 NOWCAST = Horizon("nowcast", min_lag_hours=1)
 
-HORIZONS: dict[str, Horizon] = {h.name: h for h in (DAY_AHEAD, NOWCAST)}
+HORIZONS: dict[str, Horizon] = {h.name: h for h in (DAY_AHEAD, D_PLUS_1, NOWCAST)}
 
 
 def most_recent_load_lag(column: str) -> int | None:

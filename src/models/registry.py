@@ -51,6 +51,7 @@ _METRIC_KEYS = (
     "lightgbm_mape_mean",
     "seasonal_naive_168_mae_mean",
     "seasonal_naive_24_mae_mean",
+    "seasonal_naive_48_mae_mean",
     "beats_all_baselines",
 )
 

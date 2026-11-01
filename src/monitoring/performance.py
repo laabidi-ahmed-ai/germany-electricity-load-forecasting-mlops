@@ -31,7 +31,7 @@ from config.log import configure_logging
 from src.data import db
 from src.data.db import SOURCE_SMARD
 from src.features.build_features import TARGET, build_features
-from src.features.horizons import DAY_AHEAD
+from src.features.horizons import DAY_AHEAD, HORIZONS, Horizon
 from src.monitoring.metrics import (
     MIN_WINDOW_HOURS,
     WINDOWS_DAYS,
@@ -165,7 +165,9 @@ def backtest_vs_official(
     as_of: pd.Timestamp | None = None,
     params: dict[str, Any] | None = None,
     frame: pd.DataFrame | None = None,
+    horizon: Horizon = DAY_AHEAD,
 ) -> BacktestReport:
+    """Train once before the window, forecast it with ``horizon``-valid features, compare."""
     from src.models.evaluate import DEFAULT_MIN_TRAIN_HOURS
     from src.models.train import fit_model
 
@@ -177,7 +179,7 @@ def backtest_vs_official(
     if len(train) < DEFAULT_MIN_TRAIN_HOURS or holdout.empty:
         raise ValueError("not enough data for a backtest (need >= 1 year of training rows)")
 
-    model, cols = fit_model(train, DAY_AHEAD, params)
+    model, cols = fit_model(train, horizon, params)
     pred = pd.Series(model.predict(holdout[cols]), index=holdout.index, name="model_mw")
 
     official = db.read_table(
@@ -228,6 +230,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--as-of", default=None)
     p.add_argument("--model-version", default=None)
     p.add_argument("--backtest-days", type=int, default=0, help="also run an OOS backtest")
+    p.add_argument("--horizon", choices=sorted(HORIZONS), default=DAY_AHEAD.name)
     p.add_argument("--database-url", default=None)
     args = p.parse_args(argv)
 
@@ -243,6 +246,7 @@ def main(argv: list[str] | None = None) -> int:
             engine,
             days=args.backtest_days,
             as_of=pd.Timestamp(args.as_of) if args.as_of else None,
+            horizon=HORIZONS[args.horizon],
         )
         print()
         print(bt.summary())

@@ -65,6 +65,15 @@ Any service that can send a scheduled HTTP POST works; these steps use
   **force**. (Without it, the run exits because today's forecast exists.)
 - **Rehearse a retrain without touching the champion.** Actions → *monitor-retrain* →
   *Run workflow* → mode **force**, **dry_run** ticked.
+- **Evaluate the calendar-day (D+1) forecast without touching production.** Actions →
+  *bootstrap* → *Run workflow* → tick **skip_backfill**, horizon **d_plus_1**, untick
+  **promote**. The log shows the cross-validation report (LightGBM vs the 48 h and 168 h
+  baselines) and a 365-day backtest against the official forecast; the run is in MLflow,
+  nothing is registered or forecast.
+- **Switch production to D+1** (after a good evaluation): the same with **promote** ticked.
+  It trains, registers and promotes the D+1 champion and issues its first forecast; from
+  then on the daily jobs, monitoring and retraining follow the champion's horizon. Roll
+  back with the command below.
 - **Roll back the model.** With `DATABASE_URL` in `.env`:
   `python -m src.models.registry --promote <previous version>`.
 - **Rotate the database password.** Neon → *Roles* → the owner role → *Reset password*;

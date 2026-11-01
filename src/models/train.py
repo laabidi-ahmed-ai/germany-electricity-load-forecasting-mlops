@@ -36,7 +36,7 @@ from src.features.build_features import DEFAULT_OUTPUT as FEATURES_PARQUET
 from src.features.build_features import TARGET
 from src.features.horizons import DAY_AHEAD, HORIZONS, Horizon, excluded_features, select_features
 from src.models import evaluate
-from src.models.baselines import BASELINE_FACTORIES
+from src.models.baselines import baseline_factories
 from src.models.tracking import DEFAULT_EXPERIMENT, setup_mlflow
 
 log = logging.getLogger(__name__)
@@ -238,7 +238,7 @@ def main(argv: list[str] | None = None) -> int:
     horizon = HORIZONS[args.horizon]
     df = load_feature_frame(args.features)
 
-    factories = {**BASELINE_FACTORIES, MODEL_NAME: lightgbm_factory()}
+    factories = {**baseline_factories(horizon), MODEL_NAME: lightgbm_factory()}
     cv = evaluate.cross_validate(
         df,
         factories,

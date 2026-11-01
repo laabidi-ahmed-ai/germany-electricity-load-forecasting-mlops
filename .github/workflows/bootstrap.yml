@@ -3,6 +3,10 @@
 #   -> register + promote champion (exported to the DB)  ->  first day-ahead forecast
 #   -> monitoring check.
 # Re-running is safe: every step is idempotent (upserts) or creates a new model version.
+#
+# Evaluate another horizon without touching production: skip_backfill, horizon=d_plus_1,
+# promote=false -> CV report + a 365-day backtest vs the official forecast in the log and
+# MLflow, nothing registered. Switch to it: the same with promote=true (docs/operations.md).
 name: bootstrap
 
 on:
@@ -20,6 +24,15 @@ on:
         description: "skip training (a champion is already exported)"
         type: boolean
         default: false
+      horizon:
+        description: "day_ahead = 24 h after the latest actual; d_plus_1 = next calendar day (Berlin)"
+        type: choice
+        options: [day_ahead, d_plus_1]
+        default: day_ahead
+      promote:
+        description: "register + promote the trained model and forecast with it (off = evaluate only)"
+        type: boolean
+        default: true
 
 concurrency:
   group: bootstrap
@@ -54,16 +67,22 @@ jobs:
 
       - name: Train + expanding-window CV (baselines vs LightGBM) -> MLflow
         if: ${{ !inputs.skip_training }}
-        run: python -m src.models.train
+        run: python -m src.models.train --horizon "${{ inputs.horizon }}"
+
+      - name: Out-of-sample backtest vs the official forecast (last 365 days)
+        if: ${{ !inputs.skip_training && !inputs.promote }}
+        run: python -m src.monitoring.performance --backtest-days 365 --horizon "${{ inputs.horizon }}"
 
       - name: Register + promote champion (exported to the database)
-        if: ${{ !inputs.skip_training }}
+        if: ${{ !inputs.skip_training && inputs.promote }}
         run: python -m src.models.registry --promote-latest
 
-      - name: First day-ahead forecast
+      - name: First forecast with the champion
+        if: ${{ inputs.promote }}
         run: python -m src.serving.batch_forecast
 
       - name: Monitoring check (no retraining)
+        if: ${{ inputs.promote }}
         run: python -m src.monitoring.retrain --check-only
 
       - name: Summary

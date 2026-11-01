@@ -314,7 +314,8 @@ def panel_accuracy(acc: dict[str, Any], head: dict[str, Any], days: int, tz: str
             f"Offline reference (expanding-window CV on {fmt_ts(champ['train_start'], tz, '%Y-%m')} → "
             f"{fmt_ts(champ['train_end'], tz, '%Y-%m')}): LightGBM MAE {fmt_mw(m.get('lightgbm_mae_mean'))}, "
             f"MAPE {fmt_pct(m.get('lightgbm_mape_mean'))} · seasonal-naive MAE "
-            f"{fmt_mw(m.get('seasonal_naive_168_mae_mean'))} (weekly) / {fmt_mw(m.get('seasonal_naive_24_mae_mean'))} (daily)."
+            f"{fmt_mw(m.get('seasonal_naive_168_mae_mean'))} (weekly) / "
+            f"{fmt_mw(m.get('seasonal_naive_24_mae_mean', m.get('seasonal_naive_48_mae_mean')))} (daily)."
         )
 
 

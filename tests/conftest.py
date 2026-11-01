@@ -22,7 +22,7 @@ from sqlalchemy.engine import Engine
 from config.settings import Settings, get_settings
 from src.data import db
 from src.features.build_features import TARGET, WEATHER_COLUMNS, build_feature_frame
-from src.features.horizons import DAY_AHEAD
+from src.features.horizons import DAY_AHEAD, Horizon
 from src.models.registry import LoadedModel
 
 _ENV_KEYS = [
@@ -252,6 +252,7 @@ def fake_loaded_model(
     bias: float = 0.0,
     pyfunc: Any = None,
     train_end: pd.Timestamp | None = None,
+    horizon: Horizon = DAY_AHEAD,
 ) -> LoadedModel:
     """A champion as ``registry.load_champion`` would return it, without MLflow."""
     return LoadedModel(
@@ -260,7 +261,7 @@ def fake_loaded_model(
         alias="champion",
         run_id=f"run-{version}",
         features=features,
-        horizon=DAY_AHEAD,
+        horizon=horizon,
         pyfunc=pyfunc if pyfunc is not None else StubPyfunc(bias),
         train_end=train_end,
     )

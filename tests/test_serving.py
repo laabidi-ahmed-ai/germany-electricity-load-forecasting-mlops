@@ -12,17 +12,19 @@ from fastapi.testclient import TestClient
 from src.data import db
 from src.data.weather_client import City
 from src.features.build_features import TARGET, build_features
-from src.features.horizons import DAY_AHEAD, NOWCAST, select_features
+from src.features.horizons import D_PLUS_1, DAY_AHEAD, NOWCAST, select_features
 from src.models.registry import LoadedModel
 from src.serving import api, batch_forecast
 from src.serving.forecast import (
     NoDataError,
     build_serving_features,
+    calendar_day_window,
     ensure_weather,
     fill_short_gaps,
     forecast_window,
     make_day_ahead_forecast,
     store_forecast,
+    target_window,
 )
 from tests.conftest import fake_loaded_model, load_curve
 
@@ -189,6 +191,48 @@ def test_long_gap_in_recent_load_is_still_rejected(seeded) -> None:
     _delete_load_hours(seeded, "2024-01-20T03:00Z", 6)  # covers t-24 for the first targets
     with pytest.raises(NoDataError, match=r"gaps longer than 3h .*load_lag_24"):
         build_serving_features(seeded, as_of="2024-01-20T23:00Z")
+
+
+# --- Calendar-day D+1 ---
+@pytest.mark.parametrize(
+    ("day", "hours", "first_utc"),
+    [
+        ("2024-01-21", 24, "2024-01-20T23:00Z"),  # winter: Berlin = UTC+1
+        ("2024-03-31", 23, "2024-03-30T23:00Z"),  # clocks go forward: a 23-hour day
+        ("2024-10-27", 25, "2024-10-26T22:00Z"),  # clocks go back: a 25-hour day
+    ],
+)
+def test_calendar_day_window_follows_the_berlin_clock(day, hours, first_utc) -> None:
+    w = calendar_day_window(pd.Timestamp(day))
+    assert len(w) == hours and w[0] == pd.Timestamp(first_utc)
+    assert (w.tz_convert("Europe/Berlin").date == pd.Timestamp(day).date()).all()
+
+
+def test_d_plus_1_targets_tomorrow_and_refuses_stale_actuals() -> None:
+    issued = pd.Timestamp("2024-10-26T05:40Z")  # Saturday morning; Sunday has 25 hours
+    w = target_window(D_PLUS_1, pd.Timestamp("2024-10-26T03:00Z"), issued)
+    assert len(w) == 25 and w[0] == pd.Timestamp("2024-10-26T22:00Z")
+    # A rolling horizon ignores the calendar.
+    assert target_window(DAY_AHEAD, pd.Timestamp("2024-10-26T03:00Z"), issued)[0] == (
+        pd.Timestamp("2024-10-26T04:00Z")
+    )
+    # Actuals ending 50 h before the last target hour: lag_48 cannot cover the whole day.
+    with pytest.raises(NoDataError, match="beyond the 48h cutoff of d_plus_1"):
+        target_window(D_PLUS_1, pd.Timestamp("2024-10-25T20:00Z"), issued)
+
+
+def test_d_plus_1_forecast_covers_the_next_local_day_without_the_24h_lag(seeded) -> None:
+    as_of = pd.Timestamp("2024-01-20T05:00Z")  # issued Saturday morning, latest actual 05:00
+    served, last_actual = build_serving_features(seeded, horizon=D_PLUS_1, as_of=as_of)
+    assert list(served.index) == list(calendar_day_window(pd.Timestamp("2024-01-21")))
+    assert last_actual == as_of
+
+    features = select_features(served.columns, D_PLUS_1)
+    assert "load_lag_24" not in features and "load_lag_48" in features
+    model = fake_loaded_model(features, version="9", horizon=D_PLUS_1)
+    result = make_day_ahead_forecast(seeded, model, as_of=as_of)
+    assert result.horizon == "d_plus_1" and len(result.frame) == 24
+    assert result.target_start == pd.Timestamp("2024-01-20T23:00Z")
 
 
 def test_empty_db_raises(engine) -> None:

@@ -1,14 +1,19 @@
 """Day-ahead forecast generation shared by the API and the batch job.
 
 Serving-time features come from the same code path as training - ``build_feature_frame``
-followed by ``select_features(DAY_AHEAD)`` - so train/serve parity is checked by name
-and order before every prediction. The only difference is the content of the weather
-columns (Open-Meteo forecast values where no reanalysis exists yet).
+followed by ``select_features(<the champion's horizon>)`` - so train/serve parity is
+checked by name and order before every prediction. The only difference is the content
+of the weather columns (Open-Meteo forecast values where no reanalysis exists yet).
 
-The target window is ``(L, L + 24h]`` for the latest stored actual load L: with the
-24-hour information cutoff of ``src.features.horizons`` those are exactly the hours
-whose day-ahead lags are fully observed. Predictions are never fed back in as lags
-to reach further.
+The target window depends on the champion's horizon (``target_window``):
+
+* ``day_ahead``: ``(L, L + 24h]`` for the latest stored actual load L - with the 24-hour
+  information cutoff those are exactly the hours whose lags are fully observed;
+* ``d_plus_1``: every hour of the next local (Berlin) calendar day - 23, 24 or 25 hours -
+  the same target as the official forecast. It is refused if the latest actual is too
+  old for the 48-hour cutoff to cover the whole day.
+
+Predictions are never fed back in as lags to reach further.
 
 Per request / batch run: read the last ``HISTORY_HOURS`` of load, bridge gaps of at
 most ``MAX_FILLED_GAP_HOURS`` missing hours by linear interpolation (a late SMARD
@@ -33,14 +38,14 @@ from sqlalchemy.engine import Engine
 from src.data import db
 from src.data.db import SOURCE_SMARD
 from src.data.weather_client import WeatherClient, national_average
-from src.features.build_features import TARGET, WEATHER_COLUMNS, build_feature_frame
-from src.features.horizons import DAY_AHEAD, most_recent_load_lag, select_features
+from src.features.build_features import LOCAL_TZ, TARGET, WEATHER_COLUMNS, build_feature_frame
+from src.features.horizons import DAY_AHEAD, Horizon, most_recent_load_lag, select_features
 from src.models.registry import LoadedModel
 
 log = logging.getLogger(__name__)
 
 DAY_AHEAD_HOURS = 24
-HISTORY_HOURS = 24 * 10  # lag_168 for the last target hour needs L + 24 - 168 = L - 144h
+HISTORY_HOURS = 24 * 10  # lag_168 for the last target hour needs L + 44 - 168 = L - 124h
 MAX_FILLED_GAP_HOURS = 3  # longer runs of missing hours are a data problem, not a delay
 
 
@@ -104,6 +109,44 @@ def forecast_window(last_actual: pd.Timestamp, hours: int = DAY_AHEAD_HOURS) -> 
     return pd.date_range(start, periods=hours, freq="h", tz="UTC", name="timestamp_utc")
 
 
+def calendar_day_window(day: pd.Timestamp) -> pd.DatetimeIndex:
+    """The UTC hours of the local (Berlin) calendar ``day``: 23, 24 or 25 of them (DST)."""
+    day = pd.Timestamp(day).tz_localize(None).normalize()  # local wall-clock date
+    start = day.tz_localize(LOCAL_TZ)
+    end = (day + pd.Timedelta(days=1)).tz_localize(LOCAL_TZ)
+    return pd.date_range(
+        start.tz_convert("UTC"),
+        end.tz_convert("UTC"),
+        freq="h",
+        inclusive="left",
+        name="timestamp_utc",
+    )
+
+
+def target_window(
+    horizon: Horizon,
+    last_actual: pd.Timestamp,
+    issued: pd.Timestamp,
+    hours: int = DAY_AHEAD_HOURS,
+) -> pd.DatetimeIndex:
+    """The hours to forecast for ``horizon`` (``hours`` only applies to rolling horizons).
+
+    A calendar-day horizon targets the local day after the issue date, and refuses when
+    the latest actual is so old that the last target hour falls beyond its cutoff.
+    """
+    if not horizon.calendar_day:
+        return forecast_window(last_actual, hours)
+    issue_date = db.to_utc(issued).tz_convert(LOCAL_TZ).date()  # dates, not +24h: DST-safe
+    target = calendar_day_window(pd.Timestamp(issue_date) + pd.Timedelta(days=1))
+    lead = (target.max() - last_actual) / pd.Timedelta(hours=1)
+    if lead > horizon.min_lag_hours:
+        raise NoDataError(
+            f"latest actual {last_actual} is {lead:.0f}h before the last target hour "
+            f"{target.max()} - beyond the {horizon.min_lag_hours}h cutoff of {horizon.name}"
+        )
+    return target
+
+
 def ensure_weather(
     engine: Engine, target: pd.DatetimeIndex, weather_client: WeatherClient | None
 ) -> None:
@@ -135,13 +178,14 @@ def build_serving_features(
     engine: Engine,
     *,
     weather_client: WeatherClient | None = None,
+    horizon: Horizon = DAY_AHEAD,
     hours: int = DAY_AHEAD_HOURS,
     as_of: pd.Timestamp | None = None,
 ) -> tuple[pd.DataFrame, pd.Timestamp]:
     """Return ``(full feature frame for the target hours, last_actual)``.
 
-    ``as_of`` pretends the latest known load is at/before that time (for backtests);
-    default is the real latest actual in the database.
+    ``as_of`` pretends the forecast is issued at that time, with the latest known load
+    at/before it (for backtests); default is now and the real latest actual.
     """
     last_actual = db.latest_timestamp(engine, db.LoadActual, source=SOURCE_SMARD)
     if last_actual is None:
@@ -149,7 +193,8 @@ def build_serving_features(
     if as_of is not None:
         last_actual = min(last_actual, db.to_utc(as_of).floor("h"))
 
-    target = forecast_window(last_actual, hours)
+    issued = db.to_utc(as_of) if as_of is not None else pd.Timestamp.now(tz="UTC")
+    target = target_window(horizon, last_actual, issued, hours)
     hist_start = last_actual - pd.Timedelta(hours=HISTORY_HOURS)
     history = db.read_load(engine, start=hist_start, end=last_actual)
     if history.empty or history["timestamp_utc"].max() != last_actual:
@@ -167,9 +212,9 @@ def build_serving_features(
     frame = build_feature_frame(load, weather_avg, dropna=False)
     served = frame.loc[target]
 
-    # Every day-ahead feature must be fully observed (no NaN lags); weather may be NaN.
+    # Every lag the horizon allows must be fully observed (no NaN lags); weather may be NaN.
     lag_cols = [
-        c for c in select_features(served.columns, DAY_AHEAD) if most_recent_load_lag(c) is not None
+        c for c in select_features(served.columns, horizon) if most_recent_load_lag(c) is not None
     ]
     if served[lag_cols].isna().any().any():
         bad = served[lag_cols].isna().sum()
@@ -192,8 +237,9 @@ def make_day_ahead_forecast(
     hours: int = DAY_AHEAD_HOURS,
     as_of: pd.Timestamp | None = None,
 ) -> ForecastResult:
+    """Forecast the champion's horizon; ``hours`` only applies to the rolling day-ahead one."""
     served, last_actual = build_serving_features(
-        engine, weather_client=weather_client, hours=hours, as_of=as_of
+        engine, weather_client=weather_client, horizon=model.horizon, hours=hours, as_of=as_of
     )
     model.check_features(list(served.columns))  # exact train/serve feature parity
     X = served[model.features]
@@ -205,7 +251,8 @@ def make_day_ahead_forecast(
     frame.insert(0, "forecast_mw", pred)
     issued_at = pd.Timestamp(datetime.now(UTC))
     log.info(
-        "day-ahead forecast %s -> %s by %s: mean %.0f MW",
+        "%s forecast %s -> %s by %s: mean %.0f MW",
+        model.horizon.name,
         frame.index.min(),
         frame.index.max(),
         model.version_label,

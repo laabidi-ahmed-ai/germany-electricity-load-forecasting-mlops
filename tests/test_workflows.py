@@ -74,7 +74,22 @@ def test_scheduled_workflows_have_cron_and_manual_dispatch(name: str) -> None:
 def test_bootstrap_is_manual_only() -> None:
     on = load("bootstrap.yml")["on"]
     assert list(on) == ["workflow_dispatch"]
-    assert {"start", "skip_backfill", "skip_training"} <= set(on["workflow_dispatch"]["inputs"])
+    inputs = on["workflow_dispatch"]["inputs"]
+    assert {"start", "skip_backfill", "skip_training", "horizon", "promote"} <= set(inputs)
+    assert inputs["horizon"]["options"] == ["day_ahead", "d_plus_1"]
+    assert inputs["horizon"]["default"] == "day_ahead" and inputs["promote"]["default"] is True
+
+
+def test_bootstrap_can_evaluate_a_horizon_without_touching_production() -> None:
+    """promote=false trains + backtests only: no registration, no forecast, no monitoring event."""
+    by_name = {s.get("name", ""): s for s in steps(load("bootstrap.yml"))}
+    train_step = next(s for n, s in by_name.items() if n.startswith("Train"))
+    assert '--horizon "${{ inputs.horizon }}"' in train_step["run"]
+    backtest = next(s for n, s in by_name.items() if n.startswith("Out-of-sample backtest"))
+    assert "!inputs.promote" in backtest["if"] and "--horizon" in backtest["run"]
+    for prefix in ("Register", "First forecast", "Monitoring check"):
+        step = next(s for n, s in by_name.items() if n.startswith(prefix))
+        assert "inputs.promote" in step["if"] and "!inputs.promote" not in step["if"]
 
 
 @pytest.mark.parametrize("name", sorted(SCHEDULED | {"bootstrap.yml"}))

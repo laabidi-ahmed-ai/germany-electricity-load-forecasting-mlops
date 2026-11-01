@@ -312,3 +312,23 @@ def test_train_cli_cv_only_stops_after_the_report(frame, tmp_path, monkeypatch, 
 class _FastForecaster(train.LightGBMForecaster):
     def __init__(self, params=None):
         super().__init__({**FAST_LGBM, **(params or {})})
+
+
+def test_baselines_never_see_what_the_horizon_hides() -> None:
+    from src.features.horizons import D_PLUS_1
+    from src.models.baselines import baseline_factories
+
+    assert set(baseline_factories(DAY_AHEAD)) == {"seasonal_naive_24", "seasonal_naive_168"}
+    assert set(baseline_factories(D_PLUS_1)) == {"seasonal_naive_48", "seasonal_naive_168"}
+
+
+def test_cv_on_d_plus_1_compares_against_the_honest_baselines(frame) -> None:
+    from src.features.horizons import D_PLUS_1
+    from src.models.baselines import baseline_factories
+
+    factories = {**baseline_factories(D_PLUS_1), "lightgbm": train.lightgbm_factory(FAST_LGBM)}
+    cv = cross_validate(
+        frame, factories, D_PLUS_1, n_splits=3, val_hours=48, min_train_hours=24 * 20
+    )
+    assert cv.horizon == "d_plus_1" and "load_lag_24" not in cv.features
+    assert set(cv.beats_baselines()) == {"seasonal_naive_48", "seasonal_naive_168"}

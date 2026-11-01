@@ -32,7 +32,6 @@ DEFAULT_VAL_HOURS = 24 * 30  # one-month folds -> 12 folds = the last year
 DEFAULT_MIN_TRAIN_HOURS = 24 * 365
 
 METRICS = ("mae", "rmse", "mape")
-BASELINE_NAMES = ("seasonal_naive_24", "seasonal_naive_168")
 CHALLENGER_NAME = "lightgbm"
 
 
@@ -69,14 +68,16 @@ class CVResult:
     def beats_baselines(
         self,
         challenger: str = CHALLENGER_NAME,
-        baselines: tuple[str, ...] = BASELINE_NAMES,
+        baselines: tuple[str, ...] | None = None,
         metric: str = "mae",
     ) -> dict[str, dict[str, Any]]:
-        """Per baseline: does the challenger have a lower mean ``metric``, and by how much?"""
+        """Per baseline (default: every other model in the CV): is the challenger better?"""
         out: dict[str, dict[str, Any]] = {}
         if challenger not in self.summary.index:
             return out
         c = self.mean(challenger, metric)
+        if baselines is None:
+            baselines = tuple(m for m in self.summary.index if m != challenger)
         for b in baselines:
             if b not in self.summary.index:
                 continue

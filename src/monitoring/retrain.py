@@ -41,9 +41,8 @@ from sqlalchemy.engine import Engine
 from config.log import configure_logging
 from src.data import db
 from src.features.build_features import TARGET, build_features
-from src.features.horizons import DAY_AHEAD
 from src.models import evaluate, registry, train
-from src.models.baselines import BASELINE_FACTORIES
+from src.models.baselines import baseline_factories
 from src.models.registry import LoadedModel
 from src.models.tracking import DEFAULT_EXPERIMENT, setup_mlflow
 from src.monitoring import drift as drift_mod
@@ -304,8 +303,10 @@ def run_champion_challenger(
             triggers=triggers or [],
         )
 
+    # The challenger competes on the champion's horizon (same target, same information).
+    horizon = champion.horizon
     candidate, cols = train.fit_model(
-        frame[frame.index < holdout.index.min()], DAY_AHEAD, cfg.lgbm_params
+        frame[frame.index < holdout.index.min()], horizon, cfg.lgbm_params
     )
     champ_m = compute_metrics(holdout[TARGET], champion.predict(holdout))
     cand_m = compute_metrics(holdout[TARGET], candidate.predict(holdout[cols]))
@@ -339,15 +340,15 @@ def run_champion_challenger(
     # Refit the winner on everything, log it exactly like `make train`, register, promote.
     cv = evaluate.cross_validate(
         frame,
-        {**BASELINE_FACTORIES, train.MODEL_NAME: train.lightgbm_factory(cfg.lgbm_params)},
-        DAY_AHEAD,
+        {**baseline_factories(horizon), train.MODEL_NAME: train.lightgbm_factory(cfg.lgbm_params)},
+        horizon,
         n_splits=cfg.cv_n_splits,
         val_hours=cfg.cv_val_hours,
         min_train_hours=cfg.cv_min_train_hours,
     )
-    final, final_cols = train.fit_model(frame, DAY_AHEAD, cfg.lgbm_params)
+    final, final_cols = train.fit_model(frame, horizon, cfg.lgbm_params)
     run_id = train.log_training_run(
-        final, final_cols, cv, DAY_AHEAD, frame, run_name="retrain_challenger"
+        final, final_cols, cv, horizon, frame, run_name="retrain_challenger"
     )
     mv = registry.register_run_model(run_id)
     registry.promote(mv.version, engine=engine)
