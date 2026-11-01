@@ -336,15 +336,51 @@ def test_latest_check_parses_triggers_and_drift(seeded: Engine) -> None:
     assert len(events) == 3 and events["created_at"].is_monotonic_decreasing
     check = q.latest_check(events)
     assert check is not None and check["triggered"] and check["model_version"] == "2"
-    assert check["as_of"] == pd.Timestamp(
-        "2024-01-11T00:00Z"
-    )  # the latest *check*, not the retrain
+    assert check["as_of"] == pd.Timestamp("2024-01-11T00:00Z")
+    assert check["created_at"] == pd.Timestamp("2024-01-11T06:30Z")  # the retrain pass
     assert list(check["checks"]["name"]) == ["error", "official", "drift"]
     assert list(check["checks"]["fired"]) == [False, False, True]
     assert check["drift"]["share_drifted"] == 0.5
     # per-column table = monitored columns + the prediction column (target absent)
     assert list(check["drift_columns"]["column"]) == ["load_lag_24", "temp", "prediction"]
     assert list(check["drift_columns"]["drifted"]) == [True, False, False]
+
+
+def test_latest_check_is_a_newer_triggered_retrain_not_a_stale_clear_check(
+    engine: Engine,
+) -> None:
+    """A triggered pass is recorded only as ``retrain``; it must not hide behind day 1."""
+    decision_day2 = {
+        "checks": [
+            {"name": "error", "fired": True, "value": 5.1, "threshold": 4.0, "detail": "MAPE"},
+        ],
+        "drift": None,
+    }
+    db.insert_monitoring_event(
+        engine,
+        created_at=datetime(2024, 1, 1, 6, tzinfo=UTC),
+        as_of=datetime(2024, 1, 1, tzinfo=UTC),
+        kind="check",
+        triggered=False,
+        model_version="1",
+        details=json.dumps({"decision": {"checks": [], "drift": None}, "outcome": None}),
+    )
+    db.insert_monitoring_event(
+        engine,
+        created_at=datetime(2024, 1, 2, 6, tzinfo=UTC),
+        as_of=datetime(2024, 1, 2, tzinfo=UTC),
+        kind="retrain",
+        triggered=True,
+        decision="kept",
+        reason="challenger not better",
+        model_version="1",
+        details=json.dumps({"decision": decision_day2, "outcome": {"decision": "kept"}}),
+    )
+    check = q.latest_check(q.monitoring_events(engine))
+    assert check is not None
+    assert check["as_of"] == pd.Timestamp("2024-01-02T00:00Z") and check["triggered"]
+    assert list(check["checks"]["name"]) == ["error"]
+    assert list(check["checks"]["fired"]) == [True]
 
 
 def test_event_timeline_status(seeded: Engine) -> None:

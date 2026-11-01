@@ -189,15 +189,18 @@ def _parse_details(text: str | None) -> dict[str, Any]:
 
 
 def latest_check(events: pd.DataFrame) -> dict[str, Any] | None:
-    """Trigger checks and drift report of the most recent monitoring check.
+    """Trigger checks and drift report of the most recent monitoring pass.
+
+    A clear pass is stored as a ``check`` event, a triggered one as a single ``retrain``
+    event; both carry ``details.decision.checks``, so the newest of either kind wins.
 
     Returns ``{"as_of", "model_version", "checks": DataFrame, "drift": dict | None,
     "drift_error": str | None, "drift_columns": DataFrame}`` or None.
     """
     if events.empty:
         return None
-    checks_only = events[events["kind"] == "check"]
-    row = (checks_only if not checks_only.empty else events).iloc[0]
+    passes = events[events["kind"].isin(["check", "retrain"])]
+    row = (passes if not passes.empty else events).iloc[0]
     decision = (row["details_parsed"] or {}).get("decision") or {}
     checks = pd.DataFrame(
         decision.get("checks") or [], columns=["name", "fired", "value", "threshold", "detail"]
