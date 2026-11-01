@@ -185,25 +185,34 @@ def promote(
     changes; if the pointer step fails, the alias is put back.
     """
     import mlflow
-    from mlflow.exceptions import MlflowException
 
     engine = engine or db.get_engine()
     setup_mlflow(experiment)
     if db.get_model_artifact(engine, name, str(version)) is None:
         export_model_version(engine, version, name=name, experiment=experiment)
     client = mlflow.MlflowClient()
-    try:
-        previous: str | None = client.get_model_version_by_alias(name, alias).version
-    except MlflowException:  # no alias yet (first promotion)
-        previous = None
+    # Read the alias map rather than catching a lookup error: a missing alias is simply
+    # absent here, so any MLflow error propagates before anything moves (treating a
+    # transient failure as "no alias" would later delete the real champion alias).
+    previous: str | None = client.get_registered_model(name).aliases.get(alias)
     client.set_registered_model_alias(name, alias, str(version))
     try:
         db.set_champion(engine, name, str(version))
     except Exception:
-        if previous is not None:
-            client.set_registered_model_alias(name, alias, previous)
-        else:
-            client.delete_registered_model_alias(name, alias)
+        try:
+            if previous is not None:
+                client.set_registered_model_alias(name, alias, previous)
+            else:
+                client.delete_registered_model_alias(name, alias)
+        except Exception:
+            log.exception(
+                "DB and MLflow now disagree: %s@%s points at version %s but the DB champion "
+                "did not move (alias was on %s) - promote again or fix the alias by hand",
+                name,
+                alias,
+                version,
+                previous or "(none)",
+            )
         raise
     pruned = db.prune_model_artifacts(engine, name, keep=keep_versions)
     log.info("%s@%s -> version %s (pruned %d old exports)", name, alias, version, pruned)

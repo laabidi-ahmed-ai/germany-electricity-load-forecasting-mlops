@@ -210,6 +210,85 @@ def test_promote_failing_db_pointer_restores_the_mlflow_alias(env, monkeypatch) 
     assert registry.champion_record(engine)["version"] == before
 
 
+def test_promote_alias_lookup_error_is_not_mistaken_for_no_alias(env, monkeypatch) -> None:
+    """A transient MLflow error reading the alias must stop the promotion before anything moves."""
+    import mlflow
+    from mlflow.exceptions import MlflowException
+    from mlflow.protos.databricks_pb2 import TEMPORARILY_UNAVAILABLE
+
+    engine = env["engine"]
+    before = registry.champion_record(engine)["version"]
+    alias_before = alias_version()
+    mv = registry.register_run_model(env["run_id"])
+    moved: list[tuple] = []
+
+    def flaky(self, *a, **k):
+        raise MlflowException("backend hiccup", error_code=TEMPORARILY_UNAVAILABLE)
+
+    with monkeypatch.context() as m, pytest.raises(MlflowException, match="backend hiccup"):
+        m.setattr(mlflow.MlflowClient, "get_registered_model", flaky)
+        m.setattr(mlflow.MlflowClient, "set_registered_model_alias", lambda s, *a: moved.append(a))
+        m.setattr(
+            mlflow.MlflowClient, "delete_registered_model_alias", lambda s, *a: moved.append(a)
+        )
+        registry.promote(mv.version, engine=engine)
+    assert moved == []  # neither alias call ran
+    assert alias_version() == alias_before
+    assert registry.champion_record(engine)["version"] == before
+
+
+def test_first_promotion_failing_db_pointer_removes_the_new_alias(env, monkeypatch) -> None:
+    import mlflow
+
+    engine = env["engine"]
+    name = "first-promotion-model"
+    mv = registry.register_run_model(env["run_id"], name=name)
+    assert mlflow.MlflowClient().get_registered_model(name).aliases == {}  # no alias yet
+
+    def boom(*a, **k):
+        raise RuntimeError("db down")
+
+    with monkeypatch.context() as m, pytest.raises(RuntimeError, match="db down"):
+        m.setattr(db, "set_champion", boom)
+        registry.promote(mv.version, engine=engine, name=name)
+    assert mlflow.MlflowClient().get_registered_model(name).aliases == {}  # alias removed
+    assert registry.champion_record(engine, name=name) is None
+
+
+def test_failed_alias_restore_logs_and_raises_the_original_db_error(
+    env, monkeypatch, caplog
+) -> None:
+    import mlflow
+
+    engine = env["engine"]
+    before = registry.champion_record(engine)["version"]
+    alias_before = alias_version()
+    mv = registry.register_run_model(env["run_id"])
+    original = mlflow.MlflowClient.set_registered_model_alias
+    calls: list[str] = []
+
+    def move_then_fail(self, name, alias, version):
+        calls.append(str(version))
+        if len(calls) > 1:  # the restore
+            raise RuntimeError("mlflow unreachable")
+        return original(self, name, alias, version)
+
+    def boom(*a, **k):
+        raise RuntimeError("db down")
+
+    with monkeypatch.context() as m, pytest.raises(RuntimeError, match="db down"):
+        m.setattr(db, "set_champion", boom)
+        m.setattr(mlflow.MlflowClient, "set_registered_model_alias", move_then_fail)
+        caplog.set_level("ERROR", logger=registry.log.name)
+        registry.promote(mv.version, engine=engine)
+    assert calls == [str(mv.version), str(alias_before)]  # moved, then tried to restore
+    (record,) = [r for r in caplog.records if "disagree" in r.getMessage()]
+    assert str(mv.version) in record.getMessage() and str(alias_before) in record.getMessage()
+    assert record.exc_info is not None  # logged with the restore traceback
+    assert registry.champion_record(engine)["version"] == before
+    original(mlflow.MlflowClient(), registry.REGISTERED_MODEL_NAME, "champion", alias_before)
+
+
 def test_promote_prunes_old_exports_but_never_the_champion(env) -> None:
     engine = env["engine"]
     champ = registry.champion_record(engine)["version"]
