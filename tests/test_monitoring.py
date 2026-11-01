@@ -265,6 +265,25 @@ def test_seasonal_reference_selects_same_season_of_past_years() -> None:
     assert not ((ref2.index.month == 1) & (ref2.index.day > 7)).any()
 
 
+def test_seasonal_reference_current_window_spanning_new_year() -> None:
+    """Dec 11 -> Jan 10 (lo=338 > hi=17 before the fix) must select Dec + Jan, not nothing."""
+    idx = pd.date_range("2021-01-01", "2025-01-10T23:00", freq="h", tz="UTC")
+    training = pd.DataFrame({"x": np.arange(len(idx))}, index=idx)
+    current = pd.date_range("2024-12-11", "2025-01-10T23:00", freq="h", tz="UTC")
+    ref = drift_mod.seasonal_reference(training, current, pad_days=7)
+    assert len(ref) > 0
+    assert set(ref.index.month) == {12, 1}
+    assert (ref.index < current.min()).all()  # past years only (+ the pad before the window)
+    assert {2021, 2022, 2023} <= set(ref.index[ref.index.month == 12].year)
+    assert {2021, 2022, 2023, 2024} <= set(ref.index[ref.index.month == 1].year)
+    assert not ((ref.index.month == 12) & (ref.index.day < 3)).any()  # Dec 11 - 7 d (+ leap)
+    assert not ((ref.index.month == 1) & (ref.index.day > 17)).any()  # Jan 10 + 7 d
+    # a window plus pad covering a whole year keeps every past row
+    long = pd.date_range("2023-06-01", "2024-05-31T23:00", freq="h", tz="UTC")
+    full = drift_mod.seasonal_reference(training, long, pad_days=7)
+    assert len(full) == (training.index < long.min()).sum()
+
+
 def test_summarize_metrics_reads_evidently_structure() -> None:
     metrics = fake_runner({"a"})(None, None, ["a", "b"], 0.25)
     out = drift_mod.summarize_metrics(metrics)
@@ -493,6 +512,24 @@ def test_drift_trigger_fires_and_drift_errors_are_contained(engine, cfg) -> None
     )
     assert not d.checks[2].fired and "error: evidently exploded" in d.checks[2].detail
     assert d.drift is None and d.drift_error == "evidently exploded"
+
+
+def test_empty_drift_result_is_unavailable_not_no_drift(engine, cfg) -> None:
+    """A runner that scores no monitored column must not read as a clean 0/0 report."""
+    load = seed_db(engine, days=120, with_model=False)
+    frame = feature_frame(load)
+    champ = fake_loaded_model(select_features(frame.columns, DAY_AHEAD))
+
+    def empty(*a, **k):
+        return []
+
+    with pytest.raises(RuntimeError, match="no result"):
+        drift_mod.compute_drift(engine, champ, window_days=30, frame=frame, runner=empty)
+    d = retrain.evaluate_triggers(
+        engine, champ, cfg, as_of=load["timestamp_utc"].max(), frame=frame, drift_runner=empty
+    )
+    assert d.drift is None and "no result" in d.drift_error  # -> drift.unavailable = 1
+    assert not d.checks[2].fired and d.checks[2].detail.startswith("error:")
 
 
 # --- Champion / challenger ---

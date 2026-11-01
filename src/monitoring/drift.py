@@ -72,13 +72,18 @@ def seasonal_reference(
     training: pd.DataFrame, current_index: pd.DatetimeIndex, *, pad_days: int = DEFAULT_PAD_DAYS
 ) -> pd.DataFrame:
     """Training rows whose day-of-year lies within the current window (± pad), any year."""
-    lo = int(current_index.min().dayofyear) - pad_days
-    hi = int(current_index.max().dayofyear) + pad_days
+    start, end = current_index.min(), current_index.max()
     doy = training.index.dayofyear
-    if lo < 1 or hi > 366:  # window wraps the year boundary
-        mask = (doy >= (lo % 366 or 366)) | (doy <= (hi % 366 or 366))
+    if end - start + pd.Timedelta(days=2 * pad_days) >= pd.Timedelta(days=365):
+        mask = doy >= 1  # window (+ pad) covers a whole year: every day matches
     else:
-        mask = (doy >= lo) & (doy <= hi)
+        # Normalise both bounds into 1..366; lo > hi then means the window wraps the year
+        # boundary - either through the pad (Jan 3 - 7 d) or because the current window
+        # itself spans New Year (Dec 11 -> Jan 10 gives lo=338, hi=17).
+        lo = (int(start.dayofyear) - pad_days - 1) % 366 + 1
+        hi = (int(end.dayofyear) + pad_days - 1) % 366 + 1
+        after_lo, before_hi = doy >= lo, doy <= hi
+        mask = (after_lo | before_hi) if lo > hi else (after_lo & before_hi)
     mask &= training.index < current_index.min()  # reference is strictly in the past
     return training[mask]
 
@@ -279,6 +284,10 @@ def compute_drift(
 
     per_column = summarize_metrics(runner(reference, current, [*columns, *extra], column_threshold))
     missing = [c for c in columns if c not in per_column]
+    if columns and len(missing) == len(columns):
+        # An empty result would read as "0/0 drifted -> no drift"; fail loudly instead so
+        # the trigger records drift_error and drift.unavailable fires.
+        raise RuntimeError(f"drift runner returned no result for any monitored column {columns}")
     if missing:
         notes.append(f"no drift result for: {missing}")
 
