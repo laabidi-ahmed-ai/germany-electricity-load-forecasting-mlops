@@ -54,6 +54,7 @@ DEFAULT_DRIFT_SHARE = 0.5  # >= this share of monitored features drifted -> data
 DEFAULT_COLUMN_THRESHOLD = 0.25  # normed Wasserstein distance per column (see module doc)
 PREDICTION_COL = "prediction"
 MIN_CURRENT_ROWS = 24 * 3
+MIN_COLUMN_COVERAGE = 0.5  # < this share of monitored columns scored -> drift unavailable
 
 Runner = Callable[[pd.DataFrame, pd.DataFrame, list[str], float], list[dict[str, Any]]]
 
@@ -282,12 +283,19 @@ def compute_drift(
     if TARGET in current.columns and current[TARGET].notna().all():
         extra.append(TARGET)
 
+    # Too few scored columns would decide drift from one or two features (or read as
+    # "0/0 drifted -> no drift"); fail loudly instead so the trigger records drift_error
+    # and drift.unavailable fires.
+    if not columns:
+        raise RuntimeError("drift unavailable: the champion's horizon has no monitored columns")
     per_column = summarize_metrics(runner(reference, current, [*columns, *extra], column_threshold))
     missing = [c for c in columns if c not in per_column]
-    if columns and len(missing) == len(columns):
-        # An empty result would read as "0/0 drifted -> no drift"; fail loudly instead so
-        # the trigger records drift_error and drift.unavailable fires.
-        raise RuntimeError(f"drift runner returned no result for any monitored column {columns}")
+    scored = len(columns) - len(missing)
+    if scored < MIN_COLUMN_COVERAGE * len(columns):
+        raise RuntimeError(
+            f"drift unavailable: runner scored only {scored}/{len(columns)} monitored columns "
+            f"(< {MIN_COLUMN_COVERAGE:.0%}); missing {missing}"
+        )
     if missing:
         notes.append(f"no drift result for: {missing}")
 
