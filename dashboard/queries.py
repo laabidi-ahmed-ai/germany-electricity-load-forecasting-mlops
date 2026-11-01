@@ -189,19 +189,29 @@ def _parse_details(text: str | None) -> dict[str, Any]:
 
 
 def latest_check(events: pd.DataFrame) -> dict[str, Any] | None:
-    """Trigger checks and drift report of the most recent monitoring pass.
+    """Trigger checks, drift report and outcome of the most recent monitoring pass.
 
-    A clear pass is stored as a ``check`` event, a triggered one as a single ``retrain``
-    event; both carry ``details.decision.checks``, so the newest of either kind wins.
+    A clear pass is stored as an ``EVENT_CHECK`` event; a pass that ran the champion/
+    challenger (triggered or forced) as a single ``EVENT_RETRAIN`` event. Both carry
+    ``details.decision.checks``, so the newest of either kind wins.
 
-    Returns ``{"as_of", "model_version", "checks": DataFrame, "drift": dict | None,
-    "drift_error": str | None, "drift_columns": DataFrame}`` or None.
+    Returns ``{"as_of", "created_at", "kind", "model_version" (champion the pass checked),
+    "champion_version" (champion after the pass), "triggered", "forced", "outcome"
+    (promoted | kept | skipped | promoted (dry-run) | None), "checks": DataFrame,
+    "drift": dict | None, "drift_error": str | None, "drift_columns": DataFrame}`` or None.
     """
-    if events.empty:
+    passes = events[events["kind"].isin([db.EVENT_CHECK, db.EVENT_RETRAIN])]
+    if passes.empty:
         return None
-    passes = events[events["kind"].isin(["check", "retrain"])]
-    row = (passes if not passes.empty else events).iloc[0]
-    decision = (row["details_parsed"] or {}).get("decision") or {}
+    row = passes.iloc[0]
+    details = row["details_parsed"] or {}
+    decision = details.get("decision") or {}
+    outcome = details.get("outcome") or {}
+    is_retrain = row["kind"] == db.EVENT_RETRAIN
+    promoted = is_retrain and outcome.get("decision") == "promoted"
+    # A forced run is the only retrain that no trigger fired.
+    forced = is_retrain and (outcome.get("triggers") == ["forced"] or not bool(row["triggered"]))
+    champion_after = (promoted and outcome.get("challenger_version")) or row["model_version"]
     checks = pd.DataFrame(
         decision.get("checks") or [], columns=["name", "fired", "value", "threshold", "detail"]
     )
@@ -217,13 +227,37 @@ def latest_check(events: pd.DataFrame) -> dict[str, Any] | None:
     return {
         "as_of": row["as_of"],
         "created_at": row["created_at"],
+        "kind": row["kind"],
         "model_version": row["model_version"],
+        "champion_version": champion_after,
         "triggered": bool(row["triggered"]),
+        "forced": forced,
+        "outcome": (outcome.get("decision") or None) if is_retrain else None,
         "checks": checks,
         "drift": drift,
         "drift_error": decision.get("drift_error"),
         "drift_columns": columns,
     }
+
+
+OUTCOME_TEXT = {
+    "kept": "champion kept",
+    "skipped": "challenger skipped",
+    "promoted (dry-run)": "dry run: challenger would be promoted",
+}
+
+
+def pass_headline(check: dict[str, Any]) -> str:
+    """One status line for the latest pass: what fired and what the retrain did."""
+    if check["kind"] != db.EVENT_RETRAIN:
+        return "🔴 retraining triggered" if check["triggered"] else "🟢 all triggers clear"
+    state = "🟠 retrain forced" if check["forced"] else "🔴 retraining triggered"
+    outcome = check["outcome"]
+    if outcome == "promoted":
+        result = f"challenger promoted → v{check['champion_version']}"
+    else:
+        result = OUTCOME_TEXT.get(outcome, outcome or "no outcome recorded")
+    return f"{state} · {result}"
 
 
 def event_timeline(events: pd.DataFrame) -> pd.DataFrame:
@@ -243,8 +277,8 @@ def event_timeline(events: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=cols)
 
     def status(row: pd.Series) -> str:
-        if row["kind"] == "retrain":
-            return str(row["decision"] or "retrain")
+        if row["kind"] == db.EVENT_RETRAIN:
+            return str(row["decision"] or db.EVENT_RETRAIN)
         return "triggered" if row["triggered"] else "ok"
 
     out = events.assign(status=events.apply(status, axis=1))

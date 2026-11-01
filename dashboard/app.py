@@ -26,6 +26,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from config.settings import get_settings  # noqa: E402
 from dashboard import queries as q  # noqa: E402
+from src.data.db import EVENT_CHECK, EVENT_RETRAIN  # noqa: E402
 
 CACHE_TTL_SECONDS = 10 * 60
 COLORS = {
@@ -325,13 +326,13 @@ def panel_monitoring(mon: dict[str, Any], tz: str) -> None:
 
     left, right = st.columns([3, 2])
     with left:
-        st.markdown("**Latest check**")
+        st.markdown("**Latest monitoring pass**")
         if check is None:
             st.info("No monitoring events yet - the daily monitor job has not run.")
         else:
-            state = "🔴 retraining triggered" if check["triggered"] else "🟢 all triggers clear"
             st.markdown(
-                f"{state} · as of {fmt_ts(check['as_of'], tz)} · champion v{check['model_version']}"
+                f"{q.pass_headline(check)} · as of {fmt_ts(check['as_of'], tz)} · "
+                f"champion v{check['champion_version']}"
             )
             checks = check["checks"]
             if not checks.empty:
@@ -454,7 +455,7 @@ def panel_monitoring(mon: dict[str, Any], tz: str) -> None:
         height=220,
         margin={"l": 10, "r": 10, "t": 10, "b": 10},
         xaxis_title=f"time ({tz})",
-        yaxis={"categoryorder": "array", "categoryarray": ["retrain", "check"]},
+        yaxis={"categoryorder": "array", "categoryarray": [EVENT_RETRAIN, EVENT_CHECK]},
         legend={"orientation": "h", "y": 1.2, "x": 0},
     )
     st.plotly_chart(fig, width="stretch")

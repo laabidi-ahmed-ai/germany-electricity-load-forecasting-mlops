@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -381,6 +382,60 @@ def test_latest_check_is_a_newer_triggered_retrain_not_a_stale_clear_check(
     assert check["as_of"] == pd.Timestamp("2024-01-02T00:00Z") and check["triggered"]
     assert list(check["checks"]["name"]) == ["error"]
     assert list(check["checks"]["fired"]) == [True]
+
+
+def record_pass(engine: Engine, *, kind: str, triggered: bool, outcome: dict | None) -> None:
+    """One monitoring pass as ``retrain.record_event`` stores it (champion v5 checked)."""
+    db.insert_monitoring_event(
+        engine,
+        created_at=datetime(2024, 1, 2, 6, tzinfo=UTC),
+        as_of=datetime(2024, 1, 2, tzinfo=UTC),
+        kind=kind,
+        triggered=triggered,
+        decision=outcome["decision"] if outcome else None,
+        model_version="5",
+        details=json.dumps({"decision": {"checks": [], "drift": None}, "outcome": outcome}),
+    )
+
+
+def test_latest_pass_forced_retrain_that_promoted(engine: Engine) -> None:
+    outcome = {
+        "decision": "promoted",
+        "champion_version": "5",
+        "challenger_version": "6",
+        "triggers": ["forced"],
+    }
+    record_pass(engine, kind=db.EVENT_RETRAIN, triggered=False, outcome=outcome)
+    check = q.latest_check(q.monitoring_events(engine))
+    assert check["forced"] and not check["triggered"] and check["outcome"] == "promoted"
+    assert check["model_version"] == "5" and check["champion_version"] == "6"  # after the pass
+    assert q.pass_headline(check) == "🟠 retrain forced · challenger promoted → v6"
+
+
+def test_latest_pass_triggered_retrain_that_kept_the_champion(engine: Engine) -> None:
+    outcome = {"decision": "kept", "champion_version": "5", "triggers": ["drift"]}
+    record_pass(engine, kind=db.EVENT_RETRAIN, triggered=True, outcome=outcome)
+    check = q.latest_check(q.monitoring_events(engine))
+    assert check["triggered"] and not check["forced"] and check["outcome"] == "kept"
+    assert check["champion_version"] == "5"
+    assert q.pass_headline(check) == "🔴 retraining triggered · champion kept"
+
+
+def test_latest_pass_clear_check_is_unchanged(engine: Engine) -> None:
+    record_pass(engine, kind=db.EVENT_CHECK, triggered=False, outcome=None)
+    check = q.latest_check(q.monitoring_events(engine))
+    assert not check["triggered"] and not check["forced"] and check["outcome"] is None
+    assert check["champion_version"] == check["model_version"] == "5"
+    assert q.pass_headline(check) == "🟢 all triggers clear"
+
+
+def test_event_kinds_are_defined_once() -> None:
+    """The writer (retrain) and the reader (dashboard) use the same kind strings."""
+    from src.monitoring import retrain
+
+    clear = SimpleNamespace(reasons=[])
+    assert retrain._kind_and_reason(clear, None)[0] == db.EVENT_CHECK
+    assert retrain._kind_and_reason(clear, SimpleNamespace(reason="r"))[0] == db.EVENT_RETRAIN
 
 
 def test_event_timeline_status(seeded: Engine) -> None:

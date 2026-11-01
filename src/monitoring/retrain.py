@@ -380,8 +380,8 @@ def _kind_and_reason(
 ) -> tuple[str, str]:
     """``(kind, reason)`` of one monitoring pass, shared by the MLflow run and the DB event."""
     if outcome is not None:
-        return "retrain", outcome.reason
-    return "check", "; ".join(decision.reasons)
+        return db.EVENT_RETRAIN, outcome.reason
+    return db.EVENT_CHECK, "; ".join(decision.reasons)
 
 
 def log_decision(

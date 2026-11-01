@@ -54,6 +54,11 @@ DateLike = date | datetime | str | pd.Timestamp
 # forecast come from SMARD (the column stays in the key so another source can sit beside it).
 SOURCE_SMARD = "smard"
 
+# ``kind`` of a monitoring event: one per pass - a clear pass is a check, a pass that ran the
+# champion/challenger (triggered or forced) is a retrain. Here so the dashboard can share them.
+EVENT_CHECK = "check"
+EVENT_RETRAIN = "retrain"
+
 
 # --- UTC handling ---
 def to_utc(value: DateLike) -> pd.Timestamp:
@@ -166,8 +171,8 @@ class LoadForecastModel(Base):
 class MonitoringEvent(Base):
     """One row per monitoring / retraining decision (the dashboard's event timeline).
 
-    ``kind`` = ``check`` (performance + drift evaluation) | ``retrain`` (champion/
-    challenger outcome). ``details`` holds the full JSON summary.
+    ``kind`` = ``EVENT_CHECK`` (performance + drift evaluation) | ``EVENT_RETRAIN`` (the same
+    plus the champion/challenger outcome). ``details`` holds the full JSON summary.
     """
 
     __tablename__ = "monitoring_events"
