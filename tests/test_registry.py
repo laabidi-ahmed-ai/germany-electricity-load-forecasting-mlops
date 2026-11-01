@@ -176,6 +176,40 @@ def test_promote_moves_both_pointers_rollback(env) -> None:
     assert registry.load_champion(engine, cache_dir=env["cache"]).version == str(v1)
 
 
+def test_promote_failing_mlflow_alias_leaves_the_db_champion_unchanged(env, monkeypatch) -> None:
+    import mlflow
+
+    engine = env["engine"]
+    before = registry.champion_record(engine)["version"]
+    alias_before = alias_version()
+    mv = registry.register_run_model(env["run_id"])
+
+    def boom(self, *a, **k):
+        raise RuntimeError("mlflow unreachable")
+
+    with monkeypatch.context() as m, pytest.raises(RuntimeError, match="mlflow unreachable"):
+        m.setattr(mlflow.MlflowClient, "set_registered_model_alias", boom)
+        registry.promote(mv.version, engine=engine)
+    assert registry.champion_record(engine)["version"] == before  # serving untouched
+    assert alias_version() == alias_before
+
+
+def test_promote_failing_db_pointer_restores_the_mlflow_alias(env, monkeypatch) -> None:
+    engine = env["engine"]
+    before = registry.champion_record(engine)["version"]
+    alias_before = alias_version()
+    mv = registry.register_run_model(env["run_id"])
+
+    def boom(*a, **k):
+        raise RuntimeError("db down")
+
+    with monkeypatch.context() as m, pytest.raises(RuntimeError, match="db down"):
+        m.setattr(db, "set_champion", boom)
+        registry.promote(mv.version, engine=engine)
+    assert alias_version() == alias_before != mv.version  # alias put back
+    assert registry.champion_record(engine)["version"] == before
+
+
 def test_promote_prunes_old_exports_but_never_the_champion(env) -> None:
     engine = env["engine"]
     champ = registry.champion_record(engine)["version"]

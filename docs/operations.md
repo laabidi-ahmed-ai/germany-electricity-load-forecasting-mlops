@@ -74,8 +74,11 @@ Any service that can send a scheduled HTTP POST works; these steps use
   It trains, registers and promotes the D+1 champion and issues its first forecast; from
   then on the daily jobs, monitoring and retraining follow the champion's horizon. Roll
   back with the command below.
-- **Roll back the model.** With `DATABASE_URL` in `.env`:
-  `python -m src.models.registry --promote <previous version>`.
+- **Roll back the model.** With `DATABASE_URL` **and** `MLFLOW_TRACKING_URI` in `.env`
+  (the same store the workflows use: the `MLFLOW_TRACKING_URI` secret if set, else the
+  `DATABASE_URL` value - the local default `sqlite:///mlruns/mlflow.db` is the wrong
+  registry): `python -m src.models.registry --promote <previous version>`. The MLflow alias
+  moves first; if it fails, the champion serving reads is left unchanged.
 - **Rotate the database password.** Neon → *Roles* → the owner role → *Reset password*;
   paste the new connection string into the GitHub secret `DATABASE_URL` (plain URL, **no
   quotes**); run *ingest* manually and check it is green. The dashboard uses its own

@@ -179,15 +179,32 @@ def promote(
     experiment: str = DEFAULT_EXPERIMENT,
     keep_versions: int = KEEP_EXPORTED_VERSIONS,
 ) -> None:
-    """Make ``version`` the champion: MLflow alias + DB export + DB pointer. Rollback = same call."""
+    """Make ``version`` the champion: DB export + MLflow alias + DB pointer. Rollback = same call.
+
+    The DB pointer is what serving reads, so it moves last: if the alias step fails, nothing
+    changes; if the pointer step fails, the alias is put back.
+    """
     import mlflow
+    from mlflow.exceptions import MlflowException
 
     engine = engine or db.get_engine()
     setup_mlflow(experiment)
     if db.get_model_artifact(engine, name, str(version)) is None:
         export_model_version(engine, version, name=name, experiment=experiment)
-    db.set_champion(engine, name, str(version))
-    mlflow.MlflowClient().set_registered_model_alias(name, alias, str(version))
+    client = mlflow.MlflowClient()
+    try:
+        previous: str | None = client.get_model_version_by_alias(name, alias).version
+    except MlflowException:  # no alias yet (first promotion)
+        previous = None
+    client.set_registered_model_alias(name, alias, str(version))
+    try:
+        db.set_champion(engine, name, str(version))
+    except Exception:
+        if previous is not None:
+            client.set_registered_model_alias(name, alias, previous)
+        else:
+            client.delete_registered_model_alias(name, alias)
+        raise
     pruned = db.prune_model_artifacts(engine, name, keep=keep_versions)
     log.info("%s@%s -> version %s (pruned %d old exports)", name, alias, version, pruned)
 

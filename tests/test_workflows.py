@@ -92,6 +92,14 @@ def test_bootstrap_can_evaluate_a_horizon_without_touching_production() -> None:
         assert "inputs.promote" in step["if"] and "!inputs.promote" not in step["if"]
 
 
+def test_promoting_workflows_share_one_concurrency_group() -> None:
+    """bootstrap and monitor-retrain both promote; two promotions must never overlap."""
+    groups = {name: load(name)["concurrency"] for name in ("bootstrap.yml", "monitor_retrain.yml")}
+    assert all(g == {"group": "promotion", "cancel-in-progress": False} for g in groups.values())
+    others = {load(n)["concurrency"]["group"] for n in ("ingest.yml", "forecast.yml", "ci.yml")}
+    assert "promotion" not in others
+
+
 @pytest.mark.parametrize("name", sorted(SCHEDULED | {"bootstrap.yml"}))
 def test_jobs_use_secrets_and_never_hardcode_them(name: str) -> None:
     wf = load(name)

@@ -34,8 +34,9 @@ on:
         type: boolean
         default: true
 
+# Shared with monitor_retrain.yml: both can promote, so they never run at the same time.
 concurrency:
-  group: bootstrap
+  group: promotion
   cancel-in-progress: false
 
 permissions:

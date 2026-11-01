@@ -29,8 +29,9 @@ on:
         type: boolean
         default: false
 
+# Shared with bootstrap.yml: both can promote, so they never run at the same time.
 concurrency:
-  group: monitor-retrain
+  group: promotion
   cancel-in-progress: false
 
 permissions:
