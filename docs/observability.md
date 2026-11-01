@@ -69,7 +69,7 @@ so the alert e-mails you. Create them in this order.
 | 1 | Ingest stopped | `sum(last_3h):sum:germany_load.job.run{job:ingest,runner:github} < 1` | below 1 | **Notify if data is missing for more than 180 minutes** |
 | 2 | Actual load data is stale | `min(last_2h):max:germany_load.data.freshness_hours{runner:github} > 6` | above 6 (warning 4.5) | off |
 | 3 | No forecast today | `min(last_1h):max:germany_load.forecast.age_hours{runner:github} > 25` | above 25 (warning 24.5) | off |
-| 4 | Model error above retrain threshold | `max(last_1d):max:germany_load.model.mape{window:7d,runner:github} > 3.5` | above 3.5 (warning 3.2) | off |
+| 4 | Model error above retrain threshold | `max(last_1d):max:germany_load.model.mape{window:7d,runner:github} > 4` | above 4 (warning 3.7) for the D+1 champion; 3.5 (warning 3.2) for the rolling day-ahead model | off |
 | 5 | A job failed | `max(last_1h):max:germany_load.job.failed{runner:github} by {job} > 0.5` | above 0.5 — choose **Multi Alert** (one alert per job) | off |
 | 6 | Drift check unavailable | `max(last_1d):max:germany_load.drift.unavailable{runner:github} > 0.5` | above 0.5 | off |
 
@@ -82,7 +82,8 @@ Why these six:
    missed, the ingest run at 06:20 UTC reports an age of ~24.6 h (warning) and the 07:20
    run ~25.6 h (alert). The hourly ingest reports this age, so the alert works even when
    the forecast job never started.
-4. **Model error** — the same 3.5 % 7-day MAPE the retrain trigger uses; the retrain loop
+4. **Model error** — the same 7-day MAPE limit the retrain trigger uses for the champion's
+   horizon (4.0 % for D+1, 3.5 % for the rolling day-ahead model); the retrain loop
    reacts on its own, this tells a human it is happening.
 5. **A job failed** — overlaps with GitHub's e-mails, but puts every signal in one place.
 6. **Drift check unavailable** — the drift check is allowed to fail without failing the

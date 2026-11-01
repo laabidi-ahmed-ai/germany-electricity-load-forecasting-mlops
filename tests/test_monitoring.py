@@ -442,6 +442,16 @@ def test_error_trigger_fires_on_high_mape(engine, cfg) -> None:
     assert d.triggered and any("MAPE" in r for r in d.reasons)
 
 
+def test_error_threshold_follows_the_champions_horizon() -> None:
+    """A harder task has a higher normal error, so D+1 gets its own limit."""
+    default = retrain.RetrainConfig()
+    assert retrain.mape_threshold(default, "day_ahead") == 3.5
+    assert retrain.mape_threshold(default, "d_plus_1") == 4.0
+    assert retrain.mape_threshold(default, "unknown") == 3.5
+    explicit = retrain.RetrainConfig(mape_threshold_pct=5.0)  # a CLI override always wins
+    assert retrain.mape_threshold(explicit, "d_plus_1") == 5.0
+
+
 def test_official_trigger_fires_when_benchmark_is_much_better(engine, cfg) -> None:
     load = seed_db(engine, days=60, model_noise=1_500, official_noise=300)
     frame = feature_frame(load)

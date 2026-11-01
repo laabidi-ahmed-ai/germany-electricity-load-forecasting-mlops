@@ -1,7 +1,9 @@
 """Retraining trigger + champion / challenger promotion (README §9).
 
 Any one of three triggers fires a retrain: the champion's rolling 7-day MAPE on its
-live forecasts exceeds ``mape_threshold_pct``; over 30 days the official forecast beats
+live forecasts exceeds its horizon's limit (``MAPE_THRESHOLD_BY_HORIZON``: about 1.4x the
+cross-validated MAPE - 3.5 % for day_ahead at 2.44 %, 4.0 % for d_plus_1 at 2.88 % -
+because a harder task has a higher normal error); over 30 days the official forecast beats
 the model by more than ``official_gap_pct``; or ``src.monitoring.drift`` flags dataset
 or prediction drift.
 
@@ -53,11 +55,16 @@ from src.observability import JobMetrics, job_metrics
 log = logging.getLogger(__name__)
 
 
+# 7-day MAPE above which the error trigger fires, per horizon: ~1.4x the CV MAPE.
+MAPE_THRESHOLD_BY_HORIZON: dict[str, float] = {"day_ahead": 3.5, "d_plus_1": 4.0}
+DEFAULT_MAPE_THRESHOLD = 3.5
+
+
 @dataclass(frozen=True)
 class RetrainConfig:
-    # error trigger
+    # error trigger (None = the champion's horizon limit from MAPE_THRESHOLD_BY_HORIZON)
     error_window_days: int = 7
-    mape_threshold_pct: float = 3.5
+    mape_threshold_pct: float | None = None
     # official-forecast trigger
     official_window_days: int = 30
     official_gap_pct: float = 15.0
@@ -73,6 +80,13 @@ class RetrainConfig:
     cv_n_splits: int = evaluate.DEFAULT_N_SPLITS
     cv_val_hours: int = evaluate.DEFAULT_VAL_HOURS
     cv_min_train_hours: int = evaluate.DEFAULT_MIN_TRAIN_HOURS
+
+
+def mape_threshold(cfg: RetrainConfig, horizon_name: str) -> float:
+    """An explicit ``cfg.mape_threshold_pct`` wins; otherwise the horizon's own limit."""
+    if cfg.mape_threshold_pct is not None:
+        return cfg.mape_threshold_pct
+    return MAPE_THRESHOLD_BY_HORIZON.get(horizon_name, DEFAULT_MAPE_THRESHOLD)
 
 
 DEFAULT_CONFIG = RetrainConfig()
@@ -157,18 +171,19 @@ def evaluate_triggers(
         model_version=champion.version,
     )
     w_err = perf.window(cfg.error_window_days)
+    limit = mape_threshold(cfg, champion.horizon.name)
     if w_err is not None and w_err.judged:
         checks.append(
             Check(
                 "error",
-                fired=w_err.model_mape > cfg.mape_threshold_pct,
+                fired=w_err.model_mape > limit,
                 value=w_err.model_mape,
-                threshold=cfg.mape_threshold_pct,
+                threshold=limit,
                 detail=f"{cfg.error_window_days}d MAPE {w_err.model_mape:.2f}% over {w_err.n_hours}h",
             )
         )
     else:
-        checks.append(_unjudged("error", w_err, cfg.mape_threshold_pct))
+        checks.append(_unjudged("error", w_err, limit))
 
     w_off = perf.window(cfg.official_window_days)
     if w_off is not None and w_off.judged:
@@ -489,7 +504,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument("--dry-run", action="store_true", help="never register / promote")
     p.add_argument("--as-of", default=None)
-    p.add_argument("--mape-threshold", type=float, default=RetrainConfig.mape_threshold_pct)
+    p.add_argument(
+        "--mape-threshold",
+        type=float,
+        default=None,
+        help="override the error trigger (default: the champion's horizon limit)",
+    )
     p.add_argument("--official-gap", type=float, default=RetrainConfig.official_gap_pct)
     p.add_argument("--drift-share", type=float, default=RetrainConfig.drift_share_threshold)
     p.add_argument("--drift-threshold", type=float, default=RetrainConfig.drift_column_threshold)

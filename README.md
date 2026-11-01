@@ -55,7 +55,7 @@ Demand is always moving. It rises on cold winter evenings (heating) and hot summ
 Once deployed, the system runs on its own:
 
 - **Every hour** — a scheduled job pulls the newest electricity-load figures (SMARD), the official day-ahead forecast, and the latest weather (Open-Meteo), and stores them in a cloud database. This is the continuous data collection that runs unattended.
-- **Every morning (05:40 UTC)** — a batch job produces the day-ahead forecast: expected load for each hour of the next 24 hours. It stores the forecast alongside the official grid-operator forecast for the same hours, so the two sit side by side. The monitoring job starts as soon as the forecast finishes.
+- **Every morning (05:40 UTC)** — a batch job produces the day-ahead forecast: expected load for each hour of **tomorrow, 00:00–24:00 Berlin time** — exactly the hours the official grid-operator forecast covers and the electricity market trades at noon. It stores the forecast alongside the official forecast for the same hours, so the two sit side by side. The monitoring job starts as soon as the forecast finishes.
 - **On demand** — a serving API returns the latest forecast instantly.
 - **Every day, looking back** — because yesterday's *actual* load has now been published, a job computes the model's error and the official forecast's error over the same period and updates the accuracy history.
 - **Continuously** — a monitor watches for data drift (incoming data moving away from the training distribution) and rising error. If either crosses a calibrated threshold, it triggers a retraining job: a fresh *challenger* model is trained on the latest data and promoted to production **only if it beats the current *champion*** on a held-out out-of-time window — with the previous model retained for rollback.
@@ -185,7 +185,7 @@ Day-ahead load forecasting is a **supervised** problem. The model progresses fro
 1. **Naive baselines** — "same hour yesterday" and "same hour last week" (seasonal naive). These set the bar every other model must beat.
 2. **Gradient boosting** — **LightGBM** on lag, calendar, and weather features. This is a genuinely strong baseline for load forecasting.
 
-**Horizon-aware features.** For an honest day-ahead forecast, a feature may only use information available at forecast-issue time. The model therefore uses lags of 24h and longer, calendar features, and weather (available as a forecast), and deliberately excludes features that depend on the most recent, still-unobserved hours — which keeps the *load information* on par with the official day-ahead forecast. One caveat: the batch job forecasts the 24 hours after the latest published actual (lead times of 1–24 h, with a same-morning weather forecast), whereas the official forecast is issued the previous day for the whole calendar day (roughly 12–36 h ahead); the comparison is therefore favourable to the model on lead time and weather freshness. A calendar-day horizon (`d_plus_1`: every morning, all of tomorrow 00:00-24:00 Berlin time, with a 48-hour information cutoff and no `load_lag_24`) is implemented to remove that caveat; it is being evaluated against the official forecast before it replaces the current champion (§17).
+**Horizon-aware features.** For an honest day-ahead forecast, a feature may only use information available at forecast-issue time. The model therefore uses lags of 24h and longer, calendar features, and weather (available as a forecast), and deliberately excludes features that depend on the most recent, still-unobserved hours — which keeps the *load information* on par with the official day-ahead forecast. One caveat: the batch job forecasts the 24 hours after the latest published actual (lead times of 1–24 h, with a same-morning weather forecast), whereas the official forecast is issued the previous day for the whole calendar day (roughly 12–36 h ahead); the comparison is therefore favourable to the model on lead time and weather freshness. **That caveat applied to the first champion and is now removed:** since November 2026 the champion uses the calendar-day horizon `d_plus_1` — every morning it forecasts all of tomorrow, 00:00–24:00 Berlin time, exactly like the official forecast. Tomorrow's hours are 19–43 h after the latest actual, so its information cutoff is 48 h: it keeps `load_lag_48` and `load_lag_168` but drops `load_lag_24`, and it is compared with honest baselines ("same hour 2 days ago", "same hour last week"). See §16.5 for the evaluation and the decision.
 
 **Validation.** Strict **time-series cross-validation** (expanding window) — never random splits, which would leak the future into the past. Early stopping is done on a chronological tail of the training data, never on the evaluation fold.
 
@@ -327,6 +327,29 @@ A one-time `bootstrap` workflow seeds the cloud database (backfill → features 
 
 ## 15. Results
 
+### Current champion: calendar day D+1 (exactly the official forecast's task)
+
+12-fold expanding-window cross-validation (one-month folds, Nov 2025 – Oct 2026), 19 features:
+
+| Model | MAE (MW) | MAPE (%) |
+|---|---:|---:|
+| Seasonal naive (same hour, 48 h ago) | 6,219 | 11.92 |
+| Seasonal naive (same hour, 168 h ago) | 2,826 | 5.33 |
+| **LightGBM (D+1)** | **1,517** | **2.88** |
+
+One-year out-of-sample backtest against the official forecast (trained on data up to 1 Nov 2025, never retrained, then scored on every hour from 1 Nov 2025 to 1 Nov 2026 — 8,760 hours):
+
+| | MAE (MW) | MAPE (%) |
+|---|---:|---:|
+| **LightGBM (D+1)** | **1,529** | **2.90** |
+| Official TSO day-ahead forecast | 2,027 | 3.83 |
+
+- LightGBM beats the best baseline by 46 % (MAE) and wins on every one of the 12 folds.
+- On exactly the official forecast's task it is **24.6 % more accurate** over the year and wins on **256 of 366 days**.
+- Caveat: the backtest uses *measured* weather for the past year, whereas live forecasts (ours and the official one) must use weather *forecasts* — so the live gap is expected to be smaller. The live record (dashboard) is the final judge.
+
+### First champion (v1): the 24 hours after the latest actual
+
 Measured with expanding-window time-series cross-validation and out-of-sample day-ahead backtests over 2021–2026 (German national load, SMARD region DE):
 
 | Model | MAE (MW) | MAPE (%) |
@@ -339,7 +362,7 @@ Measured with expanding-window time-series cross-validation and out-of-sample da
 - LightGBM reduces MAE by ~56% vs. the best naive baseline and wins on every cross-validation fold.
 - In an out-of-sample day-ahead backtest, the model beats the **official grid-operator forecast in 12 of 12 monthly windows** (2.43% vs. 3.85% MAPE). Read with the caveat in §8: the model's window starts right after the latest published actual and uses fresher weather than a true previous-day issue would have.
 
-**Live, on fresh actuals** (as of 15 October 2026, four weeks after go-live; the dashboard updates these continuously):
+**Live, on fresh actuals, v1** (as of 15 October 2026, four weeks after go-live; the dashboard updates these continuously):
 
 | Window | Hours scored | Model MAPE | Official MAPE | Model MAE vs official |
 |---|---:|---:|---:|---:|
@@ -378,7 +401,7 @@ The system went live on 17 September 2026. Some problems only show up when a sys
 - **`monitor-retrain` is chained** to the forecast (`workflow_run`), so it starts the moment the forecast finishes instead of guessing a time slot. A later cron remains as a backup.
 - **Once-per-day guards** (`batch_forecast --once-per-day`, `retrain --once-per-day`): a late backup run sees that today's forecast / monitoring pass already exists and exits without doing anything. Without them, the backup would re-issue the forecast at midday and bring back problem 2. A manual run with `force` still re-forecasts on purpose.
 
-**Still open:** forecasting the 24 hours *after the latest actual* is not the same as forecasting *tomorrow's calendar day*, which is what the official forecast and the auction use. Moving to a fixed calendar-day (D+1) target removes the remaining overlap/gap effect and makes the official comparison exactly like-for-like; it is the next planned change (§17).
+**Resolved later (§16.5):** forecasting the 24 hours *after the latest actual* is not the same as forecasting *tomorrow's calendar day*, which is what the official forecast and the auction use. The calendar-day (D+1) champion removes the remaining overlap/gap effect and makes the official comparison exactly like-for-like.
 
 ### 16.2 Incident log
 
@@ -410,11 +433,23 @@ So each job now reports a few metrics to **Datadog** when it ends — rows writt
 | Ingest stopped (no run for 3 h) | the external scheduler or its token broke |
 | Actual load data stale (> 6 h) | SMARD stopped publishing, or an ingest step keeps failing |
 | No forecast today (forecast older than 25 h) | the forecast job never ran — reported by the *hourly ingest*, so it works even when the forecast job cannot report anything |
-| 7-day MAPE above 3.5 % | the model is degrading (the retrain loop reacts; this tells a human) |
+| 7-day MAPE above the champion's limit (4.0 % for D+1) | the model is degrading (the retrain loop reacts; this tells a human) |
 | A job failed | any failure, per job, in the same place as everything else |
 | Drift check unavailable | a drift check that errors but, by design, does not fail the monitor job |
 
 Setup and the exact monitor queries: `docs/observability.md`. Without the `DD_API_KEY` secret nothing is sent, so local runs, tests and forks are unaffected.
+
+### 16.5 From "the next 24 hours" to the official task: the calendar-day (D+1) champion
+
+**The problem.** The first champion forecast the 24 hours after the latest published actual. The official forecast covers *tomorrow's calendar day*. Close, but not the same task — every "the model beats the official forecast" claim needed a caveat (§8).
+
+**What was built (Batch C).** A second horizon, `d_plus_1`: every morning, all of tomorrow 00:00–24:00 Berlin time (23 or 25 hours on clock-change days). Tomorrow's hours are 19–43 h after the latest actual, so `load_lag_24` would be leakage and is dropped; the information cutoff is 48 h, leaving 4–5 h of slack for a late SMARD publication, and the forecast refuses to run if the latest actual is too old to cover the whole day. Serving, retraining, drift monitoring and the backtest all follow the **champion's** horizon. Building it surfaced two details worth knowing: "same hour yesterday" is itself a leaking *baseline* for D+1 (replaced by "same hour 2 days ago"), and computing "tomorrow" as "midnight + 24 h" picks the wrong day on the autumn clock change (fixed with calendar dates, and tested).
+
+**How it was decided.** Changing the task is a product decision, not something the automatic retraining should do, so the model was first trained in an *evaluate-only* run (`bootstrap` with `horizon=d_plus_1`, `promote` off) and judged on evidence: does it beat honest baselines (cross-validation) and, above all, the official forecast on the same task (one-year backtest)? Its error is naturally higher than v1's (2.88 % vs 2.44 % CV MAPE) because it forecasts further ahead with less information — comparing those two numbers would be comparing a 100 m and a 200 m time. Against the official forecast on the same hours it was 24.6 % more accurate (§15), so it was promoted; rollback is `python -m src.models.registry --promote 1`.
+
+**Consequences.** The retraining error trigger is now per horizon — about 1.4× the cross-validated MAPE: 3.5 % for the rolling model, 4.0 % for D+1 — so the harder task does not cause pointless retrains or alerts (the Datadog monitor follows the same limit).
+
+**What the backtest taught.** The model's worst day of the year was 4 June 2026 (10 % vs the official 2 %): Corpus Christi, a public holiday in only some German states, which the model deliberately ignores. The official forecast's worst stretch was 7–12 January 2026 (9–10 %), where the model stayed at 2–6 %. Regional holidays are now on the roadmap.
 
 ---
 
@@ -422,7 +457,7 @@ Setup and the exact monitor queries: `docs/observability.md`. Without the `DD_AP
 
 Planned technical extensions, in rough order:
 
-- **Calendar-day (D+1) forecast** — forecast tomorrow 00:00–24:00 Berlin time every morning, as the official forecast does: an exactly like-for-like benchmark and no window drift (§16.1).
+- **Regional holidays** — a "share of the population on holiday" feature, so days like Corpus Christi (a holiday in some states only) stop being the model's worst days (§16.5).
 
 - **Deep learning** — LSTM/GRU and a Temporal Fusion Transformer, compared rigorously against the LightGBM baseline.
 - **Multi-region forecasting** — the four German control areas (50Hertz, Amprion, TenneT, TransnetBW) forecast separately.
