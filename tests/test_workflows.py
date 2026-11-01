@@ -92,12 +92,20 @@ def test_bootstrap_can_evaluate_a_horizon_without_touching_production() -> None:
         assert "inputs.promote" in step["if"] and "!inputs.promote" not in step["if"]
 
 
-def test_promoting_workflows_share_one_concurrency_group() -> None:
-    """bootstrap and monitor-retrain both promote; two promotions must never overlap."""
-    groups = {name: load(name)["concurrency"] for name in ("bootstrap.yml", "monitor_retrain.yml")}
-    assert all(g == {"group": "promotion", "cancel-in-progress": False} for g in groups.values())
+def test_only_promoting_runs_share_the_promotion_group() -> None:
+    """Two promotions must never overlap; an evaluate-only bootstrap must not block the monitor."""
+    assert load("monitor_retrain.yml")["concurrency"] == {
+        "group": "promotion",
+        "cancel-in-progress": False,
+    }
+    boot = load("bootstrap.yml")["concurrency"]
+    assert boot["cancel-in-progress"] is False
+    group = boot["group"]
+    # inputs.* is typed (a boolean); github.event.inputs.* is the string 'false' (truthy).
+    assert "inputs.promote" in group and "github.event.inputs" not in group
+    assert "'promotion'" in group and "'bootstrap-eval'" in group
     others = {load(n)["concurrency"]["group"] for n in ("ingest.yml", "forecast.yml", "ci.yml")}
-    assert "promotion" not in others
+    assert not any("promotion" in g for g in others)
 
 
 @pytest.mark.parametrize("name", sorted(SCHEDULED | {"bootstrap.yml"}))
