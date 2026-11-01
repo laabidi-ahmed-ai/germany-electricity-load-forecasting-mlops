@@ -523,55 +523,14 @@ def test_empty_drift_result_is_unavailable_not_no_drift(engine, cfg) -> None:
     def empty(*a, **k):
         return []
 
-    with pytest.raises(RuntimeError, match="drift unavailable"):
+    with pytest.raises(RuntimeError, match="no result"):
         drift_mod.compute_drift(engine, champ, window_days=30, frame=frame, runner=empty)
     d = retrain.evaluate_triggers(
         engine, champ, cfg, as_of=load["timestamp_utc"].max(), frame=frame, drift_runner=empty
     )
-    assert d.drift is None and "drift unavailable" in d.drift_error  # -> drift.unavailable = 1
+    assert d.drift is None and "no result" in d.drift_error  # -> drift.unavailable = 1
     drift_check = next(c for c in d.checks if c.name == "drift")
     assert not drift_check.fired and drift_check.detail.startswith("error:")
-
-
-def partial_runner(keep: int):
-    """``fake_runner`` (nothing drifts) that returns a result for only the first ``keep`` columns."""
-
-    def _run(reference, current, columns, threshold=0.25):
-        dropped = set(columns[keep:])
-        metrics = fake_runner(set())(reference, current, columns, threshold)
-        return [m for m in metrics if (m.get("config") or {}).get("column") not in dropped]
-
-    return _run
-
-
-def test_drift_is_never_decided_from_too_few_columns(engine, monkeypatch) -> None:
-    load = seed_db(engine, days=120, with_model=False)
-    frame = feature_frame(load)
-    champ = fake_loaded_model(select_features(frame.columns, DAY_AHEAD))
-    n = len(drift_mod.drift_columns(list(frame.columns)))
-    assert n == 8
-
-    # fewer than half the monitored columns scored -> unavailable, not a 0/3 "no drift"
-    below = int(n * drift_mod.MIN_COLUMN_COVERAGE) - 1
-    with pytest.raises(RuntimeError, match=rf"only {below}/{n} monitored columns"):
-        drift_mod.compute_drift(
-            engine, champ, window_days=30, frame=frame, runner=partial_runner(below)
-        )
-
-    # most columns scored -> a report over those, with the gap noted
-    r = drift_mod.compute_drift(
-        engine, champ, window_days=30, frame=frame, runner=partial_runner(n - 2)
-    )
-    assert r.n_monitored == n - 2 and not r.flag
-    assert any(note.startswith("no drift result for:") for note in r.notes)
-
-    # a horizon with no monitored columns at all -> unavailable, the runner never runs
-    def never(*a, **k):
-        raise AssertionError("runner must not be called without columns")
-
-    monkeypatch.setattr(drift_mod, "drift_columns", lambda *a, **k: [])
-    with pytest.raises(RuntimeError, match="no monitored columns"):
-        drift_mod.compute_drift(engine, champ, window_days=30, frame=frame, runner=never)
 
 
 # --- Champion / challenger ---

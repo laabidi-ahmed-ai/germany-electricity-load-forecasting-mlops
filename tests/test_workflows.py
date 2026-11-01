@@ -92,18 +92,11 @@ def test_bootstrap_can_evaluate_a_horizon_without_touching_production() -> None:
         assert "inputs.promote" in step["if"] and "!inputs.promote" not in step["if"]
 
 
-def test_only_promoting_runs_share_the_promotion_group() -> None:
-    """Two promotions must never overlap; an evaluate-only bootstrap must not block the monitor."""
-    assert load("monitor_retrain.yml")["concurrency"] == {
-        "group": "promotion",
-        "cancel-in-progress": False,
-    }
-    boot = load("bootstrap.yml")["concurrency"]
-    assert boot["cancel-in-progress"] is False
-    group = boot["group"]
-    # inputs.* is typed (a boolean); github.event.inputs.* is the string 'false' (truthy).
-    assert "inputs.promote" in group and "github.event.inputs" not in group
-    assert "'promotion'" in group and "'bootstrap-eval'" in group
+def test_promoting_workflows_share_one_concurrency_group() -> None:
+    """bootstrap (every run, even evaluate-only) and monitor-retrain must never overlap:
+    --promote-latest could otherwise promote a concurrent evaluate-only model."""
+    for name in ("bootstrap.yml", "monitor_retrain.yml"):
+        assert load(name)["concurrency"] == {"group": "promotion", "cancel-in-progress": False}
     others = {load(n)["concurrency"]["group"] for n in ("ingest.yml", "forecast.yml", "ci.yml")}
     assert not any("promotion" in g for g in others)
 

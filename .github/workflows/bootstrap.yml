@@ -34,11 +34,10 @@ on:
         type: boolean
         default: true
 
-# A promoting run shares the group with monitor_retrain.yml so two promotions never overlap;
-# an evaluate-only run (promote=false) gets its own group and never blocks the daily monitor.
-# `inputs.promote` is a real boolean (github.event.inputs would be the string 'false').
+# Shared with monitor_retrain.yml, even for evaluate-only runs: an evaluate-only run that
+# overlapped a promoting one could have its model picked up by --promote-latest.
 concurrency:
-  group: ${{ inputs.promote && 'promotion' || 'bootstrap-eval' }}
+  group: promotion
   cancel-in-progress: false
 
 permissions:

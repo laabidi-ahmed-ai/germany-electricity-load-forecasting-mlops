@@ -427,6 +427,9 @@ def test_latest_pass_clear_check_is_unchanged(engine: Engine) -> None:
     assert not check["triggered"] and not check["forced"] and check["outcome"] is None
     assert check["champion_version"] == check["model_version"] == "5"
     assert q.pass_headline(check) == "🟢 all triggers clear"
+    # a check whose triggers fired ran no retrain (e.g. --check-only)
+    fired = {**check, "triggered": True}
+    assert q.pass_headline(fired) == "🔴 triggers fired (check only, no retrain)"
 
 
 def test_event_kinds_are_defined_once() -> None:

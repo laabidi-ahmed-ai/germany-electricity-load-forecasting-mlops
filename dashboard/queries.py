@@ -249,8 +249,10 @@ OUTCOME_TEXT = {
 
 def pass_headline(check: dict[str, Any]) -> str:
     """One status line for the latest pass: what fired and what the retrain did."""
-    if check["kind"] != db.EVENT_RETRAIN:
-        return "🔴 retraining triggered" if check["triggered"] else "🟢 all triggers clear"
+    if check["kind"] != db.EVENT_RETRAIN:  # e.g. --check-only: no champion/challenger ran
+        if check["triggered"]:
+            return "🔴 triggers fired (check only, no retrain)"
+        return "🟢 all triggers clear"
     state = "🟠 retrain forced" if check["forced"] else "🔴 retraining triggered"
     outcome = check["outcome"]
     if outcome == "promoted":

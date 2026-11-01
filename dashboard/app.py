@@ -332,7 +332,7 @@ def panel_monitoring(mon: dict[str, Any], tz: str) -> None:
         else:
             st.markdown(
                 f"{q.pass_headline(check)} · as of {fmt_ts(check['as_of'], tz)} · "
-                f"champion v{check['champion_version']}"
+                f"champion at this pass v{check['champion_version']}"
             )
             checks = check["checks"]
             if not checks.empty:

@@ -79,9 +79,10 @@ Any service that can send a scheduled HTTP POST works; these steps use
   `DATABASE_URL` value - the local default `sqlite:///mlruns/mlflow.db` is the wrong
   registry): `python -m src.models.registry --promote <previous version>`. The MLflow alias
   moves first; if it fails, the champion serving reads is left unchanged.
-- **A bootstrap shows as cancelled.** A promoting bootstrap and monitor-retrain share the
+- **A bootstrap or monitor-retrain run shows as cancelled.** Both workflows share the
   `promotion` concurrency group, and GitHub keeps only one pending run per group, so a newer
-  queued run cancels the waiting one. Re-run it.
+  queued run cancels the waiting one - either a bootstrap or that day's monitor-retrain
+  (which then records no monitoring event). Re-run it.
 - **Rotate the database password.** Neon → *Roles* → the owner role → *Reset password*;
   paste the new connection string into the GitHub secret `DATABASE_URL` (plain URL, **no
   quotes**); run *ingest* manually and check it is green. The dashboard uses its own
