@@ -8,6 +8,8 @@
 #   make train      train + evaluate, log to MLflow
 #   make serve      run the FastAPI app locally
 #   make dashboard  run the Streamlit dashboard
+#   make lock       re-pin requirements/constraints.txt after editing pyproject.toml
+#   make lock-upgrade  move every pin to the newest allowed version (then test!)
 #
 # Works on Linux / macOS / Git Bash on Windows. The venv lives in ./.venv.
 # ---------------------------------------------------------------------------
@@ -21,16 +23,27 @@ else
 endif
 PIP         := $(BIN)/pip
 PY          := $(BIN)/python
+UV          ?= uv
+
+# One lock for every environment: Python 3.11+ on Linux, macOS and Windows (--universal).
+LOCK_CMD    := $(UV) pip compile pyproject.toml --extra dev --universal --python-version 3.11 \
+               --custom-compile-command "make lock" -o requirements/constraints.txt
 
 .DEFAULT_GOAL := help
-.PHONY: help setup test test-integration test-all lint format data data-update features train evaluate mlflow-ui register forecast monitor retrain serve dashboard clean
+.PHONY: help setup lock lock-upgrade test test-integration test-all lint format data data-update features train evaluate mlflow-ui register forecast monitor retrain serve dashboard clean
 
 help:  ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
 
 setup: $(VENV)  ## Create venv and install project + dev deps
 	$(PIP) install --upgrade pip
-	$(PIP) install -e ".[dev]"
+	$(PIP) install -e ".[dev]" -c requirements/constraints.txt
+
+lock:  ## Re-pin the lock file after editing pyproject.toml (keeps existing pins)
+	$(LOCK_CMD)
+
+lock-upgrade:  ## Move every pin to the newest version pyproject.toml allows
+	$(LOCK_CMD) --upgrade
 
 $(VENV):
 	$(PYTHON) -m venv $(VENV)

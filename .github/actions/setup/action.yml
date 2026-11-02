@@ -1,5 +1,6 @@
 # Shared setup for the jobs that talk to the database (ingest, forecast, monitor, bootstrap):
-# fail fast without DATABASE_URL, install Python, then the job's dependencies.
+# fail fast without DATABASE_URL, install Python, then the job's dependencies at the exact
+# versions pinned in requirements/constraints.txt (the lock file; see docs/operations.md).
 # The calling job checks the repository out first (a local action lives in it).
 name: Set up the project
 description: Require DATABASE_URL, install Python and the job's dependencies.
@@ -26,7 +27,9 @@ runs:
       with:
         python-version: "3.11"
         cache: pip
-        cache-dependency-path: ${{ inputs.requirements || 'pyproject.toml' }}
+        cache-dependency-path: |
+          ${{ inputs.requirements || 'pyproject.toml' }}
+          requirements/constraints.txt
 
     - name: Install dependencies
       shell: bash
@@ -34,8 +37,10 @@ runs:
         REQUIREMENTS: ${{ inputs.requirements }}
       run: |
         python -m pip install --upgrade pip
+        # -c: every package (direct or transitive) at its locked version, so a new upstream
+        # release cannot change what production runs between two commits.
         if [ -n "$REQUIREMENTS" ]; then
-          pip install -r "$REQUIREMENTS"
+          pip install -r "$REQUIREMENTS" -c requirements/constraints.txt
         else
-          pip install .
+          pip install . -c requirements/constraints.txt
         fi

@@ -132,8 +132,19 @@ def test_setup_action_checks_the_secret_and_installs_lean_or_full() -> None:
     python = next(s for s in action_steps if s.get("uses", "").startswith("actions/setup-python@"))
     assert python["with"]["python-version"] == "3.11"
     assert "inputs.requirements" in python["with"]["cache-dependency-path"]  # lean jobs cache lean
+    assert "requirements/constraints.txt" in python["with"]["cache-dependency-path"]
     install = action_steps[-1]["run"]
-    assert 'pip install -r "$REQUIREMENTS"' in install and "pip install ." in install
+    # both the lean and the full install are pinned by the lock file
+    assert 'pip install -r "$REQUIREMENTS" -c requirements/constraints.txt' in install
+    assert "pip install . -c requirements/constraints.txt" in install
+
+
+def test_ci_and_docker_install_the_locked_versions() -> None:
+    ci = run_lines(load("ci.yml"))
+    assert 'pip install -e ".[dev]" -c requirements/constraints.txt' in ci
+    dockerfile = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert "COPY requirements/constraints.txt" in dockerfile
+    assert "pip install . -c requirements/constraints.txt" in dockerfile
 
 
 def test_actions_run_on_node_24() -> None:

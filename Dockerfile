@@ -24,10 +24,11 @@ WORKDIR /app
 
 # Install dependencies first so source edits do not invalidate this layer.
 COPY pyproject.toml README.md LICENSE ./
+COPY requirements/constraints.txt ./requirements/constraints.txt
 COPY src ./src
 COPY config ./config
 COPY dashboard ./dashboard
-RUN pip install --upgrade pip && pip install .
+RUN pip install --upgrade pip && pip install . -c requirements/constraints.txt
 
 # Non-root runtime user; data/ is a mounted volume.
 RUN useradd --create-home --uid 1000 app \
