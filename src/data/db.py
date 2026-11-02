@@ -9,6 +9,8 @@
   ``INSERT ... ON CONFLICT DO UPDATE`` on both dialects.
 * Postgres is the production store (README §10); SQLite is the zero-config local
   fallback that the default ``DATABASE_URL`` points at.
+* The schema is versioned with Alembic (``src/data/migrations``). ``init_db`` creates it
+  on an empty database and otherwise only checks its version: jobs never migrate.
 """
 
 from __future__ import annotations
@@ -22,16 +24,22 @@ from typing import Any
 import pandas as pd
 from sqlalchemy import (
     Boolean,
+    Column,
     DateTime,
     Float,
+    Index,
     Integer,
     LargeBinary,
+    MetaData,
+    PrimaryKeyConstraint,
     String,
+    Table,
     Text,
     create_engine,
     delete,
     func,
     insert,
+    inspect,
     or_,
     select,
     update,
@@ -168,6 +176,14 @@ class LoadForecastModel(Base):
     ingested_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
 
 
+# Production's four time-series tables are TimescaleDB hypertables, converted by an early setup
+# before migrations existed, and ``create_hypertable`` gave each of them this index. The code
+# never creates hypertables; the indexes are declared so the models and the baseline migration
+# describe the schema production has.
+for _model in (LoadActual, LoadForecastOfficial, WeatherHourly, LoadForecastModel):
+    Index(f"{_model.__tablename__}_timestamp_utc_idx", _model.timestamp_utc.desc())
+
+
 class MonitoringEvent(Base):
     """One row per monitoring / retraining decision (the dashboard's event timeline).
 
@@ -239,9 +255,78 @@ def normalize_database_url(url: str) -> str:
     return url
 
 
+# Schema version (Alembic, ``src/data/migrations``). Not the default ``alembic_version``:
+# MLflow's own migrations keep their revision there when it tracks into the same database.
+SCHEMA_VERSION_TABLE = "alembic_version_app"
+# Every revision, oldest first; tests/test_migrations.py checks it against the scripts.
+SCHEMA_REVISIONS: tuple[str, ...] = ("0001",)
+SCHEMA_REVISION = SCHEMA_REVISIONS[-1]
+
+# The version table exactly as Alembic creates it, so ``init_db`` can record the revision of
+# a new database without importing Alembic (the ingest job and the dashboard run without it).
+_schema_version = Table(
+    SCHEMA_VERSION_TABLE,
+    MetaData(),
+    Column("version_num", String(32), nullable=False),
+    PrimaryKeyConstraint("version_num", name=f"{SCHEMA_VERSION_TABLE}_pkc"),
+)
+
+
+class SchemaError(RuntimeError):
+    """The database schema is not at the revision this code needs."""
+
+
 def init_db(engine: Engine) -> None:
-    """Create all tables (no-op if they exist). Called once by each entry point."""
-    Base.metadata.create_all(engine)
+    """Create the schema on an empty database; otherwise check its version - never migrate.
+
+    Called once by each entry point. A database with none of the application's tables (a
+    fresh local or test database, the first cloud backfill) gets them, recorded at
+    ``SCHEMA_REVISION``. Any other database must already be at ``SCHEMA_REVISION``, or
+    ``SchemaError`` names the Alembic command to run. Tables of other applications in the
+    same database (MLflow) are ignored.
+    """
+    tables = set(inspect(engine).get_table_names())
+    versions = _schema_versions(engine) if SCHEMA_VERSION_TABLE in tables else []
+    if not versions and not tables & set(Base.metadata.tables):
+        with engine.begin() as conn:
+            Base.metadata.create_all(conn)
+            _schema_version.create(conn, checkfirst=True)
+            conn.execute(insert(_schema_version).values(version_num=SCHEMA_REVISION))
+        return
+    _check_schema_version(versions)
+
+
+def _schema_versions(engine: Engine) -> list[str]:
+    with engine.connect() as conn:
+        return list(conn.execute(select(_schema_version.c.version_num)).scalars())
+
+
+def _check_schema_version(versions: list[str]) -> None:
+    see = "(docs/operations.md, 'Schema migrations')"
+    if not versions:
+        raise SchemaError(
+            "the database has the application's tables but no schema version - it predates "
+            f"migrations. Record it once with `alembic stamp {SCHEMA_REVISIONS[0]}` (the "
+            f"baseline), then run `alembic upgrade head` {see}"
+        )
+    if len(versions) > 1:
+        raise SchemaError(
+            f"the database has several schema versions {sorted(versions)}; this code expects "
+            f"exactly one, {SCHEMA_REVISION} {see}"
+        )
+    current = versions[0]
+    if current == SCHEMA_REVISION:
+        return
+    if current in SCHEMA_REVISIONS:
+        raise SchemaError(
+            f"the database schema is at revision {current}, this code needs "
+            f"{SCHEMA_REVISION} - run `alembic upgrade head` {see}"
+        )
+    raise SchemaError(
+        f"the database schema is at revision {current}, which this code does not know (it "
+        f"knows up to {SCHEMA_REVISION}) - most likely newer code migrated it. Deploy that "
+        f"code, or downgrade the database with it (`alembic downgrade {SCHEMA_REVISION}`) {see}"
+    )
 
 
 # --- Upsert ---

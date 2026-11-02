@@ -16,6 +16,7 @@ WORKFLOWS = PROJECT_ROOT / ".github" / "workflows"
 SETUP_ACTION = "./.github/actions/setup"
 SCHEDULED = {"ingest.yml", "forecast.yml", "monitor_retrain.yml"}
 HEAVY_MODULES = (
+    "alembic",  # migrations run by hand; the lean ingest install does not have it
     "lightgbm",
     "mlflow",
     "evidently",

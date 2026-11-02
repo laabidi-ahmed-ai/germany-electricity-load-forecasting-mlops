@@ -34,6 +34,9 @@ dependencies = [
     # Storage (Postgres; SQLite for local dev)
     "sqlalchemy>=2.0",
     "psycopg[binary]>=3.1",
+    # Schema migrations (src/data/migrations). Jobs never import it: init_db only reads the
+    # schema version, so the lean ingest and dashboard installs do without it.
+    "alembic>=1.13",
     # Config / secrets
     "pydantic>=2.5",
     "pydantic-settings>=2.1",

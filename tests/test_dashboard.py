@@ -562,7 +562,16 @@ def test_dashboard_requirements_cover_its_imports() -> None:
     loaded = set(json.loads(out.stdout.strip().splitlines()[-1]))
     heavy = [
         m
-        for m in ("lightgbm", "mlflow", "evidently", "sklearn", "torch", "fastapi", "optuna")
+        for m in (
+            "alembic",
+            "lightgbm",
+            "mlflow",
+            "evidently",
+            "sklearn",
+            "torch",
+            "fastapi",
+            "optuna",
+        )
         if m in loaded
     ]
     assert not heavy, f"dashboard imports heavy modules: {heavy}"

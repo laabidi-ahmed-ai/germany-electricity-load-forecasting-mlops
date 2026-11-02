@@ -120,6 +120,74 @@ Any service that can send a scheduled HTTP POST works; these steps use
 - **Renew the scheduler token** before it expires (step 1 above, then update the
   `Authorization` header in both cron jobs).
 
+## Schema migrations
+
+The application's tables are versioned with Alembic (`alembic.ini`, `src/data/migrations/`).
+Jobs never migrate: every entry point calls `init_db`, which builds the schema only on a
+database that has none of the application's tables, and otherwise checks that the database is
+at the revision the code expects (`SCHEMA_REVISION` in `src/data/db.py`). If it is not, the
+job stops with a `SchemaError` that names the command to run, before writing anything.
+
+- **Our version table is `alembic_version_app`.** The `alembic_version` table in the same
+  database belongs to MLflow (its own migrations; the workflows' `MLFLOW_TRACKING_URI` falls
+  back to `DATABASE_URL`): never stamp or edit it. Alembic here sees only our tables.
+- **Production's time-series tables are TimescaleDB hypertables.** `load_actual`,
+  `load_forecast_official`, `weather_hourly` and `load_forecast_model` were converted by an
+  early setup, before migrations existed, and the `timescaledb` extension is still
+  installed. Alembic cannot see that, except through the index `create_hypertable` gave
+  each table: `<table>_timestamp_utc_idx` on `timestamp_utc DESC`. The models and the
+  baseline `0001` include those four indexes, so `alembic check` matches production. The
+  code never creates hypertables: a new database gets plain tables with the same indexes.
+- **Run Alembic** from the repository root, with the target database set for the current
+  PowerShell session only (without it, Alembic uses `.env`'s value or the local SQLite file):
+
+  ```powershell
+  $env:DATABASE_URL = "<connection string>"
+  .venv\Scripts\alembic current
+  Remove-Item Env:DATABASE_URL
+  ```
+
+- **A local database created before migrations** fails the same check: with
+  `DATABASE_URL` unset, run `.venv\Scripts\alembic stamp 0001`, or delete the file and run
+  the backfill again. One that predates the four time indexes makes `alembic check` list
+  them as `add_index`; create them once from the models (an existing index is skipped):
+
+  ```powershell
+  Remove-Item Env:DATABASE_URL -ErrorAction SilentlyContinue   # target the local file
+  .venv\Scripts\python -c "from src.data import db; e = db.get_engine(); print('target:', e.url); [ix.create(e, checkfirst=True) for t in db.Base.metadata.sorted_tables for ix in t.indexes]"
+  .venv\Scripts\alembic check
+  ```
+- **Stamp the live database (once, before merging the change that introduced migrations).**
+  1. Neon SQL editor, read-only: `SELECT table_name FROM information_schema.tables WHERE
+     table_schema = 'public' ORDER BY 1;` and `SELECT version_num FROM alembic_version;`
+     (MLflow's revision - note it).
+  2. Neon → *Branches* → *Create branch* `backup-before-stamp` from `main` (current data).
+  3. In PowerShell, from the repository root:
+
+     ```powershell
+     $env:DATABASE_URL = "<Neon connection string of main>"
+     .venv\Scripts\alembic current      # no revision yet
+     .venv\Scripts\alembic stamp 0001
+     .venv\Scripts\alembic current      # 0001 (head)
+     .venv\Scripts\alembic check        # No new upgrade operations detected.
+     Remove-Item Env:DATABASE_URL
+     ```
+
+     `alembic check` compares the live tables with the code. If it reports any
+     difference, do not merge: the live schema is not the baseline.
+  4. SQL editor: `SELECT version_num FROM alembic_version_app;` returns `0001`, and MLflow's
+     `alembic_version` is unchanged.
+  5. Merge. A job that runs the new code before the stamp stops with `SchemaError` and
+     writes nothing; the stamp fixes it.
+  6. After a day of green jobs, delete the `backup-before-stamp` branch.
+
+  Roll back by reverting the merge: the old code ignores `alembic_version_app`. There is
+  nothing to downgrade - the baseline `0001` refuses to, because that would drop every table.
+- **A later migration:** `.venv\Scripts\alembic revision --rev-id 0002 -m "<what changes>"`,
+  then append the id to `SCHEMA_REVISIONS` in `src/data/db.py` (`tests/test_migrations.py`
+  checks they match). Before merging: a Neon backup branch, `alembic upgrade head`, `alembic
+  check`. To roll back, `alembic downgrade <previous revision>` first, then revert the code.
+
 ## Dependencies: adding and upgrading packages
 
 Ranges live in `pyproject.toml`; the exact versions every job installs live in
