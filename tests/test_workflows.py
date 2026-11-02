@@ -190,6 +190,20 @@ def test_daily_jobs_run_once_per_day_and_monitor_follows_the_forecast() -> None:
     assert "--once-per-day" in mon_text and '!= "workflow_dispatch"' in mon_text
 
 
+def test_forecast_still_runs_when_only_the_refresh_failed() -> None:
+    """An Open-Meteo outage fails the refresh; the stored data may still be enough (2 Nov)."""
+    wf_steps = steps(load("forecast.yml"))
+    names = [s.get("name", "") for s in wf_steps]
+    refresh = next(s for s in wf_steps if s.get("name", "").startswith("Refresh"))
+    assert refresh["id"] == "refresh" and "src.data.ingest" in refresh["run"]
+    assert "continue-on-error" not in refresh  # the job must still end red
+    after = wf_steps[names.index(refresh["name"]) + 1 :]
+    assert [s["name"] for s in after] == ["Show champion", "Day-ahead forecast -> database"]
+    for step in after:
+        # not always(): a cancelled run, or a failed setup before the refresh, must not forecast
+        assert step["if"] == "${{ success() || steps.refresh.outcome == 'failure' }}"
+
+
 def test_ingest_workflow_installs_only_the_lean_requirements() -> None:
     wf = load("ingest.yml")
     text = run_lines(wf)

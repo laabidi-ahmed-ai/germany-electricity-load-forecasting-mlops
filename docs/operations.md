@@ -64,6 +64,7 @@ Any service that can send a scheduled HTTP POST works; these steps use
   forecast, a rising error or a failed job (`docs/observability.md`). By hand: the Actions
   tab (all green), and the dashboard's *Data coverage* (latest actual) and *last model
   forecast* timestamps. `python -m src.models.registry --show` prints the champion.
+- **`forecast` is red but the forecast step ran.** The refresh (ingest) failed, e.g. Open-Meteo down, and the job forecast from the stored data anyway; it stays red so the failure is seen. Check the refresh step's log; the next hourly `ingest` catches up.
 - **Forecast again today on purpose.** Actions → *forecast* → *Run workflow* → tick
   **force**. (Without it, the run exits because today's forecast exists.)
 - **Rehearse a retrain without touching the champion.** Actions → *monitor-retrain* →
