@@ -4,7 +4,7 @@
 
 > A production-style machine-learning system that forecasts **Germany's national electricity demand (load)** for every hour of the next calendar day (D+1). It ingests fresh grid and weather data every hour, benchmarks itself every day against the **official grid-operator day-ahead forecast**, and **retrains itself** when the daily check finds data drift or performance decay — all on a fully free-tier, cloud-scheduled stack.
 
-### Headline result
+## Headline result
 
 In a one-year retrospective backtest (Nov 2025 – Nov 2026, 8,760 hours; trained once before the window, never retrained), the D+1 model had **24.6 % lower MAE than the official grid-operator day-ahead forecast** on the same target days: 1,529 MW vs 2,027 MW.
 
@@ -21,6 +21,8 @@ xychart-beta
 ---
 
 ## Table of Contents
+
+- [Headline result](#headline-result)
 
 1. [Overview](#1-overview)
 2. [The business problem, in plain terms](#2-the-business-problem-in-plain-terms)
@@ -196,10 +198,10 @@ Weather is sampled at **city level** (several major German cities) as *input fea
 
 Day-ahead load forecasting is a **supervised** problem. The model progresses from simple to sophisticated so each step is justified by measured improvement:
 
-1. **Naive baselines** — "same hour yesterday" and "same hour last week" (seasonal naive). These set the bar every other model must beat.
+1. **Naive baselines** — "same hour 2 days ago" and "same hour last week" (seasonal naive) for the D+1 champion. These set the bar every other model must beat. ("Same hour yesterday", used for the first champion, leaks for D+1 — §16.5.)
 2. **Gradient boosting** — **LightGBM** on lag, calendar, and weather features. This is a genuinely strong baseline for load forecasting.
 
-**Horizon-aware features.** For an honest day-ahead forecast, a feature may only use information available at forecast-issue time. The model therefore uses lags of 24h and longer, calendar features, and weather (available as a forecast), and deliberately excludes features that depend on the most recent, still-unobserved hours — which keeps the *load information* on par with the official day-ahead forecast. One caveat: the batch job forecasts the 24 hours after the latest published actual (lead times of 1–24 h, with a same-morning weather forecast), whereas the official forecast is issued the previous day for the whole calendar day (roughly 12–36 h ahead); the comparison is therefore favourable to the model on lead time and weather freshness. **That caveat applied to the first champion; the task mismatch is now removed:** since November 2026 the champion uses the calendar-day horizon `d_plus_1` — every morning it forecasts all of tomorrow, 00:00–24:00 Berlin time, the same task (same target day) as the official forecast. The weather information is still not equal: the one-year backtest uses measured weather rather than the forecasts available at issue time (§15), and live, the two forecasts are not built from the same weather forecast. Tomorrow's hours are 19–43 h after the latest actual, so its information cutoff is 48 h: it keeps `load_lag_48` and `load_lag_168` but drops `load_lag_24`, and it is compared with honest baselines ("same hour 2 days ago", "same hour last week"). See §16.5 for the evaluation and the decision.
+**Horizon-aware features.** For an honest day-ahead forecast, a feature may only use information available at forecast-issue time. The model therefore uses load lags at or beyond its horizon's cutoff — 48 h and longer for the D+1 champion (`load_lag_24` is dropped), 24 h and longer for the first champion (v1) — plus calendar features, and weather (available as a forecast), and deliberately excludes features that depend on the most recent, still-unobserved hours — which keeps the *load information* on par with the official day-ahead forecast. One caveat: the batch job forecasts the 24 hours after the latest published actual (lead times of 1–24 h, with a same-morning weather forecast), whereas the official forecast is issued the previous day for the whole calendar day (roughly 12–36 h ahead); the comparison is therefore favourable to the model on lead time and weather freshness. **That caveat applied to the first champion; the task mismatch is now removed:** since November 2026 the champion uses the calendar-day horizon `d_plus_1` — every morning it forecasts all of tomorrow, 00:00–24:00 Berlin time, the same task (same target day) as the official forecast. The weather information is still not equal: the one-year backtest uses measured weather rather than the forecasts available at issue time (§15), and live, the two forecasts are not built from the same weather forecast. Tomorrow's hours are 19–43 h after the latest actual, so its information cutoff is 48 h: it keeps `load_lag_48` and `load_lag_168` but drops `load_lag_24`, and it is compared with honest baselines ("same hour 2 days ago", "same hour last week"). See §16.5 for the evaluation and the decision.
 
 **Validation.** Strict **time-series cross-validation** (expanding window) — never random splits, which would leak the future into the past. Early stopping is done on a chronological tail of the training data, never on the evaluation fold.
 
@@ -217,7 +219,7 @@ Automated retraining here means a disciplined, guarded pipeline — not online l
 - **Champion / challenger** — a challenger is trained on the latest data and evaluated against the champion on data that arrived *after* the champion's training window (a true out-of-time holdout).
 - **Promotion or rollback** — the challenger is promoted **only if it beats the champion by a minimum margin**; the previous model is retained for one-step rollback. Every decision is logged to MLflow and a monitoring-events table.
 
-This loop is why the system is designed to keep running — hourly ingestion, a daily check: a retraining trigger is only meaningful once fresh data has had time to accumulate.
+This loop is why the system is designed to keep running (hourly ingestion, a daily check), because a retraining trigger is only meaningful once fresh data has had time to accumulate.
 
 ---
 
@@ -302,7 +304,7 @@ Every data source is keyless. The secrets are:
 - `DATABASE_URL` — connection string from a free Postgres provider (Neon / Supabase). Required.
 - `MLFLOW_TRACKING_URI` — optional; the cloud jobs fall back to `DATABASE_URL`.
 - `DD_API_KEY` — optional; job metrics are sent to Datadog only when it is set (`docs/observability.md`).
-- The external scheduler's token — a fine-grained GitHub token stored in the scheduler (cron-job.org), not in the repository; it can start, re-run and cancel this repository's workflows, but cannot read secrets or change code (`docs/operations.md`).
+- The external scheduler's token — a fine-grained GitHub token stored in the scheduler (cron-job.org), not in the repository; it can start, re-run and cancel this repository's workflows, but cannot read secrets or change code. A leaked token can still dispatch any workflow (including `bootstrap`, which retrains and promotes a new champion) and disable workflows, which also stops the GitHub cron backups — revoke it immediately (`docs/operations.md`).
 
 ---
 
@@ -397,7 +399,7 @@ Live accuracy is worse than the backtest (2.81 % vs 2.43 % MAPE over 30 days) an
 
 ## 16. Operating it: problems found in production and how they were fixed
 
-The system went live on 17 September 2026. Some problems only show up when a system runs unattended for weeks, so the approach was: **observe first, measure, then fix** — as long as a problem could not corrupt data. Every job is incremental and idempotent (it re-reads an overlap window before the last stored hour — 48 h of load, 7 days of archived weather — and upserts), so a re-run does not duplicate rows and a late or failed run mostly delays data: gaps inside the overlap window are repaired on the next run. That made it safe to leave the system alone and collect real evidence before changing anything.
+The system went live on 17 September 2026. Some problems only show up when a system runs unattended for weeks, so the approach was: **observe first, measure, then fix** — as long as a problem could not corrupt data. The ingest jobs are incremental and idempotent (each re-reads an overlap window before the last stored hour — 48 h of load, 7 days of archived weather — and upserts), so a re-run does not duplicate rows and a late or failed run mostly delays data: gaps inside the overlap window are repaired on the next run. Holes older than the overlap window are not repaired automatically. Training, `bootstrap` and retrain runs are not idempotent: each one creates a new model version. That made it safe to leave the system alone and collect real evidence before changing anything.
 
 ### 16.1 GitHub's scheduler ran the daily jobs 4–8 hours late
 

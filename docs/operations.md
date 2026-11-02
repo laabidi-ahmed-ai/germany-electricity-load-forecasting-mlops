@@ -8,7 +8,7 @@ history, are in README §16; the one-time cloud setup is in `docs/cloud-setup.md
 | When | What starts it | Job |
 |---|---|---|
 | every hour, :20 | external scheduler (backup: GitHub cron at :15) | `ingest` |
-| 05:40 | external scheduler (backup: GitHub cron at 05:40) | `forecast` (ingests first, then forecasts tomorrow, 00:00–24:00 Berlin time — D+1) |
+| 05:40 | external scheduler (backup: GitHub cron at 05:40) | `forecast` (ingests first, then forecasts the champion's horizon: currently D+1, tomorrow 00:00–24:00 Berlin) |
 | when `forecast` finishes | `workflow_run` chain (backup: GitHub cron at 08:30) | `monitor-retrain` |
 
 GitHub's own cron ran these jobs 4–8 hours late every day (README §16.1), so it is only a
@@ -30,8 +30,11 @@ Any service that can send a scheduled HTTP POST works; these steps use
    - *Expiration*: e.g. one year, with a calendar reminder to renew it.
 
    The token can start, re-run and cancel this repository's workflows. It cannot read
-   secrets or change code. If it leaks, revoke it in the same settings page; the GitHub
-   cron backups keep the system running meanwhile.
+   secrets or change code, but a leaked token can still dispatch any workflow - including
+   `bootstrap`, which retrains and promotes a new champion - and disable workflows, which
+   also stops the GitHub cron backups. If it leaks, revoke it immediately in the same
+   settings page, then check the Actions tab: the cron backups keep the system running
+   only if no workflow was disabled.
 
 2. **Create two cron jobs on cron-job.org** (*Create cronjob*, time zone **UTC**):
 
