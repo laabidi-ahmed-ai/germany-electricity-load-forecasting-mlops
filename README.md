@@ -6,14 +6,14 @@
 
 ## Headline result
 
-In a one-year retrospective backtest (Nov 2025 – Nov 2026, 8,760 hours; trained once before the window, never retrained), the D+1 model had **24.6 % lower MAE than the official grid-operator day-ahead forecast** on the same target days: 1,529 MW vs 2,027 MW.
+In a one-year retrospective backtest (2 Nov 2025 – 2 Nov 2026, 8,760 hours; trained once before the window, never retrained), the D+1 model had **25.2 % lower MAE than the official grid-operator day-ahead forecast** on the same target days: 1,515 MW vs 2,025 MW.
 
 ```mermaid
 xychart-beta
     title "One-year backtest, same D+1 hours: MAE in MW (lower is better)"
     x-axis ["Official TSO day-ahead forecast", "LightGBM (D+1)"]
     y-axis "MAE (MW)" 0 --> 2500
-    bar [2027, 1529]
+    bar [2025, 1515]
 ```
 
 **Main limitation:** the backtest used *measured* weather for the past year, whereas a real forecast — ours live, and the official one — can only use weather *forecasts*. The live gap is therefore expected to be smaller; the live record on the dashboard is the final judge. Cross-validation against baselines and the full numbers: §15.
@@ -353,23 +353,25 @@ A one-time `bootstrap` workflow seeds the cloud database (backfill → features 
 
 ### Current champion: calendar day D+1 (the official forecast's task)
 
-12-fold expanding-window cross-validation (one-month folds, Nov 2025 – Oct 2026), 19 features:
+The champion is **v3**: the D+1 LightGBM refit on its full training window after early stopping (§16.7), trained on data up to 2 Nov 2026 08:00 UTC and promoted on 2 Nov 2026 (MLflow run `6371e4785d82483bb0690a134e2c892b`).
+
+12-fold expanding-window cross-validation from v3's own training run (one-month folds, 7 Nov 2025 – 2 Nov 2026), 19 features:
 
 | Model | MAE (MW) | MAPE (%) |
 |---|---:|---:|
-| Seasonal naive (same hour, 48 h ago) | 6,219 | 11.92 |
-| Seasonal naive (same hour, 168 h ago) | 2,826 | 5.33 |
-| **LightGBM (D+1)** | **1,517** | **2.88** |
+| Seasonal naive (same hour, 48 h ago) | 6,238 | 11.95 |
+| Seasonal naive (same hour, 168 h ago) | 2,827 | 5.33 |
+| **LightGBM (D+1)** | **1,496** | **2.84** |
 
-One-year out-of-sample backtest against the official forecast (trained on data up to 1 Nov 2025, never retrained, then scored on every hour from 1 Nov 2025 to 1 Nov 2026 — 8,760 hours):
+One-year out-of-sample backtest against the official forecast, with the champion's training code (trained on data up to 2 Nov 2025, never retrained, then scored on every hour from 2 Nov 2025 to 2 Nov 2026 — 8,760 hours; recorded from evaluation run B, §16.7):
 
 | | MAE (MW) | MAPE (%) |
 |---|---:|---:|
-| **LightGBM (D+1)** | **1,529** | **2.90** |
-| Official TSO day-ahead forecast | 2,027 | 3.83 |
+| **LightGBM (D+1)** | **1,515** | **2.87** |
+| Official TSO day-ahead forecast | 2,025 | 3.82 |
 
-- LightGBM beats the best baseline by 46 % (MAE) and wins on every one of the 12 folds.
-- On the official forecast's task (same target days) it had **24.6 % lower MAE in a one-year retrospective backtest using measured weather**, and a lower daily MAE on **256 of 366 days**. These are UTC days: the window ends at the latest published hour, not at midnight, so its first and last days are partial.
+- LightGBM beats the best baseline by 47.1 % (MAE) and wins on every one of the 12 folds.
+- On the official forecast's task (same target days) it had **25.2 % lower MAE in a one-year retrospective backtest using measured weather**, and a lower daily MAE on **255 of 366 days**. These are UTC days: the window ends at the latest published hour, not at midnight, so its first and last days are partial.
 - Caveat: the backtest uses *measured* weather for the past year, whereas live forecasts (ours and the official one) must use weather *forecasts* — so the live gap is expected to be smaller. The live record (dashboard) is the final judge.
 
 ### First champion (v1): the 24 hours after the latest actual
@@ -469,7 +471,7 @@ Setup and the exact monitor queries: `docs/observability.md`. Without the `DD_AP
 
 **What was built (Batch C).** A second horizon, `d_plus_1`: every morning, all of tomorrow 00:00–24:00 Berlin time (23 or 25 hours on clock-change days). Tomorrow's hours are 19–43 h after the latest actual, so `load_lag_24` would be leakage and is dropped; the information cutoff is 48 h, leaving 4–5 h of slack for a late SMARD publication, and the forecast refuses to run if the latest actual is too old to cover the whole day. Serving, retraining, drift monitoring and the backtest all follow the **champion's** horizon. Building it surfaced two details worth knowing: "same hour yesterday" is itself a leaking *baseline* for D+1 (replaced by "same hour 2 days ago"), and computing "tomorrow" as "midnight + 24 h" picks the wrong day on the autumn clock change (fixed with calendar dates, and tested).
 
-**How it was decided.** Changing the task is a product decision, not something the automatic retraining should do, so the model was first trained in an *evaluate-only* run (`bootstrap` with `horizon=d_plus_1`, `promote` off) and judged on evidence: does it beat honest baselines (cross-validation) and, above all, the official forecast on the same task (one-year backtest)? Its error is naturally higher than v1's (2.88 % vs 2.44 % CV MAPE) because it forecasts further ahead with less information — comparing those two numbers would be comparing a 100 m and a 200 m time. Against the official forecast on the same hours it had 24.6 % lower MAE in a one-year retrospective backtest using measured weather (§15), so it was promoted; rollback is `python -m src.models.registry --promote 1`.
+**How it was decided.** Changing the task is a product decision, not something the automatic retraining should do, so the model was first trained in an *evaluate-only* run (`bootstrap` with `horizon=d_plus_1`, `promote` off) and judged on evidence: does it beat honest baselines (cross-validation) and, above all, the official forecast on the same task (one-year backtest)? Its error is naturally higher than v1's (2.88 % vs 2.44 % CV MAPE) because it forecasts further ahead with less information — comparing those two numbers would be comparing a 100 m and a 200 m time. Against the official forecast on the same hours it had 24.6 % lower MAE in a one-year retrospective backtest using measured weather, so it was promoted; rollback was `python -m src.models.registry --promote 1`. Its successor, the current champion, is the same D+1 model refit on its full training window (§16.7): 25.2 % lower MAE in a one-year retrospective backtest using measured weather (§15).
 
 **Consequences.** The retraining error trigger is now per horizon — about 1.4× the cross-validated MAPE: 3.5 % for the rolling model, 4.0 % for D+1 — so the harder task does not cause pointless retrains or alerts (the Datadog monitor follows the same limit).
 
@@ -488,6 +490,30 @@ Setup and the exact monitor queries: `docs/observability.md`. Without the `DD_AP
 Every install uses it: the cloud jobs (lean ingest and full), CI, and `make setup` all run `pip install … -c requirements/constraints.txt`; the Docker image runs `pip install -r requirements/constraints.txt`, then `pip install --no-deps . && pip check`. CI therefore tests exactly the versions production runs. Offline tests (`tests/test_lock.py`) fail if a dependency is added to `pyproject.toml` without re-locking, or if a bound changes so that a pinned version no longer satisfies it.
 
 **The trade-off.** Upgrades no longer arrive by themselves, so they are now a deliberate step: `make lock-upgrade`, run the tests, push, and let CI confirm — one reviewed commit, easy to revert (`docs/operations.md`). The Streamlit dashboard keeps its own short range file (`dashboard/requirements.txt`): it only reinstalls when it is redeployed, and a broken deploy shows immediately on the page.
+
+### 16.7 Refitting after early stopping (measured)
+
+**The problem.** Early stopping held out the most recent 10 % of the training window — about 6–7 months of data — only to pick the number of trees. The model that was kept had been trained without it, so the months closest to what it forecasts never reached the model.
+
+**The change.** The tail still picks the number of trees; the model is then refit on every row with that number. CV folds, the backtest, the challenger and the final model all use the same procedure, so every reported number describes how the deployed model is trained.
+
+**How it was evaluated.** Changing how the model is trained changes every number above, so it was measured before it was merged: two *evaluate-only* bootstraps on the same data, one from `main` (A, no refit) and one from the branch (B, refit). Both selected the same number of trees (`best_iteration` 587), confirming they saw the same data.
+
+| | A: no refit | B: refit |
+|---|---:|---:|
+| CV mean MAE (12 folds) | 1,522 MW | 1,499 MW (−1.5 %) |
+| CV mean MAPE | 2.89 % | 2.84 % |
+| Backtest MAE (official: 2,025 MW in both runs) | 1,538 MW | 1,515 MW |
+| Backtest: lower MAE than the official forecast | 24.0 % | 25.2 % |
+| Backtest: days with lower daily MAE (of 366 UTC days) | 252 | 255 |
+
+B was better on 9 of the 12 paired folds, and the gains were largest in the most recent folds (fold 11: −90 MW) — where the refit adds the data closest to the validation month.
+
+The 1,499 MW is run B's; v3's own training run (§15: 1,496 MW, `best_iteration` 595) came a few hours later with slightly more data.
+
+**The decision.** Merged and promoted. The gain is modest, and on its own not conclusive: a one-sided sign test on the 12 folds gives p ≈ 0.07. But cross-validation and the full-year backtest agree on its direction and size.
+
+**The record.** MLflow runs: A `17229c7a7dbb4edda01cd328457b7c64`, B `c3bf57f0f56148a9a188e2a66b88d9c8`. The backtest numbers are recorded only in this section: the backtest is printed to the GitHub Actions log, and those logs expire. The procedure for the next change of this kind is in `docs/operations.md` (*Evaluate a model-code change against production*).
 
 ---
 

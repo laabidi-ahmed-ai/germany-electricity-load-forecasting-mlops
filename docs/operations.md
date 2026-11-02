@@ -77,6 +77,28 @@ Any service that can send a scheduled HTTP POST works; these steps use
   It trains, registers and promotes the D+1 champion and issues its first forecast; from
   then on the daily jobs, monitoring and retraining follow the champion's horizon. Roll
   back with the command below.
+- **Evaluate a model-code change against production** (anything that changes how the model
+  is trained; README §16.7 is the worked example):
+  1. Commit the change on a branch and push the branch (not `main`: the daily
+     monitor-retrain would start training challengers with it).
+  2. Actions → *bootstrap* → *Run workflow*, evaluate-only: tick **skip_backfill**, the
+     champion's horizon (`registry --show`; currently **d_plus_1**), untick **promote**. Run it
+     from `main` (A), then immediately from the branch (B, *Use workflow from*), so both see
+     the same data. Avoid roughly 05:30–07:00 and 08:30 UTC: both workflows share the
+     `promotion` queue with monitor-retrain, and a newer queued run cancels a waiting one.
+  3. Compare B with A: CV mean MAE, the paired folds (same validation windows, how many B
+     wins), the both-baselines verdict, and the backtest's gain over the official forecast.
+     `best_iteration` (MLflow) should match if the data was the same; the official
+     forecast's backtest MAE must be identical.
+  4. Merge only if B holds. Then promote: *bootstrap* from `main` with **skip_backfill** and
+     **promote** ticked (the promoting run skips the backtest).
+  5. Record the numbers in README §16, including the backtest: it is only in the Actions log,
+     and those logs expire.
+
+  **While evaluation runs exist, don't run `python -m src.models.registry --promote-latest`
+  by hand:** it registers and promotes the newest *training run* in MLflow, which may be an
+  evaluation run - from the branch, or from `main` before the merge. Promote with the
+  bootstrap, which trains first, or name the run: `--run-id <run id>`.
 - **Roll back the model.** With `DATABASE_URL` **and** `MLFLOW_TRACKING_URI` in `.env`
   (the same store the workflows use: the `MLFLOW_TRACKING_URI` secret if set, else the
   `DATABASE_URL` value - the local default `sqlite:///mlruns/mlflow.db` is the wrong
