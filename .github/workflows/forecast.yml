@@ -46,13 +46,19 @@ jobs:
       - name: Set up Python + dependencies
         uses: ./.github/actions/setup
 
+      # A failed refresh (e.g. Open-Meteo down) still forecasts from what is stored, and
+      # the job still ends red. batch_forecast refuses stale or gappy load and fetches
+      # missing target-day weather itself, failing if it cannot (README §16.2, 2 Nov).
       - name: Refresh actuals + weather (incremental ingest)
+        id: refresh
         run: python -m src.data.ingest
 
       - name: Show champion
+        if: ${{ success() || steps.refresh.outcome == 'failure' }}
         run: python -m src.models.registry --show
 
       - name: Day-ahead forecast -> database
+        if: ${{ success() || steps.refresh.outcome == 'failure' }}
         run: |
           FLAGS="--once-per-day"
           if [ "${{ inputs.force }}" = "true" ]; then FLAGS=""; fi
