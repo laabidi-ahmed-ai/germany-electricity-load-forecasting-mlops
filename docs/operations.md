@@ -123,10 +123,13 @@ Any service that can send a scheduled HTTP POST works; these steps use
 ## Schema migrations
 
 The application's tables are versioned with Alembic (`alembic.ini`, `src/data/migrations/`).
-Jobs never migrate: every entry point calls `init_db`, which builds the schema only on a
-database that has none of the application's tables, and otherwise checks that the database is
-at the revision the code expects (`SCHEMA_REVISION` in `src/data/db.py`). If it is not, the
-job stops with a `SchemaError` that names the command to run, before writing anything.
+Jobs never migrate. `ingest`, `batch_forecast`, `registry`, `retrain` and the API call
+`init_db`, which builds the schema only on a database that has none of the application's
+tables, and otherwise checks that the database is at the revision the code expects
+(`SCHEMA_REVISION` in `src/data/db.py`). If it is not, they stop with a `SchemaError` that
+names the command to run, before writing anything. `build_features`, `train`, `performance`,
+`drift` and the dashboard only read and don't check. Every scheduled workflow starts with
+`ingest`, so each scheduled run is checked before anything writes.
 
 - **Our version table is `alembic_version_app`.** The `alembic_version` table in the same
   database belongs to MLflow (its own migrations; the workflows' `MLFLOW_TRACKING_URI` falls
