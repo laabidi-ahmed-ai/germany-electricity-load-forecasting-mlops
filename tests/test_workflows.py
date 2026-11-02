@@ -77,7 +77,8 @@ def test_bootstrap_is_manual_only() -> None:
     inputs = on["workflow_dispatch"]["inputs"]
     assert {"start", "skip_backfill", "skip_training", "horizon", "promote"} <= set(inputs)
     assert inputs["horizon"]["options"] == ["day_ahead", "d_plus_1"]
-    assert inputs["horizon"]["default"] == "day_ahead" and inputs["promote"]["default"] is True
+    # the champion's horizon: a default run must not silently train the old task
+    assert inputs["horizon"]["default"] == "d_plus_1" and inputs["promote"]["default"] is True
 
 
 def test_bootstrap_can_evaluate_a_horizon_without_touching_production() -> None:
@@ -143,8 +144,12 @@ def test_ci_and_docker_install_the_locked_versions() -> None:
     ci = run_lines(load("ci.yml"))
     assert 'pip install -e ".[dev]" -c requirements/constraints.txt' in ci
     dockerfile = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
-    assert "COPY requirements/constraints.txt" in dockerfile
-    assert "pip install . -c requirements/constraints.txt" in dockerfile
+    lock_copy = dockerfile.index("COPY requirements/constraints.txt")
+    lock_install = dockerfile.index("pip install -r requirements/constraints.txt")
+    # the dependency layer is built before any source is copied, so edits keep it cached
+    assert lock_copy < lock_install < dockerfile.index("COPY src")
+    assert lock_install < dockerfile.index("COPY pyproject.toml")
+    assert "pip install --no-deps ." in dockerfile
 
 
 def test_actions_run_on_node_24() -> None:
@@ -263,3 +268,16 @@ def test_dockerfile_and_compose_do_not_depend_on_local_mlruns() -> None:
     assert not any("mlruns" in v for v in api.get("volumes", []))
     dockerfile = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
     assert "libgomp1" in dockerfile and 'CMD ["uvicorn", "src.serving.api:app"' in dockerfile
+
+
+def test_compose_lets_env_override_the_database_and_checks_each_service() -> None:
+    services = yaml.safe_load((PROJECT_ROOT / "docker-compose.yml").read_text(encoding="utf-8"))[
+        "services"
+    ]
+    for name in ("api", "dashboard"):
+        # a hard-coded value would override DATABASE_URL from .env / the shell
+        url = services[name]["environment"]["DATABASE_URL"]
+        assert url == "${DATABASE_URL:-postgresql+psycopg://load:load@db:5432/load}"
+    # the image's healthcheck probes the API port; the dashboard needs its own
+    test = " ".join(services["dashboard"]["healthcheck"]["test"])
+    assert "8501/_stcore/health" in test and "8000" not in test

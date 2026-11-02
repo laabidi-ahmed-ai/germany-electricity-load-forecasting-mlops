@@ -36,7 +36,7 @@ services:
       - path: .env
         required: false
     environment:
-      DATABASE_URL: postgresql+psycopg://load:load@db:5432/load
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://load:load@db:5432/load}
     ports:
       - "8000:8000"
     volumes:
@@ -51,10 +51,16 @@ services:
       - path: .env
         required: false
     environment:
-      DATABASE_URL: postgresql+psycopg://load:load@db:5432/load
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://load:load@db:5432/load}
     command: streamlit run dashboard/app.py --server.port 8501 --server.address 0.0.0.0 --server.headless true
     ports:
       - "8501:8501"
+    healthcheck: # the image's own healthcheck probes the API on 8000
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8501/_stcore/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 40s
+      retries: 3
 
 volumes:
   pgdata:

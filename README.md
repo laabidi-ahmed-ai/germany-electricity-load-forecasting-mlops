@@ -295,7 +295,9 @@ git clone https://github.com/laabidi-ahmed-ai/germany-electricity-load-forecasti
 cd germany-electricity-load-forecasting-mlops
 
 # 2. Install (Python 3.11+)
-pip install -e ".[dev]" -c requirements/constraints.txt   # or: make setup
+make setup        # creates .venv and installs the locked versions into it
+# (every other make target runs .venv's Python, so run `make setup` first; without make:
+#  pip install -e ".[dev]" -c requirements/constraints.txt, then call the python -m commands)
 
 # 3. Configure (SQLite is used by default while DATABASE_URL stays commented out)
 cp .env.example .env

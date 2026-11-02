@@ -260,6 +260,10 @@ def test_training_run_is_logged_to_mlflow(frame, cv, tmp_path, monkeypatch) -> N
 
 
 # --- CLI ---
+def test_train_cli_defaults_to_the_champion_horizon() -> None:
+    assert train.build_parser().parse_args([]).horizon == "d_plus_1"
+
+
 def test_train_cli_end_to_end(frame, tmp_path, monkeypatch, capsys) -> None:
     path = tmp_path / "features.parquet"
     frame.to_parquet(path)

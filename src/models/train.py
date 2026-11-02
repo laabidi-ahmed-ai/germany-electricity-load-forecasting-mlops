@@ -34,7 +34,14 @@ import pandas as pd
 from config.log import configure_logging
 from src.features.build_features import DEFAULT_OUTPUT as FEATURES_PARQUET
 from src.features.build_features import TARGET
-from src.features.horizons import DAY_AHEAD, HORIZONS, Horizon, excluded_features, select_features
+from src.features.horizons import (
+    D_PLUS_1,
+    DAY_AHEAD,
+    HORIZONS,
+    Horizon,
+    excluded_features,
+    select_features,
+)
 from src.models import evaluate
 from src.models.baselines import baseline_factories
 from src.models.tracking import DEFAULT_EXPERIMENT, setup_mlflow
@@ -221,7 +228,8 @@ def log_training_run(
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python -m src.models.train")
     p.add_argument("--features", type=Path, default=FEATURES_PARQUET)
-    p.add_argument("--horizon", choices=sorted(HORIZONS), default=DAY_AHEAD.name)
+    # The production champion's horizon; day_ahead stays available on request.
+    p.add_argument("--horizon", choices=sorted(HORIZONS), default=D_PLUS_1.name)
     p.add_argument("--n-splits", type=int, default=evaluate.DEFAULT_N_SPLITS)
     p.add_argument("--val-hours", type=int, default=evaluate.DEFAULT_VAL_HOURS)
     p.add_argument("--min-train-hours", type=int, default=evaluate.DEFAULT_MIN_TRAIN_HOURS)

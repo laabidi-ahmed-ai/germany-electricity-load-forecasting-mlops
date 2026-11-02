@@ -4,9 +4,10 @@
 #   -> monitoring check.
 # Re-running is safe: every step is idempotent (upserts) or creates a new model version.
 #
-# Evaluate another horizon without touching production: skip_backfill, horizon=d_plus_1,
-# promote=false -> CV report + a 365-day backtest vs the official forecast in the log and
-# MLflow, nothing registered. Switch to it: the same with promote=true (docs/operations.md).
+# Evaluate a horizon without touching production: skip_backfill, pick the horizon (default
+# d_plus_1, the champion's), promote=false -> CV report + a 365-day backtest vs the official
+# forecast in the log and MLflow, nothing registered. Switch to it: the same with
+# promote=true (docs/operations.md).
 name: bootstrap
 
 on:
@@ -28,7 +29,7 @@ on:
         description: "day_ahead = 24 h after the latest actual; d_plus_1 = next calendar day (Berlin)"
         type: choice
         options: [day_ahead, d_plus_1]
-        default: day_ahead
+        default: d_plus_1
       promote:
         description: "register + promote the trained model and forecast with it (off = evaluate only)"
         type: boolean

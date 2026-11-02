@@ -22,13 +22,16 @@ RUN apt-get update \
 
 WORKDIR /app
 
-# Install dependencies first so source edits do not invalidate this layer.
-COPY pyproject.toml README.md LICENSE ./
+# Install the locked dependencies first: this layer depends only on the lock file, so
+# source edits do not invalidate it. The project itself goes in afterwards, without deps.
 COPY requirements/constraints.txt ./requirements/constraints.txt
+RUN pip install --upgrade pip && pip install -r requirements/constraints.txt
+
+COPY pyproject.toml README.md LICENSE ./
 COPY src ./src
 COPY config ./config
 COPY dashboard ./dashboard
-RUN pip install --upgrade pip && pip install . -c requirements/constraints.txt
+RUN pip install --no-deps .
 
 # Non-root runtime user; data/ is a mounted volume.
 RUN useradd --create-home --uid 1000 app \
