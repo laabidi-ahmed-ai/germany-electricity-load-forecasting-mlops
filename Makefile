@@ -30,7 +30,7 @@ LOCK_CMD    := $(UV) pip compile pyproject.toml --extra dev --universal --python
                --custom-compile-command "make lock" -o requirements/constraints.txt
 
 .DEFAULT_GOAL := help
-.PHONY: help setup lock lock-upgrade test test-integration test-all lint format data data-update features train evaluate mlflow-ui register forecast monitor retrain serve dashboard clean
+.PHONY: help setup lock lock-upgrade test test-integration test-all lint format migrate db-status data data-update features train evaluate mlflow-ui register forecast monitor retrain serve dashboard clean
 
 help:  ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
@@ -64,6 +64,12 @@ lint:  ## Lint + check formatting with ruff
 format:  ## Auto-fix lint issues and reformat
 	$(PY) -m ruff check --fix .
 	$(PY) -m ruff format .
+
+migrate:  ## Apply schema migrations to DATABASE_URL (by hand only - docs/operations.md)
+	$(BIN)/alembic upgrade head
+
+db-status:  ## Show the schema revision of DATABASE_URL
+	$(BIN)/alembic current
 
 data:  ## Historical backfill from DATA_START_DATE (SMARD + Open-Meteo)
 	$(PY) -m src.data.ingest --backfill
