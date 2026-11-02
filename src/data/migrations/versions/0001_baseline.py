@@ -7,6 +7,15 @@ Create Date: 2026-11-02
 A database created before migrations is recorded at this revision once with
 ``alembic stamp 0001`` (docs/operations.md); a new database can be built from it.
 
+Production (Neon) also has something no migration created: its four time-series tables -
+``load_actual``, ``load_forecast_official``, ``weather_hourly``, ``load_forecast_model`` -
+are TimescaleDB hypertables, converted by an early setup before migrations existed (the
+``timescaledb`` extension is still installed). Alembic cannot see that, except through the
+index ``create_hypertable`` gave each table, ``<table>_timestamp_utc_idx`` on
+``timestamp_utc DESC``: the baseline includes those four indexes so it describes
+production. The code never creates hypertables; a database built from this revision has
+plain tables with the same indexes.
+
 Plain SQLAlchemy types, not the application's ``UTCDateTime``, so this file stays valid
 whatever ``src/data/db.py`` becomes. ``DateTime(timezone=True)`` creates what
 ``UTCDateTime`` creates: ``TIMESTAMP WITH TIME ZONE`` on Postgres, ``DATETIME`` on SQLite.
@@ -28,6 +37,15 @@ depends_on: str | Sequence[str] | None = None
 
 def _utc(name: str, *, nullable: bool = False) -> sa.Column:
     return sa.Column(name, sa.DateTime(timezone=True), nullable=nullable)
+
+
+# The tables production made hypertables; each got TimescaleDB's default time index.
+TIME_SERIES_TABLES = (
+    "load_actual",
+    "load_forecast_official",
+    "weather_hourly",
+    "load_forecast_model",
+)
 
 
 def upgrade() -> None:
@@ -104,6 +122,8 @@ def upgrade() -> None:
         _utc("promoted_at", nullable=True),
         sa.PrimaryKeyConstraint("name", "version"),
     )
+    for table in TIME_SERIES_TABLES:
+        op.create_index(f"{table}_timestamp_utc_idx", table, [sa.text("timestamp_utc DESC")])
 
 
 def downgrade() -> None:

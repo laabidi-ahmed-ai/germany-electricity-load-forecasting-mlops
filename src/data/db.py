@@ -27,6 +27,7 @@ from sqlalchemy import (
     Column,
     DateTime,
     Float,
+    Index,
     Integer,
     LargeBinary,
     MetaData,
@@ -173,6 +174,14 @@ class LoadForecastModel(Base):
     forecast_mw: Mapped[float] = mapped_column(Float, nullable=False)
     issued_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
     ingested_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
+
+
+# Production's four time-series tables are TimescaleDB hypertables, converted by an early setup
+# before migrations existed, and ``create_hypertable`` gave each of them this index. The code
+# never creates hypertables; the indexes are declared so the models and the baseline migration
+# describe the schema production has.
+for _model in (LoadActual, LoadForecastOfficial, WeatherHourly, LoadForecastModel):
+    Index(f"{_model.__tablename__}_timestamp_utc_idx", _model.timestamp_utc.desc())
 
 
 class MonitoringEvent(Base):

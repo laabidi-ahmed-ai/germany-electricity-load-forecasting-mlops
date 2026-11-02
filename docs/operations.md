@@ -131,6 +131,13 @@ job stops with a `SchemaError` that names the command to run, before writing any
 - **Our version table is `alembic_version_app`.** The `alembic_version` table in the same
   database belongs to MLflow (its own migrations; the workflows' `MLFLOW_TRACKING_URI` falls
   back to `DATABASE_URL`): never stamp or edit it. Alembic here sees only our tables.
+- **Production's time-series tables are TimescaleDB hypertables.** `load_actual`,
+  `load_forecast_official`, `weather_hourly` and `load_forecast_model` were converted by an
+  early setup, before migrations existed, and the `timescaledb` extension is still
+  installed. Alembic cannot see that, except through the index `create_hypertable` gave
+  each table: `<table>_timestamp_utc_idx` on `timestamp_utc DESC`. The models and the
+  baseline `0001` include those four indexes, so `alembic check` matches production. The
+  code never creates hypertables: a new database gets plain tables with the same indexes.
 - **Run Alembic** from the repository root, with the target database set for the current
   PowerShell session only (without it, Alembic uses `.env`'s value or the local SQLite file):
 
@@ -142,7 +149,14 @@ job stops with a `SchemaError` that names the command to run, before writing any
 
 - **A local database created before migrations** fails the same check: with
   `DATABASE_URL` unset, run `.venv\Scripts\alembic stamp 0001`, or delete the file and run
-  the backfill again.
+  the backfill again. One that predates the four time indexes makes `alembic check` list
+  them as `add_index`; create them once from the models (an existing index is skipped):
+
+  ```powershell
+  Remove-Item Env:DATABASE_URL -ErrorAction SilentlyContinue   # target the local file
+  .venv\Scripts\python -c "from src.data import db; e = db.get_engine(); print('target:', e.url); [ix.create(e, checkfirst=True) for t in db.Base.metadata.sorted_tables for ix in t.indexes]"
+  .venv\Scripts\alembic check
+  ```
 - **Stamp the live database (once, before merging the change that introduced migrations).**
   1. Neon SQL editor, read-only: `SELECT table_name FROM information_schema.tables WHERE
      table_schema = 'public' ORDER BY 1;` and `SELECT version_num FROM alembic_version;`
