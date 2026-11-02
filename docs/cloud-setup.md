@@ -24,7 +24,7 @@ boto3 for a 3 MB file that fits in a table row.
 | Workflow | Trigger | What it does | Install |
 |---|---|---|---|
 | `ingest.yml` | hourly, external trigger at `:20` (GitHub cron `:15` as backup) + manual (`incremental` / `backfill`) | SMARD load + official day-ahead forecast, Open-Meteo weather → DB | `requirements/ingest.txt` only (~1 min) |
-| `forecast.yml` | daily 05:40 UTC, external trigger (GitHub cron as backup) + manual (`force` to re-issue) | incremental ingest → champion (from DB) → 24 h day-ahead forecast → `load_forecast_model` | full project |
+| `forecast.yml` | daily 05:40 UTC, external trigger (GitHub cron as backup) + manual (`force` to re-issue) | incremental ingest → champion (from DB) → D+1 forecast (tomorrow, 00:00–24:00 Berlin time) → `load_forecast_model` | full project |
 | `monitor_retrain.yml` | when `forecast` completes (GitHub cron 08:30 UTC as backup) + manual (`auto` / `check-only` / `force`, `dry_run`) | performance vs actuals & official forecast, Evidently drift, triggers → champion/challenger → promote only if it wins | full project |
 | `bootstrap.yml` | manual, once | backfill 2021-03-01→now → features → train + CV → register & export champion → first forecast → monitoring check | full project |
 | `ci.yml` | push / PR | ruff + pytest (integration tests excluded) | dev extras |
@@ -51,7 +51,7 @@ tested, not on GitHub's schedule.
    backfills 5½ years, trains, promotes the champion, writes the first forecast, runs the
    first monitoring check. Re-running is safe.
 5. **Confirm** in the Actions logs: `germany-load-day-ahead@champion = v1 (...)` and
-   `stored 24 forecast rows`. From then on the three scheduled workflows keep the
+   `stored 24 forecast rows` (23 or 25 on clock-change days). From then on the three scheduled workflows keep the
    system alive. (Optionally trigger `ingest` and `forecast` manually once to see them
    green before the first cron.)
 6. **Set up the external scheduler** (`docs/operations.md`): GitHub's cron alone runs the
@@ -95,8 +95,9 @@ Roughly 100 MB after a year — comfortably inside the tier.
 - GitHub's cron is best-effort: here it ran the daily jobs 4–8 hours late and the hourly
   ingest only ~4–5 times a day (README §16.1). That is why an external scheduler starts
   them, and why the automatic forecast / monitoring runs are guarded to once per UTC day.
-  The jobs are idempotent and incremental, so a late or duplicate run never loses or
-  duplicates data.
+  The jobs are idempotent and incremental (each re-reads an overlap window: 48 h of load,
+  7 days of archived weather), so a re-run does not duplicate rows and a late or failed run
+  mostly delays data: gaps inside the overlap window are repaired on the next run.
 - The drift thresholds and retrain margins are CLI/config knobs
   (`src/monitoring/retrain.py`); manual `monitor-retrain` runs with `check-only` or
   `force` + `dry_run` let you rehearse without touching the champion.

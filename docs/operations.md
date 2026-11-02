@@ -8,7 +8,7 @@ history, are in README §16; the one-time cloud setup is in `docs/cloud-setup.md
 | When | What starts it | Job |
 |---|---|---|
 | every hour, :20 | external scheduler (backup: GitHub cron at :15) | `ingest` |
-| 05:40 | external scheduler (backup: GitHub cron at 05:40) | `forecast` (ingests first, then forecasts the next 24 h) |
+| 05:40 | external scheduler (backup: GitHub cron at 05:40) | `forecast` (ingests first, then forecasts tomorrow, 00:00–24:00 Berlin time — D+1) |
 | when `forecast` finishes | `workflow_run` chain (backup: GitHub cron at 08:30) | `monitor-retrain` |
 
 GitHub's own cron ran these jobs 4–8 hours late every day (README §16.1), so it is only a
