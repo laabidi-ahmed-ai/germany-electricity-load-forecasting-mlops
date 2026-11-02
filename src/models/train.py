@@ -8,6 +8,13 @@ Early stopping is done on the *chronological tail* of the training data (last
 ``early_stopping_frac``), never on the evaluation fold - otherwise the number of
 trees would be tuned on the data we report metrics on.
 
+The tail only picks the number of trees: the model is then refit on *every* row with
+``n_estimators = best_iteration_``, so the most recent months - the ones closest to
+what we forecast - are in the model. The same procedure runs in every CV fold, the
+backtest and the challenger fit, so every reported number describes how the deployed
+model is trained. ``refit=False`` keeps the early-stopped model (trained without the
+tail), for comparison only.
+
 No scaler: tree models are invariant to monotone feature transforms. If a linear
 model is ever added, fit its scaler on the training split only - fitting it on
 the full frame would leak validation statistics into training.
@@ -69,7 +76,7 @@ EARLY_STOPPING_FRAC = 0.10
 
 
 class LightGBMForecaster:
-    """LGBMRegressor with chronological-tail early stopping; fit/predict protocol."""
+    """LGBMRegressor with chronological-tail early stopping + full refit; fit/predict protocol."""
 
     name = MODEL_NAME
 
@@ -79,13 +86,17 @@ class LightGBMForecaster:
         *,
         early_stopping_frac: float = EARLY_STOPPING_FRAC,
         early_stopping_rounds: int = EARLY_STOPPING_ROUNDS,
+        refit: bool = True,
     ) -> None:
         self.params = {**DEFAULT_LGBM_PARAMS, **(params or {})}
         self.early_stopping_frac = early_stopping_frac
         self.early_stopping_rounds = early_stopping_rounds
+        self.refit = refit
         self.model_ = None
         self.feature_names_: list[str] = []
         self.best_iteration_: int | None = None
+        self.n_fit_rows_: int | None = None  # rows the kept model was trained on
+        self.n_early_stop_rows_: int | None = None  # tail rows that picked best_iteration_
 
     def fit(self, X: pd.DataFrame, y: pd.Series) -> LightGBMForecaster:
         import lightgbm as lgb
@@ -107,9 +118,17 @@ class LightGBMForecaster:
                 callbacks=[lgb.early_stopping(self.early_stopping_rounds, verbose=False)],
             )
             self.best_iteration_ = int(model.best_iteration_ or model.n_estimators)
+            self.n_early_stop_rows_ = n_stop
+            self.n_fit_rows_ = len(X_fit)
+            if self.refit:
+                model = lgb.LGBMRegressor(**{**self.params, "n_estimators": self.best_iteration_})
+                model.fit(X, y)
+                self.n_fit_rows_ = len(X)
         else:
             model.fit(X, y)
             self.best_iteration_ = int(model.n_estimators)
+            self.n_early_stop_rows_ = 0
+            self.n_fit_rows_ = len(X)
         self.model_ = model
         return self
 
@@ -123,6 +142,7 @@ class LightGBMForecaster:
             **self.params,
             "early_stopping_frac": self.early_stopping_frac,
             "early_stopping_rounds": self.early_stopping_rounds,
+            "refit": self.refit,
         }
 
     def feature_importances(self) -> pd.DataFrame:
@@ -155,11 +175,14 @@ def fit_model(
     cols = select_features(df.columns, horizon)
     model = LightGBMForecaster(params).fit(df[cols], df[TARGET])
     log.info(
-        "fitted %s model: %d rows, %d features, best_iteration=%d",
+        "fitted %s model: %d rows, %d features, best_iteration=%d "
+        "(picked on the last %d rows; final fit on %d rows)",
         horizon.name,
         len(df),
         len(cols),
         model.best_iteration_,
+        model.n_early_stop_rows_,
+        model.n_fit_rows_,
     )
     return model, cols
 
@@ -201,6 +224,8 @@ def log_training_run(
                 "train_start": df.index.min().isoformat(),
                 "train_end": df.index.max().isoformat(),
                 "best_iteration": model.best_iteration_,
+                "n_fit_rows": model.n_fit_rows_,
+                "n_early_stop_rows": model.n_early_stop_rows_,
                 **{f"cv_{k}": v for k, v in cv.config.items()},
             }
         )

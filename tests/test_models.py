@@ -85,25 +85,80 @@ def test_lightgbm_predict_uses_training_column_order(frame) -> None:
     np.testing.assert_allclose(model.predict(shuffled), model.predict(frame[cols]))
 
 
-def test_lightgbm_early_stopping_uses_chronological_tail(frame, monkeypatch) -> None:
-    """The early-stopping set must be the *last* rows in time, never a random sample."""
+def _spy_lgbm_fits(monkeypatch) -> list[tuple[object, pd.DataFrame, dict]]:
+    """Record every ``LGBMRegressor.fit`` call as ``(estimator, X, kwargs)``."""
     import lightgbm as lgb
 
-    seen: dict[str, pd.DataFrame] = {}
+    calls: list[tuple[object, pd.DataFrame, dict]] = []
     original_fit = lgb.LGBMRegressor.fit
 
     def spy(self, X, y, *args, **kwargs):
-        seen["fit"] = X
-        seen["es"] = kwargs["eval_set"][0][0]
+        calls.append((self, X, kwargs))
         return original_fit(self, X, y, *args, **kwargs)
 
     monkeypatch.setattr(lgb.LGBMRegressor, "fit", spy)
+    return calls
+
+
+def test_lightgbm_early_stopping_uses_chronological_tail(frame, monkeypatch) -> None:
+    """The early-stopping set must be the *last* rows in time, never a random sample."""
+    calls = _spy_lgbm_fits(monkeypatch)
     cols = select_features(frame.columns, DAY_AHEAD)
     train.LightGBMForecaster(FAST_LGBM, early_stopping_frac=0.2).fit(frame[cols], frame[TARGET])
 
-    assert seen["fit"].index.max() < seen["es"].index.min()
-    assert len(seen["es"]) == int(len(frame) * 0.2)
-    assert seen["es"].index.max() == frame.index.max()
+    _, fit_X, kwargs = calls[0]
+    es_X = kwargs["eval_set"][0][0]
+    assert fit_X.index.max() < es_X.index.min()
+    assert len(es_X) == int(len(frame) * 0.2)
+    assert es_X.index.max() == frame.index.max()
+
+
+def test_lightgbm_refits_on_every_row_with_the_selected_tree_count(frame, monkeypatch) -> None:
+    calls = _spy_lgbm_fits(monkeypatch)
+    cols = select_features(frame.columns, DAY_AHEAD)
+    model = train.LightGBMForecaster(FAST_LGBM).fit(frame[cols], frame[TARGET])
+
+    assert len(calls) == 2  # early stopping, then the refit
+    kept, kept_X, kept_kwargs = calls[-1]
+    assert kept is model.model_
+    assert "eval_set" not in kept_kwargs
+    assert kept_X.index.equals(frame.index)  # the tail is in the kept model
+    assert model.model_.n_estimators == model.best_iteration_
+    assert model.model_.booster_.num_trees() == model.best_iteration_
+    assert model.n_fit_rows_ == len(frame)
+    assert model.n_early_stop_rows_ == int(len(frame) * train.EARLY_STOPPING_FRAC)
+    assert model.get_params()["refit"] is True
+
+
+def test_lightgbm_without_refit_keeps_the_early_stopped_model(frame, monkeypatch) -> None:
+    calls = _spy_lgbm_fits(monkeypatch)
+    cols = select_features(frame.columns, DAY_AHEAD)
+    model = train.LightGBMForecaster(FAST_LGBM, refit=False).fit(frame[cols], frame[TARGET])
+
+    assert len(calls) == 1 and calls[0][0] is model.model_
+    n_stop = int(len(frame) * train.EARLY_STOPPING_FRAC)
+    assert model.n_early_stop_rows_ == n_stop
+    assert model.n_fit_rows_ == len(frame) - n_stop
+
+
+def test_lightgbm_refit_learns_what_only_the_tail_shows() -> None:
+    """A level shift in the last 10 % is learned by the refit model, not the early-stopped one."""
+    n = 2000
+    t = np.arange(n)
+    X = pd.DataFrame(
+        {"hour": t % 24, "t": t}, index=pd.date_range("2025-01-01", periods=n, freq="h", tz="UTC")
+    )
+    y = pd.Series(1000 * np.sin(2 * np.pi * t / 24), index=X.index)
+    y.iloc[-n // 10 :] += 5000
+    tail = X.index[-n // 10 :]
+
+    def tail_mae(model: train.LightGBMForecaster) -> float:
+        return float(np.abs(model.predict(X.loc[tail]) - y.loc[tail]).mean())
+
+    no_refit = train.LightGBMForecaster(FAST_LGBM, refit=False).fit(X, y)
+    refit = train.LightGBMForecaster(FAST_LGBM).fit(X, y)
+    assert tail_mae(no_refit) > 4000
+    assert tail_mae(refit) < 0.1 * tail_mae(no_refit)
 
 
 def test_lightgbm_refuses_unsorted_input(frame) -> None:
@@ -242,6 +297,10 @@ def test_training_run_is_logged_to_mlflow(frame, cv, tmp_path, monkeypatch) -> N
     assert run.data.tags["horizon"] == "day_ahead"
     assert run.data.params["n_features"] == str(len(cols))
     assert run.data.params["lgbm_n_estimators"] == str(FAST_LGBM["n_estimators"])
+    assert run.data.params["lgbm_refit"] == "True"
+    assert run.data.params["best_iteration"] == str(model.best_iteration_)
+    assert run.data.params["n_fit_rows"] == str(len(frame))
+    assert run.data.params["n_early_stop_rows"] == str(model.n_early_stop_rows_)
     assert "lightgbm_mae_mean" in run.data.metrics
     assert "seasonal_naive_168_mae_mean" in run.data.metrics
     assert run.data.metrics["beats_all_baselines"] == 1.0
