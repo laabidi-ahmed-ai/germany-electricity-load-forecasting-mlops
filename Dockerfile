@@ -31,7 +31,7 @@ COPY pyproject.toml README.md LICENSE ./
 COPY src ./src
 COPY config ./config
 COPY dashboard ./dashboard
-RUN pip install --no-deps .
+RUN pip install --no-deps . && pip check
 
 # Non-root runtime user; data/ is a mounted volume.
 RUN useradd --create-home --uid 1000 app \

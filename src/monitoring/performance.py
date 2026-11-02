@@ -31,7 +31,7 @@ from config.log import configure_logging
 from src.data import db
 from src.data.db import SOURCE_SMARD
 from src.features.build_features import TARGET, build_features
-from src.features.horizons import DAY_AHEAD, HORIZONS, Horizon
+from src.features.horizons import D_PLUS_1, DAY_AHEAD, HORIZONS, Horizon
 from src.monitoring.metrics import (
     MIN_WINDOW_HOURS,
     WINDOWS_DAYS,
@@ -230,7 +230,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--as-of", default=None)
     p.add_argument("--model-version", default=None)
     p.add_argument("--backtest-days", type=int, default=0, help="also run an OOS backtest")
-    p.add_argument("--horizon", choices=sorted(HORIZONS), default=DAY_AHEAD.name)
+    # The production champion's horizon, like src.models.train.
+    p.add_argument("--horizon", choices=sorted(HORIZONS), default=D_PLUS_1.name)
     p.add_argument("--database-url", default=None)
     args = p.parse_args(argv)
 

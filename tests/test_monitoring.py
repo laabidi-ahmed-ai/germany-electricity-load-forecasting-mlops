@@ -230,6 +230,27 @@ def test_backtest_needs_a_year_of_training(engine) -> None:
         perf.backtest_vs_official(engine, days=7, frame=feature_frame(load), params=FAST_LGBM)
 
 
+def test_performance_cli_defaults_to_the_champion_horizon(monkeypatch) -> None:
+    """No database: the engine, report and backtest are stubbed; only the parsed horizon matters."""
+    seen = {}
+
+    class _Stub:
+        daily = pd.DataFrame()
+
+        def summary(self) -> str:
+            return ""
+
+    def fake_backtest(engine, *, horizon, **kwargs):
+        seen["horizon"] = horizon.name
+        return _Stub()
+
+    monkeypatch.setattr(perf.db, "get_engine", lambda url=None: None)
+    monkeypatch.setattr(perf, "compute_report", lambda *a, **k: _Stub())
+    monkeypatch.setattr(perf, "backtest_vs_official", fake_backtest)
+    assert perf.main(["--backtest-days", "1"]) == 0
+    assert seen["horizon"] == "d_plus_1"
+
+
 # --- Drift ---
 def test_drift_columns_exclude_calendar_and_nowcast_features() -> None:
     frame = feature_frame(
