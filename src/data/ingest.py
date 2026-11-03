@@ -6,7 +6,8 @@ latest stored hour, re-fetching a small overlap window (upserts make that safe).
 
 Sources: ``smard`` (actual load and the official day-ahead load forecast) and
 ``weather`` (Open-Meteo), both keyless. Each source is validated before it is written
-and runs independently, so one failing source never blocks the others. With
+and runs independently, so one failing source never blocks the others. Every value the
+official forecast has had is kept (``db.store_official_forecast``). With
 ``DD_API_KEY`` set, each run also reports rows per step, failed steps and the age of
 the newest actual load and model forecast to Datadog (``src.observability``).
 
@@ -114,15 +115,16 @@ def ingest_smard(
 def ingest_smard_forecast(
     engine: Engine, client: SmardClient, start: pd.Timestamp, end: pd.Timestamp | None = None
 ) -> IngestResult:
-    """Official day-ahead load forecast (SMARD filter 411) -> ``load_forecast_official``."""
+    """Official day-ahead load forecast (SMARD filter 411) -> ``load_forecast_official``,
+    plus a row in ``load_forecast_official_revision`` for every hour new or changed."""
     df = client.fetch_forecast(start, end)
-    return _store(
-        engine,
-        "smard_forecast",
-        df,
-        db.LoadForecastOfficial,
-        validate=_validate_forecast,
-        source=SOURCE_SMARD,
+    if df.empty:
+        return IngestResult("smard_forecast", status="skipped", message="no rows")
+    _validate_forecast(df)
+    n, revisions = db.store_official_forecast(engine, df.assign(source=SOURCE_SMARD))
+    lo, hi = _span(df)
+    return IngestResult(
+        "smard_forecast", rows=n, start=lo, end=hi, message=f"{revisions} new/changed hours"
     )
 
 

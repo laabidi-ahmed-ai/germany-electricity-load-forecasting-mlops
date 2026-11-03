@@ -1,4 +1,4 @@
-"""Horizon-aware feature selection: what a day-ahead model may and may not see."""
+"""Horizon-aware feature selection, and the deadline by which each horizon's forecast counts."""
 
 from __future__ import annotations
 
@@ -97,3 +97,55 @@ def test_calendar_day_d_plus_1_drops_the_24h_lag(frame) -> None:
     assert load_cols == ["load_lag_48", "load_lag_168"]
     assert "load_lag_24" in excluded_features(frame.columns, D_PLUS_1)
     assert set(cols) == set(select_features(frame.columns, DAY_AHEAD)) - {"load_lag_24"}
+
+
+# --- Issue deadline ---
+def local_day(day: str) -> pd.DatetimeIndex:
+    """Every UTC hour of the Berlin calendar ``day`` (23, 24 or 25 of them)."""
+    start = pd.Timestamp(day).tz_localize("Europe/Berlin")
+    end = (pd.Timestamp(day) + pd.Timedelta(days=1)).tz_localize("Europe/Berlin")
+    return pd.date_range(start, end, freq="h", inclusive="left").tz_convert("UTC")
+
+
+@pytest.mark.parametrize(
+    ("day", "n_hours", "deadline"),
+    [
+        ("2026-01-15", 24, "2026-01-14T11:00Z"),  # winter: 12:00 CET
+        ("2026-07-15", 24, "2026-07-14T10:00Z"),  # summer: 12:00 CEST
+        ("2026-03-29", 23, "2026-03-28T11:00Z"),  # spring-forward day; the day before is CET
+        ("2026-03-30", 24, "2026-03-29T10:00Z"),  # ... and its own noon is already CEST
+        ("2026-10-25", 25, "2026-10-24T10:00Z"),  # fall-back day, repeated 02:00 included
+        ("2026-10-26", 24, "2026-10-25T11:00Z"),  # ... and its own noon is already CET
+    ],
+)
+def test_d_plus_1_is_due_at_noon_berlin_the_day_before(
+    day: str, n_hours: int, deadline: str
+) -> None:
+    hours = local_day(day)
+    assert len(hours) == n_hours
+    assert set(D_PLUS_1.issue_deadline(hours)) == {pd.Timestamp(deadline)}
+
+
+def test_d_plus_1_deadline_follows_the_berlin_day_not_the_utc_day() -> None:
+    """23:00 UTC in winter is already the next Berlin day, so it is due a day later."""
+    late_evening = pd.Timestamp("2026-01-14T22:00Z")  # 23:00 Berlin, 14 Jan
+    midnight = pd.Timestamp("2026-01-14T23:00Z")  # 00:00 Berlin, 15 Jan
+    assert D_PLUS_1.issue_deadline(late_evening) == pd.Timestamp("2026-01-13T11:00Z")
+    assert D_PLUS_1.issue_deadline(midnight) == pd.Timestamp("2026-01-14T11:00Z")
+
+
+def test_issue_deadline_keeps_the_kind_of_its_input() -> None:
+    hours = local_day("2026-01-15")
+    series = pd.Series(hours, index=range(10, 10 + len(hours)), name="timestamp_utc")
+    out = D_PLUS_1.issue_deadline(series)
+    assert isinstance(out, pd.Series) and list(out.index) == list(series.index)
+    assert out.name == "timestamp_utc" and str(out.dt.tz) == "UTC"
+    assert isinstance(D_PLUS_1.issue_deadline(hours), pd.DatetimeIndex)
+    assert isinstance(D_PLUS_1.issue_deadline(hours[0]), pd.Timestamp)
+
+
+@pytest.mark.parametrize("horizon", [DAY_AHEAD, NOWCAST])
+def test_rolling_horizons_are_due_at_the_target_hour(horizon: Horizon) -> None:
+    hours = local_day("2026-10-25")
+    pd.testing.assert_index_equal(horizon.issue_deadline(hours), hours)
+    assert horizon.issue_deadline(hours[3]) == hours[3]

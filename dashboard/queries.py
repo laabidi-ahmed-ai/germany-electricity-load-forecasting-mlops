@@ -5,8 +5,9 @@ Everything the dashboard shows is derived here from the database tables through
 the dashboard deploys with the lean ``dashboard/requirements.txt``. Keeping this
 module free of Streamlit calls makes it importable and testable on its own.
 
-Metric definitions (MAE in MW, MAPE in %) come from ``src.monitoring.metrics``, the
-same code training and monitoring use, so the dashboard agrees with both.
+Metric definitions (MAE in MW, MAPE in %) and the scoring rule (only forecasts issued by
+their deadline count) come from ``src.monitoring.metrics``, the same code training and
+monitoring use, so the dashboard agrees with both.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from sqlalchemy.engine import Engine
 
 from src.data import db
 from src.data.db import SOURCE_SMARD
+from src.features.horizons import HORIZONS
 from src.models.registry import REGISTERED_MODEL_NAME as MODEL_NAME
 from src.monitoring import metrics
 from src.monitoring.metrics import MIN_WINDOW_HOURS, WINDOWS_DAYS, compute_metrics
@@ -101,11 +103,19 @@ def latest_forecast_frame(engine: Engine, *, context_hours: int = 48) -> pd.Data
 
     Includes ``context_hours`` of history before the forecast window so the chart
     shows where the forecast picks up from. Columns: ``timestamp_utc, model_mw,
-    official_mw, actual_mw, issued_at, model_version``; rows outside the forecast
+    official_mw, actual_mw, issued_at, model_version, horizon``; rows outside the forecast
     window have ``model_mw`` NaN.
     """
     forecast = db.read_latest_model_forecast(engine)
-    cols = ["timestamp_utc", "model_mw", "official_mw", "actual_mw", "issued_at", "model_version"]
+    cols = [
+        "timestamp_utc",
+        "model_mw",
+        "official_mw",
+        "actual_mw",
+        "issued_at",
+        "model_version",
+        "horizon",
+    ]
     if forecast.empty:
         return pd.DataFrame(columns=cols)
     forecast = forecast.rename(columns={"forecast_mw": "model_mw"})
@@ -119,14 +129,42 @@ def latest_forecast_frame(engine: Engine, *, context_hours: int = 48) -> pd.Data
     ).rename(columns={"forecast_mw": "official_mw"})[["timestamp_utc", "official_mw"]]
     out = (
         hours.merge(
-            forecast[["timestamp_utc", "model_mw", "issued_at", "model_version"]], how="left"
+            forecast[["timestamp_utc", "model_mw", "issued_at", "model_version", "horizon"]],
+            how="left",
         )
         .merge(official, how="left")
         .merge(actual, how="left")
     )
-    out["issued_at"] = out["issued_at"].ffill().bfill()
-    out["model_version"] = out["model_version"].ffill().bfill()
+    for col in ("issued_at", "model_version", "horizon"):
+        out[col] = out[col].ffill().bfill()
     return out[cols]
+
+
+def deadline_status(window: pd.DataFrame) -> dict[str, Any]:
+    """When the shown issue was due, and how many of its hours it made in time.
+
+    ``window`` is the forecast hours of ``latest_forecast_frame`` (one issue). For D+1
+    every hour shares one deadline; for a rolling horizon each hour is its own deadline.
+    """
+    on_time = _on_time(window)
+    deadline = HORIZONS[window["horizon"].iloc[0]].issue_deadline(window["timestamp_utc"])
+    return {
+        "deadline": deadline.min(),
+        "n_hours": len(window),
+        "n_on_time": int(on_time.sum()),
+    }
+
+
+def scored_hours(window: pd.DataFrame) -> pd.DataFrame:
+    """The shown issue's hours that are scored: issued by their deadline, with an actual (and
+    the official forecast to compare with) - the hours the accuracy panel counts for it."""
+    observed = window["actual_mw"].notna() & window["official_mw"].notna()
+    return window[_on_time(window) & observed]
+
+
+def _on_time(window: pd.DataFrame) -> pd.Series:
+    deadline = HORIZONS[window["horizon"].iloc[0]].issue_deadline(window["timestamp_utc"])
+    return window["issued_at"] <= deadline
 
 
 # --- Accuracy over time: model vs the official forecast (shared with monitoring) ---
@@ -138,20 +176,46 @@ def actual_vs_official(
     return metrics.actual_vs_official(engine, start=as_of - pd.Timedelta(days=days), end=as_of)
 
 
-def aligned_frame(engine: Engine, base: pd.DataFrame) -> pd.DataFrame:
-    """The ``base`` hours that also have a model forecast (latest issue per hour)."""
-    return metrics.with_model_forecast(engine, base)
+def model_issues(engine: Engine, base: pd.DataFrame) -> pd.DataFrame:
+    """Every stored forecast issue for ``base``'s hours with its deadline (read once)."""
+    return metrics.model_issues(engine, base)
+
+
+def aligned_frame(
+    engine: Engine, base: pd.DataFrame, issues: pd.DataFrame | None = None
+) -> pd.DataFrame:
+    """The ``base`` hours that also have a model forecast (latest on-time issue per hour)."""
+    return metrics.with_model_forecast(engine, base, issues=issues)
+
+
+def forecast_status(
+    engine: Engine, base: pd.DataFrame, issues: pd.DataFrame | None = None
+) -> pd.DataFrame:
+    """Per ``base`` hour: was its forecast ``on_time``, ``late`` or ``missing``."""
+    return metrics.forecast_status(engine, base, issues)
+
+
+PUNCTUALITY_KEYS = ("on_time_pct", "n_on_time", "n_late", "n_missing")
 
 
 def window_summary(
-    aligned: pd.DataFrame, *, days: int, as_of: pd.Timestamp | None = None
+    aligned: pd.DataFrame,
+    *,
+    days: int,
+    as_of: pd.Timestamp | None = None,
+    status: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
-    """Head-to-head over ``(as_of - days, as_of]`` - the window the monitoring job scores."""
+    """Head-to-head over ``(as_of - days, as_of]`` - the window the monitoring job scores.
+
+    With ``status`` (``forecast_status``) the on-time counts are included, judged or not.
+    """
     as_of = as_of if as_of is not None else pd.Timestamp.now(tz="UTC").floor("h")
-    wm = metrics.window_metrics(aligned, as_of, days)
+    wm = metrics.window_metrics(aligned, as_of, days, status)
     out: dict[str, Any] = {"days": days, "n_hours": wm.n_hours, "judged": wm.judged}
+    if status is not None:
+        out.update({k: getattr(wm, k) for k in PUNCTUALITY_KEYS})
     if wm.judged:
-        skip = {"window_days", "start", "end", "n_hours"}
+        skip = {"window_days", "start", "end", "n_hours", *PUNCTUALITY_KEYS}
         out.update({k: v for k, v in asdict(wm).items() if k not in skip})
     return out
 
@@ -273,6 +337,7 @@ def event_timeline(events: pd.DataFrame) -> pd.DataFrame:
         "reason",
         "model_mape_7d",
         "official_mape_7d",
+        "on_time_pct_7d",
         "drift_share",
     ]
     if events.empty:
@@ -283,5 +348,15 @@ def event_timeline(events: pd.DataFrame) -> pd.DataFrame:
             return str(row["decision"] or db.EVENT_RETRAIN)
         return "triggered" if row["triggered"] else "ok"
 
-    out = events.assign(status=events.apply(status, axis=1))
+    out = events.assign(
+        status=events.apply(status, axis=1),
+        on_time_pct_7d=events["details_parsed"].map(_on_time_pct_7d),
+    )
     return out[cols].sort_values("created_at", ascending=False).reset_index(drop=True)
+
+
+def _on_time_pct_7d(details: dict[str, Any]) -> float | None:
+    """The 7-day on-time share a pass recorded in ``details`` (None before Step 8)."""
+    performance = (details.get("decision") or {}).get("performance") or {}
+    windows = performance.get("windows") or []
+    return next((w.get("on_time_pct") for w in windows if w.get("window_days") == 7), None)

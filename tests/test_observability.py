@@ -129,6 +129,7 @@ def test_ingest_metrics_rows_failed_steps_and_freshness_of_data_and_forecast(eng
                 "timestamp_utc": [latest + pd.Timedelta(hours=1)],
                 "model_version": "1",
                 "model_name": "m",
+                "horizon": "d_plus_1",
                 "forecast_mw": 50_000.0,
                 "issued_at": pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=5),
             }
@@ -155,6 +156,7 @@ def test_forecast_metrics_only_count_a_stored_forecast() -> None:
         frame=pd.DataFrame(index=range(24)),
         issued_at=pd.Timestamp("2026-10-16T05:41Z"),
         last_actual=pd.Timestamp("2026-10-16T03:00Z"),
+        deadline_margin_hours=4.3,  # due 10:00 UTC (summer time on 16 Oct)
     )
     forecast_metrics(m, result, dry_run=True)  # a dry run is not an issue
     m.flush()
@@ -167,11 +169,12 @@ def test_forecast_metrics_only_count_a_stored_forecast() -> None:
     assert value(got, "forecast.issued", model_version="v1") == 1
     assert value(got, "forecast.hours") == 24
     assert value(got, "forecast.data_age_hours") == pytest.approx(2 + 41 / 60)
+    assert value(got, "forecast.deadline_margin_hours", model_version="v1") == 4.3
 
 
 def test_monitor_metrics_accuracy_drift_triggers_and_decision() -> None:
     window = SimpleNamespace(
-        window_days=7, model_mape=2.8, official_mape=3.04, improvement_pct=10.5
+        window_days=7, model_mape=2.8, official_mape=3.04, improvement_pct=10.5, on_time_pct=97.6
     )
     decision = SimpleNamespace(
         champion_version="1",
@@ -190,6 +193,7 @@ def test_monitor_metrics_accuracy_drift_triggers_and_decision() -> None:
     got = rec.metrics()
     assert value(got, "model.mape", window="7d", model_version="v1") == 2.8
     assert value(got, "official.mape", window="7d") == 3.04
+    assert value(got, "forecast.on_time_pct", window="7d", model_version="v1") == 97.6
     assert value(got, "drift.share") == 0.375
     assert value(got, "drift.unavailable") == 0
     assert value(got, "trigger.fired", trigger="drift") == 1

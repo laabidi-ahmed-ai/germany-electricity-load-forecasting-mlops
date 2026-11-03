@@ -42,12 +42,11 @@ from config.settings import PROJECT_ROOT, get_settings
 from src.data import db
 from src.data.weather_client import NATIONAL_COLUMNS as WEATHER_COLUMNS
 from src.data.weather_client import national_average
-from src.features.horizons import most_recent_load_lag
+from src.features.horizons import LOCAL_TZ, most_recent_load_lag
 
 log = logging.getLogger(__name__)
 
 TARGET = "load_mw"
-LOCAL_TZ = "Europe/Berlin"
 
 LAG_HOURS: tuple[int, ...] = (1, 24, 48, 168)
 ROLLING_WINDOWS: tuple[int, ...] = (24, 168)

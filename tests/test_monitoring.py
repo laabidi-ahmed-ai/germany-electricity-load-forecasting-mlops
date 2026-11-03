@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
-
 import numpy as np
 import pandas as pd
 import pytest
@@ -20,9 +18,53 @@ from tests.conftest import FAST_LGBM, fake_loaded_model, load_curve, random_weat
 N_DAYS = 40
 START = pd.Timestamp("2024-01-01T00:00Z")
 AS_OF = START + pd.Timedelta(days=N_DAYS) - pd.Timedelta(hours=1)  # last hour of the data
+MODEL_NAME = "germany-load-day-ahead"
+# The daily job issues at 05:40 UTC; in winter a D+1 forecast is due at 11:00 UTC.
+ISSUE_LEAD = pd.Timedelta(hours=5, minutes=20)
 
 
 # --- Helpers ---
+def issue(
+    hours: pd.Series | pd.DatetimeIndex,
+    forecast_mw: np.ndarray | float,
+    *,
+    version: str = "1",
+    issued_at: pd.Series | pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    """D+1 forecast rows; by default each Berlin day issued at 05:40 UTC the day before."""
+    hours = pd.Series(hours)
+    if issued_at is None:
+        issued_at = D_PLUS_1.issue_deadline(hours) - ISSUE_LEAD
+    return pd.DataFrame(
+        {
+            "timestamp_utc": hours,
+            "model_version": version,
+            "model_name": MODEL_NAME,
+            "horizon": D_PLUS_1.name,
+            "forecast_mw": forecast_mw,
+            "issued_at": issued_at,
+        }
+    )
+
+
+def local_day(day: str) -> pd.DatetimeIndex:
+    """The UTC hours of Berlin calendar ``day`` (winter: 23:00 UTC the evening before on)."""
+    return pd.date_range(
+        pd.Timestamp(day).tz_localize("Europe/Berlin"), periods=24, freq="h"
+    ).tz_convert("UTC")
+
+
+def delete_forecasts(engine, hours: pd.DatetimeIndex) -> None:
+    from sqlalchemy import delete
+
+    with engine.begin() as conn:
+        conn.execute(
+            delete(db.LoadForecastModel).where(
+                db.LoadForecastModel.timestamp_utc.in_(list(hours.to_pydatetime()))
+            )
+        )
+
+
 def seed_db(
     engine,
     *,
@@ -50,18 +92,14 @@ def seed_db(
             }
         ),
     )
-    if with_model:
+    if with_model:  # one on-time D+1 issue per day, as the daily job makes them
         db.upsert_dataframe(
             engine,
             db.LoadForecastModel,
-            pd.DataFrame(
-                {
-                    "timestamp_utc": ts,
-                    "model_version": model_version,
-                    "model_name": "germany-load-day-ahead",
-                    "forecast_mw": load + model_bias + rng.normal(0, model_noise, len(ts)),
-                    "issued_at": datetime(2024, 1, 1, tzinfo=UTC),
-                }
+            issue(
+                ts,
+                load + model_bias + rng.normal(0, model_noise, len(ts)),
+                version=model_version,
             ),
         )
     return pd.DataFrame({"timestamp_utc": ts, TARGET: load})
@@ -129,25 +167,65 @@ def test_aligned_frame_inner_joins_on_common_hours(engine) -> None:
     assert a["timestamp_utc"].is_monotonic_increasing
 
 
-def test_aligned_frame_uses_latest_issued_forecast_per_hour(engine) -> None:
+def test_the_latest_on_time_issue_wins_and_a_late_one_never_does(engine) -> None:
     seed_db(engine)
-    ts = START + pd.Timedelta(days=3)
-    later = pd.DataFrame(
-        {
-            "timestamp_utc": [ts],
-            "model_version": ["2"],
-            "model_name": ["germany-load-day-ahead"],
-            "forecast_mw": [99_999.0],
-            "issued_at": [datetime(2024, 2, 1, tzinfo=UTC)],
-        }
-    )
-    db.upsert_dataframe(engine, db.LoadForecastModel, later)
+    ts = START + pd.Timedelta(days=3)  # 01:00 Berlin on 4 Jan: due 3 Jan 11:00 UTC
+    due = D_PLUS_1.issue_deadline(ts)
+    assert due == pd.Timestamp("2024-01-03T11:00Z")
+    on_time = issue([ts], 77_777.0, version="2", issued_at=due)  # at the deadline still counts
+    late = issue([ts], 99_999.0, version="2", issued_at=due + pd.Timedelta(minutes=1))
+    db.upsert_dataframe(engine, db.LoadForecastModel, on_time)
+    db.upsert_dataframe(engine, db.LoadForecastModel, late)
+
+    stored = db.read_table(engine, db.LoadForecastModel, start=ts, end=ts)
+    assert len(stored) == 3  # every issue is kept: v1's, and both re-issues
     a = align(engine)
     row = a[a["timestamp_utc"] == ts].iloc[0]
-    assert row["model_mw"] == 99_999.0 and row["model_version"] == "2"
+    assert row["model_mw"] == 77_777.0 and row["model_version"] == "2"
     assert len(a) == 24 * N_DAYS  # still one row per hour
     only_v1 = align(engine, model_version="1")
-    assert only_v1[only_v1["timestamp_utc"] == ts]["model_mw"].iloc[0] != 99_999.0
+    assert only_v1[only_v1["timestamp_utc"] == ts]["model_mw"].iloc[0] not in (77_777.0, 99_999.0)
+
+
+def test_on_time_late_and_missing_hours_are_counted_across_versions(engine) -> None:
+    seed_db(engine)
+    late_day, missing_day, v2_day = (
+        local_day("2024-01-20"),
+        local_day("2024-01-22"),
+        local_day("2024-01-25"),
+    )
+    for day in (late_day, missing_day, v2_day):
+        delete_forecasts(engine, day)
+    late_at = D_PLUS_1.issue_deadline(late_day[0]) + pd.Timedelta(hours=2)  # a late backup run
+    db.upsert_dataframe(engine, db.LoadForecastModel, issue(late_day, 50_000.0, issued_at=late_at))
+    db.upsert_dataframe(engine, db.LoadForecastModel, issue(v2_day, 50_000.0, version="2"))
+
+    status = metrics.forecast_status(engine, metrics.actual_vs_official(engine)).set_index(
+        "timestamp_utc"
+    )["status"]
+    assert (status[late_day] == metrics.LATE).all()
+    assert (status[missing_day] == metrics.MISSING).all()
+    assert (status[v2_day] == metrics.ON_TIME).all()
+
+    report = perf.compute_report(engine, as_of=AS_OF, model_version="1")
+    w30 = report.window(30)  # (10 Jan 23:00, 9 Feb 23:00]: the three days are inside
+    assert w30.n_hours == 24 * 30 - 3 * 24  # v1 is scored on its own on-time hours only
+    assert (w30.n_on_time, w30.n_late, w30.n_missing) == (24 * 30 - 48, 24, 24)
+    assert w30.on_time_pct == pytest.approx(100 * (24 * 30 - 48) / (24 * 30))
+    w7 = report.window(7)
+    assert (w7.n_late, w7.n_missing, w7.on_time_pct) == (0, 0, 100.0)
+    assert "on time 93% (24 late, 24 missing)" in report.summary()
+    assert report.to_dict()["windows"][1]["on_time_pct"] == w30.on_time_pct
+    aligned = align(engine)
+    assert not aligned["timestamp_utc"].isin(late_day).any()  # a late-only hour is not scored
+
+
+def test_hours_before_the_first_forecast_are_not_missing(engine) -> None:
+    seed_db(engine)
+    delete_forecasts(engine, pd.date_range(START, AS_OF - pd.Timedelta(days=10), freq="h"))
+    w30 = perf.compute_report(engine, as_of=AS_OF).window(30)
+    assert w30.n_hours == w30.n_on_time == 24 * 10  # the forecasts start 31 Jan 00:00 UTC
+    assert w30.n_missing == 0 and w30.on_time_pct == 100.0
 
 
 def test_report_head_to_head_on_same_hours(engine) -> None:
@@ -162,6 +240,7 @@ def test_report_head_to_head_on_same_hours(engine) -> None:
         assert w.model_beats_official is True
         assert w.improvement_pct > 0
         assert 0 < w.model_mape < w.official_mape < 5
+        assert (w.n_on_time, w.n_late, w.n_missing, w.on_time_pct) == (24 * days, 0, 0, 100.0)
     assert len(report.daily) == 30
     assert set(report.official_only) == {7, 30}
     assert report.official_only[30]["n_hours"] == 720
@@ -184,6 +263,7 @@ def test_report_without_model_forecasts_is_honest(engine) -> None:
     assert not report.has_data
     assert report.n_aligned_hours == 0
     assert all(not w.judged for w in report.windows)
+    assert all(w.on_time_pct is None and w.n_missing == 0 for w in report.windows)  # not live
     assert report.official_only[7]["n_hours"] == 168  # the benchmark alone is still scored
     assert "no scorable model forecasts yet" in report.summary()
 

@@ -213,7 +213,7 @@ Day-ahead load forecasting is a **supervised** problem. The model progresses fro
 
 Automated retraining here means a disciplined, guarded pipeline — not online learning:
 
-- **Performance monitoring** — each day, once the real load is published, compute the champion's error and the official forecast's error over the same hours; track both.
+- **Performance monitoring** — each day, once the real load is published, compute the champion's error and the official forecast's error over the same hours; track both. Every issued forecast is kept. An hour is scored with the latest issue made by its deadline, 12:00 Berlin on the day before for D+1, when the day-ahead auction closes; a later issue is never scored. The share of hours with an on-time forecast is tracked too (§16.9).
 - **Data drift detection** — compare recent data (and features) against the training distribution with **Evidently**. Thresholds are calibrated against historical regime shifts rather than left at library defaults, so ordinary year-to-year variation does not trigger false alarms.
 - **Trigger** — retraining fires when rolling error crosses a threshold, when the official forecast beats the model by too much, or when drift is detected.
 - **Champion / challenger** — a challenger is trained on the latest data and evaluated against the champion on data that arrived *after* the champion's training window (a true out-of-time holdout).
@@ -232,6 +232,7 @@ This loop is why the system is designed to keep running (hourly ingestion, a dai
 | Language | Python 3.11+ |
 | Data ingestion | `requests` (SMARD, Open-Meteo) |
 | Storage | Postgres (Neon / Supabase free tier); SQLite for local dev |
+| Schema migrations | Alembic (jobs check the schema version, never migrate) |
 | Feature engineering | pandas, `holidays` |
 | Modeling | LightGBM |
 | Experiment tracking + registry | MLflow (Postgres-backed) |
@@ -255,6 +256,7 @@ germany-electricity-load-forecasting-mlops/
 ├── LICENSE
 ├── pyproject.toml                 # dependencies & tooling config
 ├── Makefile                       # common commands (setup, test, data, train, serve, …)
+├── alembic.ini                    # schema migrations (scripts in src/data/migrations/)
 ├── Dockerfile                     # serving image (API + batch job)
 ├── docker-compose.yml             # local Postgres + API + dashboard
 ├── .env.example                   # template for secrets (no real values)
@@ -270,7 +272,7 @@ germany-electricity-load-forecasting-mlops/
 ├── config/
 │   └── settings.py                # typed configuration
 ├── src/
-│   ├── data/                      # ingestion & DB access (smard, weather, db, ingest)
+│   ├── data/                      # ingestion & DB access (smard, weather, db, ingest, migrations/)
 │   ├── features/                  # build_features, horizons (leakage-safe, horizon-aware)
 │   ├── models/                    # baselines, train, evaluate, registry, tracking
 │   ├── serving/                   # api (FastAPI), forecast, batch_forecast
@@ -429,6 +431,8 @@ The system went live on 17 September 2026. Some problems only show up when a sys
 
 **Resolved later (§16.5):** forecasting the 24 hours *after the latest actual* is not the same as forecasting *tomorrow's calendar day*, which is what the official forecast and the auction use. The calendar-day (D+1) champion removes the remaining overlap/gap effect and makes the official comparison the same task (same target day); the weather information is still not equal (§8).
 
+**Resolved later (§16.9):** problem 2's replacement is gone too. Every issue is now kept, and an hour is scored with the latest issue made by its deadline: a late re-issue can no longer flatter the live score, and a forecast that arrives after the auction no longer counts at all.
+
 ### 16.2 Incident log
 
 | Date (2026) | What happened | Root cause | Fix |
@@ -535,6 +539,38 @@ The duplicate indexes are dropped. Dropping ~900 chunks in one transaction can e
 | Upgrade duration | 27.5 s |
 | Rows: `load_actual` / `load_forecast_official` / `weather_hourly` / `load_forecast_model` | 49,758 / 49,775 / 249,120 / 1,163 |
 | Mode used | one transaction |
+
+### 16.9 Every issued forecast kept; only on-time forecasts scored
+
+**The problem.** The live record could not be audited "as of issue time". Three histories were overwritten:
+- `load_forecast_model` was keyed by hour and model version, so a re-issue replaced the earlier issue of the same hours;
+- `load_forecast_official` keeps one value per hour, so revisions of the official forecast were invisible;
+- the weather a forecast used lived only in `weather_hourly`, where the archive later overwrites forecast values.
+
+Scoring also took the latest issue of each hour, even one made after the hour had started (§16.1, problem 2).
+
+**The fix (revision `0003`).**
+- `load_forecast_model` has `issued_at` in its primary key, so a re-issue adds rows. Each row also stores the model's `horizon`, filled in for past forecasts from the model exports. A check refuses the migration, before any change, if a version has no export.
+- `load_forecast_official_revision` keeps every value the official forecast has had. It started as a copy of the official forecast table; each ingest adds only the hours whose value is new or changed. That copy is a snapshot of the values held at the upgrade, stamped with when each row was last written rather than when the value was first seen, and earlier revisions were never kept: the revision history is complete only from the upgrade onward.
+- `load_forecast_model_weather` keeps the per-city weather each stored forecast used, written in the same transaction as the forecast.
+
+**The scoring rule.** Each horizon has an issue deadline. For D+1 it is 12:00 Berlin on the day before the target day, when the day-ahead auction closes: 11:00 UTC in winter, 10:00 UTC in summer, the same for every hour of a 23- or 25-hour clock-change day. For the rolling horizons it is the target hour itself. Either way, an hour that has already started when the forecast is issued counts as late. An hour is scored with the latest issue made by its deadline; a late issue is stored and shown, never scored. Each window also reports its hours as on time, late (only late issues) or missing (no issue). The on-time share is in the performance report, the monitoring events, the dashboard and Datadog (`forecast.on_time_pct`), and the forecast job reports its margin to the deadline (`forecast.deadline_margin_hours`).
+
+One consequence for the record before the fix: where a later issue had overwritten an earlier one, only the later one survives. For the first champion (v1), whose deadline is the target hour, some of those hours were issued after the hour started. They now count as late and leave the live score.
+
+The migration was rehearsed on a Neon branch before it ran on `main`, including a real ingest and a real forecast on the branch. Runbook: `docs/operations.md` (*Keep every issued forecast*).
+
+| Rehearsal (`rehearse-0003`) | |
+|---|---|
+| Upgrade duration | _TBD_ s |
+| `load_forecast_model` rows / issues per version, with backfilled horizon | _TBD_ |
+| `load_forecast_official_revision` seeded (= `load_forecast_official`) | _TBD_ rows |
+| Real ingest on the branch: official hours new or changed | _TBD_ |
+| `batch_forecast --dry-run`: target window, deadline margin | _TBD_ → _TBD_, _TBD_ h |
+| Real forecast on the branch: new issue's rows / weather inputs; earlier issue kept | _TBD_ / _TBD_ (5 cities × _TBD_ h); _TBD_ |
+| Downgrade → upgrade: `load_forecast_model` rows | _TBD_ → _TBD_ → `alembic check` clean |
+| On-time share, 7 d / 30 d; hours now late | _TBD_ % / _TBD_ %; _TBD_ |
+| Database size before / after | _TBD_ / _TBD_ |
 
 
 ---

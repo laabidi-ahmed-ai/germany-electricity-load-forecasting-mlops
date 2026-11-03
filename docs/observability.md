@@ -23,8 +23,10 @@ and `runner:github` (or `runner:local` from a laptop — filter on `runner:githu
 | `data.freshness_hours` | ingest | hours since the newest actual load hour |
 | `forecast.age_hours` | ingest | hours since the latest model forecast was issued (a watchdog for the forecast job) |
 | `forecast.issued`, `forecast.hours`, `forecast.data_age_hours` | forecast | a forecast was stored; how many hours; how old the newest actual was at issue time |
+| `forecast.deadline_margin_hours` | forecast | hours from the issue to its deadline (D+1: 12:00 Berlin the day before); about +5 in winter, negative = too late to be scored |
 | `forecast.skipped` | forecast | a backup run found today's forecast already issued |
 | `model.mape`, `official.mape`, `model.improvement_pct` (tag `window:7d|30d`) | monitor | live accuracy head-to-head |
+| `forecast.on_time_pct` (tag `window:7d|30d`) | monitor | share of the window's hours that had a forecast issued by its deadline (any model version); the rest were late or missing |
 | `drift.share` | monitor | share of monitored columns that drifted |
 | `drift.unavailable` | monitor | 1 if the drift check could not run (it never fails the job, so this is the only signal) |
 | `trigger.fired` (tag `trigger:error|official|drift`) | monitor | 1 if that retrain trigger fired |
@@ -104,6 +106,8 @@ widgets (*Add widgets* → type → paste the query in the code editor):
 | Model vs official MAPE (30 d) | Timeseries | same with `window:30d` |
 | Data freshness (h) | Query Value | `max:germany_load.data.freshness_hours{runner:github}` |
 | Forecast age (h) | Query Value | `max:germany_load.forecast.age_hours{runner:github}` |
+| Forecast deadline margin (h) | Timeseries | `min:germany_load.forecast.deadline_margin_hours{runner:github}` |
+| On-time forecasts (%) | Timeseries | `min:germany_load.forecast.on_time_pct{runner:github} by {window}` |
 | Drift share | Timeseries | `max:germany_load.drift.share{runner:github}` |
 | Rows ingested per step | Timeseries (bars) | `sum:germany_load.ingest.rows{runner:github} by {step}` |
 | Job duration (s) | Timeseries | `max:germany_load.job.duration_seconds{runner:github} by {job}` |

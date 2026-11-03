@@ -98,6 +98,7 @@ def test_last_run_helpers_and_happened_today(engine) -> None:
                 "timestamp_utc": pd.date_range("2026-10-15T04:00Z", periods=2, freq="h"),
                 "model_version": "1",
                 "model_name": "m",
+                "horizon": "day_ahead",
                 "forecast_mw": 50_000.0,
                 "issued_at": issued,
             }

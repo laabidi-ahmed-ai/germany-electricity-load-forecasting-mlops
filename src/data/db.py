@@ -7,6 +7,10 @@
 * Upserts are idempotent. Re-running any ingestion never creates duplicates:
   every table has a natural primary key and ``upsert_dataframe`` uses
   ``INSERT ... ON CONFLICT DO UPDATE`` on both dialects.
+* Histories are kept, never overwritten: every model forecast issue
+  (``load_forecast_model`` is keyed by ``issued_at`` too), with the per-city weather it
+  used (``load_forecast_model_weather``), and every value the official forecast has had
+  (``load_forecast_official_revision``).
 * Postgres is the production store (README §10); SQLite is the zero-config local
   fallback that the default ``DATABASE_URL`` points at.
 * The schema is versioned with Alembic (``src/data/migrations``). ``init_db`` creates it
@@ -44,7 +48,7 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy.dialects import postgresql, sqlite
-from sqlalchemy.engine import Dialect, Engine
+from sqlalchemy.engine import Connection, Dialect, Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.sql import ColumnElement, Executable
 from sqlalchemy.types import TypeDecorator
@@ -141,6 +145,24 @@ class LoadForecastOfficial(Base):
     ingested_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
 
 
+class LoadForecastOfficialRevision(Base):
+    """Every value the official forecast has had: a row per hour each time it is new or changed.
+
+    ``load_forecast_official`` keeps the latest value (the scores use it); this table keeps
+    the history, written by ``store_official_forecast``. ``ingested_at`` is the run that
+    first saw the value - except for the rows migration 0003 seeded: a snapshot of the values
+    held at the upgrade, with ``ingested_at`` = when each row was last written. The history
+    is complete only from that upgrade onward.
+    """
+
+    __tablename__ = "load_forecast_official_revision"
+
+    timestamp_utc: Mapped[datetime] = mapped_column(UTCDateTime, primary_key=True)
+    source: Mapped[str] = mapped_column(String(16), primary_key=True)
+    forecast_mw: Mapped[float] = mapped_column(Float, nullable=False)
+    ingested_at: Mapped[datetime] = mapped_column(UTCDateTime, primary_key=True)
+
+
 class WeatherHourly(Base):
     """Hourly weather per city. ``source`` = ``archive`` (reanalysis) | ``forecast``."""
 
@@ -158,21 +180,51 @@ class WeatherHourly(Base):
 
 
 class LoadForecastModel(Base):
-    """Hourly day-ahead forecast produced by *our* champion model (batch job output).
+    """Hourly forecast produced by *our* champion model (batch job output), one row per issue.
 
-    Keyed by ``(timestamp_utc, model_version)`` so re-issuing a forecast for the
-    same hours with the same model updates in place; a new model version keeps
-    its own rows, which lets monitoring compare versions side by side.
+    Keyed by ``(timestamp_utc, model_version, issued_at)``: a re-issue for the same hours
+    adds rows instead of overwriting, so every forecast can be scored as it was issued.
+    ``horizon`` is the model's (``src.features.horizons``) and sets each issue's deadline;
+    scoring takes the latest issue made by it (``src.monitoring.metrics``).
     """
 
     __tablename__ = "load_forecast_model"
+    # Named as Postgres names it, on SQLite too, so a migration can replace it by name.
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "timestamp_utc", "model_version", "issued_at", name="load_forecast_model_pkey"
+        ),
+    )
+
+    timestamp_utc: Mapped[datetime] = mapped_column(UTCDateTime)
+    model_version: Mapped[str] = mapped_column(String(64))
+    issued_at: Mapped[datetime] = mapped_column(UTCDateTime)
+    model_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    horizon: Mapped[str] = mapped_column(String(32), nullable=False)
+    forecast_mw: Mapped[float] = mapped_column(Float, nullable=False)
+    ingested_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
+
+
+class LoadForecastModelWeather(Base):
+    """The per-city weather each stored model forecast used, as it was read at issue time.
+
+    ``weather_hourly`` keeps one row per hour and city, and the archive overwrites forecast
+    values there; this table keeps the inputs of every issue (``issued_at`` links it to
+    ``load_forecast_model``). ``fetched_at`` is when that weather row had been ingested.
+    """
+
+    __tablename__ = "load_forecast_model_weather"
 
     timestamp_utc: Mapped[datetime] = mapped_column(UTCDateTime, primary_key=True)
-    model_version: Mapped[str] = mapped_column(String(64), primary_key=True)
-    model_name: Mapped[str] = mapped_column(String(128), nullable=False)
-    forecast_mw: Mapped[float] = mapped_column(Float, nullable=False)
-    issued_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
-    ingested_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
+    city: Mapped[str] = mapped_column(String(64), primary_key=True)
+    issued_at: Mapped[datetime] = mapped_column(UTCDateTime, primary_key=True)
+    source: Mapped[str] = mapped_column(String(16), nullable=False)
+    temperature_2m: Mapped[float | None] = mapped_column(Float)
+    wind_speed_10m: Mapped[float | None] = mapped_column(Float)
+    shortwave_radiation: Mapped[float | None] = mapped_column(Float)
+    cloud_cover: Mapped[float | None] = mapped_column(Float)
+    relative_humidity_2m: Mapped[float | None] = mapped_column(Float)
+    fetched_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
 
 
 class MonitoringEvent(Base):
@@ -250,7 +302,7 @@ def normalize_database_url(url: str) -> str:
 # MLflow's own migrations keep their revision there when it tracks into the same database.
 SCHEMA_VERSION_TABLE = "alembic_version_app"
 # Every revision, oldest first; tests/test_migrations.py checks it against the scripts.
-SCHEMA_REVISIONS: tuple[str, ...] = ("0001", "0002")
+SCHEMA_REVISIONS: tuple[str, ...] = ("0001", "0002", "0003")
 SCHEMA_REVISION = SCHEMA_REVISIONS[-1]
 
 # The version table exactly as Alembic creates it, so ``init_db`` can record the revision of
@@ -365,17 +417,48 @@ def upsert_rows(
     """
     if not rows:
         return 0
-    now = datetime.now(UTC)
-    if "ingested_at" in model.__table__.columns:
-        payload = [{**row, "ingested_at": row.get("ingested_at", now)} for row in rows]
-    else:
-        payload = list(rows)
-    dialect = engine.dialect.name
+    payload = _stamped(model, rows)
     with engine.begin() as conn:
-        for i in range(0, len(payload), chunk_rows):
-            chunk = payload[i : i + chunk_rows]
-            conn.execute(_build_upsert(dialect, model, chunk, update_where))
+        _upsert(conn, model, payload, update_where=update_where, chunk_rows=chunk_rows)
     return len(payload)
+
+
+def _stamped(model: type[Base], rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """``rows`` with ``ingested_at`` = now where ``model`` has that column and a row lacks it."""
+    if "ingested_at" not in model.__table__.columns:
+        return list(rows)
+    now = datetime.now(UTC)
+    return [{**row, "ingested_at": row.get("ingested_at", now)} for row in rows]
+
+
+def _upsert(
+    conn: Connection,
+    model: type[Base],
+    rows: Sequence[dict[str, Any]],
+    *,
+    update_where: UpdateWhere | None = None,
+    chunk_rows: int = UPSERT_CHUNK_ROWS,
+) -> None:
+    """Upsert ``rows`` in the transaction ``conn`` is in, ``chunk_rows`` at a time."""
+    for i in range(0, len(rows), chunk_rows):
+        chunk = rows[i : i + chunk_rows]
+        conn.execute(_build_upsert(conn.dialect.name, model, chunk, update_where))
+
+
+def frame_rows(model: type[Base], df: pd.DataFrame) -> list[dict[str, Any]]:
+    """A DataFrame as rows of ``model``: its columns only, UTC datetimes, NaN -> NULL."""
+    if df.empty:
+        return []
+    table_cols = {c.name for c in model.__table__.columns}
+    cols = [c for c in df.columns if c in table_cols]
+    if "timestamp_utc" in cols:
+        ts = pd.to_datetime(df["timestamp_utc"], utc=True)
+        df = df.assign(timestamp_utc=ts)
+    records = df.loc[:, cols].astype(object).where(df.loc[:, cols].notna(), None)
+    return [
+        {k: (v.to_pydatetime() if isinstance(v, pd.Timestamp) else v) for k, v in rec.items()}
+        for rec in records.to_dict(orient="records")
+    ]
 
 
 def upsert_dataframe(
@@ -386,19 +469,55 @@ def upsert_dataframe(
     update_where: UpdateWhere | None = None,
 ) -> int:
     """Upsert a DataFrame whose columns match ``model``'s columns (NaN -> NULL)."""
-    if df.empty:
-        return 0
-    table_cols = {c.name for c in model.__table__.columns}
-    cols = [c for c in df.columns if c in table_cols]
-    if "timestamp_utc" in cols:
-        ts = pd.to_datetime(df["timestamp_utc"], utc=True)
-        df = df.assign(timestamp_utc=ts)
-    records = df.loc[:, cols].astype(object).where(df.loc[:, cols].notna(), None)
-    rows = [
-        {k: (v.to_pydatetime() if isinstance(v, pd.Timestamp) else v) for k, v in rec.items()}
-        for rec in records.to_dict(orient="records")
-    ]
-    return upsert_rows(engine, model, rows, update_where=update_where)
+    return upsert_rows(engine, model, frame_rows(model, df), update_where=update_where)
+
+
+def store_issue(engine: Engine, forecast: pd.DataFrame, weather: pd.DataFrame) -> int:
+    """Store one model forecast issue and the per-city weather it used, in one transaction.
+
+    ``forecast`` rows go to ``load_forecast_model``, ``weather`` rows to
+    ``load_forecast_model_weather``. Both carry the issue's ``issued_at``, which is in both
+    keys: storing the same issue again adds no rows, a re-issue adds its own. Returns the
+    number of forecast rows.
+    """
+    rows = _stamped(LoadForecastModel, frame_rows(LoadForecastModel, forecast))
+    inputs = frame_rows(LoadForecastModelWeather, weather)
+    with engine.begin() as conn:
+        _upsert(conn, LoadForecastModel, rows)
+        _upsert(conn, LoadForecastModelWeather, inputs)
+    return len(rows)
+
+
+def store_official_forecast(engine: Engine, df: pd.DataFrame) -> tuple[int, int]:
+    """Upsert official forecast rows and record a revision for every hour new or changed.
+
+    ``df`` has ``timestamp_utc, source, forecast_mw``. One transaction: read the latest
+    revision of each hour in ``df``'s span, upsert ``load_forecast_official`` as before, and
+    append to ``load_forecast_official_revision`` - with this run's ``ingested_at`` - the
+    hours whose value it has not recorded yet. Returns ``(rows, revisions)``.
+    """
+    rows = _stamped(LoadForecastOfficial, frame_rows(LoadForecastOfficial, df))
+    if not rows:
+        return 0, 0
+    revision = LoadForecastOfficialRevision
+    hours = [row["timestamp_utc"] for row in rows]
+    with engine.begin() as conn:
+        latest = {
+            (to_utc(ts), source): value
+            for ts, source, value in conn.execute(
+                select(revision.timestamp_utc, revision.source, revision.forecast_mw)
+                .where(revision.timestamp_utc.between(min(hours), max(hours)))
+                .order_by(revision.ingested_at)  # later revisions overwrite earlier ones here
+            )
+        }
+        changed = [
+            {k: row[k] for k in ("timestamp_utc", "source", "forecast_mw", "ingested_at")}
+            for row in rows
+            if latest.get((to_utc(row["timestamp_utc"]), row["source"])) != row["forecast_mw"]
+        ]
+        _upsert(conn, LoadForecastOfficial, rows)
+        _upsert(conn, revision, changed)
+    return len(rows), len(changed)
 
 
 def weather_update_where(existing: Any, excluded: Any) -> ColumnElement[bool]:
@@ -502,7 +621,8 @@ def read_load(
 
 
 def read_latest_model_forecast(engine: Engine) -> pd.DataFrame:
-    """Rows of the most recently *issued* model forecast (all hours of that issue)."""
+    """Rows of the most recently *issued* model forecast (all hours of that issue), on time
+    or not - what was last published; scoring picks on-time issues itself."""
     latest = latest_issued_at(engine)
     if latest is None:
         return _frame([], LoadForecastModel.__table__.columns)

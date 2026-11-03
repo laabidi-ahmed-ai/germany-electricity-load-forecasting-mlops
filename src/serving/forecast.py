@@ -23,6 +23,10 @@ archive rows always win), append the target hours with NaN load, build the frame
 ``dropna=False``, select the day-ahead features and predict. Interpolated hours live
 only in the served frame - they are never written back to ``load_actual`` - and a
 longer gap that reaches a lag feature still raises ``NoDataError``.
+
+``store_forecast`` keeps every issue: its rows, keyed by ``issued_at`` too, and the
+per-city weather of the target hours exactly as the forecast read it, in one transaction.
+An issue after its horizon's deadline (``Horizon.issue_deadline``) is stored but not scored.
 """
 
 from __future__ import annotations
@@ -39,7 +43,13 @@ from src.data import db
 from src.data.db import SOURCE_SMARD
 from src.data.weather_client import WeatherClient, national_average
 from src.features.build_features import LOCAL_TZ, TARGET, WEATHER_COLUMNS, build_feature_frame
-from src.features.horizons import DAY_AHEAD, Horizon, most_recent_load_lag, select_features
+from src.features.horizons import (
+    DAY_AHEAD,
+    HORIZONS,
+    Horizon,
+    most_recent_load_lag,
+    select_features,
+)
 from src.models.registry import LoadedModel
 
 log = logging.getLogger(__name__)
@@ -64,10 +74,17 @@ class ForecastResult:
     horizon: str
     features: list[str]
     frame: pd.DataFrame  # index timestamp_utc; columns: forecast_mw + the served features
+    weather: pd.DataFrame  # the per-city weather_hourly rows of the target hours, as read
 
     @property
     def forecast(self) -> pd.DataFrame:
         return self.frame[["forecast_mw"]].reset_index()
+
+    @property
+    def deadline_margin_hours(self) -> float:
+        """Hours from the issue to its earliest deadline; negative = too late to be scored."""
+        deadline = HORIZONS[self.horizon].issue_deadline(self.frame.index).min()
+        return (deadline - self.issued_at) / pd.Timedelta(hours=1)
 
 
 # --- Feature reconstruction ---
@@ -181,11 +198,13 @@ def build_serving_features(
     horizon: Horizon = DAY_AHEAD,
     hours: int = DAY_AHEAD_HOURS,
     as_of: pd.Timestamp | None = None,
-) -> tuple[pd.DataFrame, pd.Timestamp]:
-    """Return ``(full feature frame for the target hours, last_actual)``.
+) -> tuple[pd.DataFrame, pd.Timestamp, pd.DataFrame]:
+    """Return ``(full feature frame for the target hours, last_actual, weather)``.
 
-    ``as_of`` pretends the forecast is issued at that time, with the latest known load
-    at/before it (for backtests); default is now and the real latest actual.
+    ``weather`` is the per-city ``weather_hourly`` rows of the target hours as they were
+    read - the inputs of the weather features, which use hour t only. ``as_of`` pretends
+    the forecast is issued at that time, with the latest known load at/before it (for
+    backtests); default is now and the real latest actual.
     """
     last_actual = db.latest_timestamp(engine, db.LoadActual, source=SOURCE_SMARD)
     if last_actual is None:
@@ -225,7 +244,8 @@ def build_serving_features(
     n_nan_weather = int(served[list(WEATHER_COLUMNS)].isna().sum().sum())
     if n_nan_weather:
         log.warning("%d NaN weather values in served features (model handles NaN)", n_nan_weather)
-    return served, last_actual
+    used = weather[weather["timestamp_utc"].isin(target)].reset_index(drop=True)
+    return served, last_actual, used
 
 
 # --- Forecast ---
@@ -238,7 +258,7 @@ def make_day_ahead_forecast(
     as_of: pd.Timestamp | None = None,
 ) -> ForecastResult:
     """Forecast the champion's horizon; ``hours`` only applies to the rolling day-ahead one."""
-    served, last_actual = build_serving_features(
+    served, last_actual, weather = build_serving_features(
         engine, weather_client=weather_client, horizon=model.horizon, hours=hours, as_of=as_of
     )
     model.check_features(list(served.columns))  # exact train/serve feature parity
@@ -268,18 +288,25 @@ def make_day_ahead_forecast(
         horizon=model.horizon.name,
         features=model.features,
         frame=frame,
+        weather=weather,
     )
 
 
 def store_forecast(engine: Engine, result: ForecastResult) -> int:
-    """Idempotent upsert of the forecast rows into ``load_forecast_model``."""
+    """Store the issue: its rows in ``load_forecast_model`` and the per-city weather it used
+    in ``load_forecast_model_weather``, in one transaction. Storing the same result again
+    adds no rows; a re-issue (a new ``issued_at``) adds its own. Returns the forecast rows."""
     rows = pd.DataFrame(
         {
             "timestamp_utc": result.frame.index,
             "model_version": result.model_version,
             "model_name": result.model_name,
+            "horizon": result.horizon,
             "forecast_mw": result.frame["forecast_mw"].to_numpy(),
             "issued_at": result.issued_at,
         }
     )
-    return db.upsert_dataframe(engine, db.LoadForecastModel, rows)
+    weather = result.weather.rename(columns={"ingested_at": "fetched_at"}).assign(
+        issued_at=result.issued_at
+    )
+    return db.store_issue(engine, rows, weather)

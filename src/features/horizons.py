@@ -30,6 +30,10 @@ set is valid.
 
 The frame keeps every column; selection happens here, by column-name contract:
 ``load_lag_{k}`` and ``load_roll_{stat}_{w}`` are the load-derived names.
+
+Each horizon also sets the deadline by which a forecast must be issued to be scored
+(``Horizon.issue_deadline``): for D+1, 12:00 Berlin on the day before the target day - the
+day-ahead auction's gate closure - and for the rolling horizons, the target hour itself.
 """
 
 from __future__ import annotations
@@ -37,12 +41,21 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import TypeVar
+
+import pandas as pd
+
+LOCAL_TZ = "Europe/Berlin"  # calendar features, the D+1 target day and its issue deadline
+# The day-ahead auction closes at 12:00 Berlin: a D+1 forecast issued later is too late to use.
+AUCTION_CLOSE_HOUR = 12
 
 _LAG_RE = re.compile(r"^load_lag_(\d+)$")
 _ROLL_RE = re.compile(r"^load_roll_[a-z]+_(\d+)$")
 
 # Rolling windows in ``build_features`` end at t-1 (computed on ``load.shift(1)``).
 _ROLLING_MOST_RECENT_LAG = 1
+
+Times = TypeVar("Times", pd.Timestamp, pd.DatetimeIndex, pd.Series)
 
 
 @dataclass(frozen=True)
@@ -61,6 +74,25 @@ class Horizon:
         """True if ``column`` may be used by a model for this horizon."""
         lag = most_recent_load_lag(column)
         return lag is None or lag >= self.min_lag_hours
+
+    def issue_deadline(self, target: Times) -> Times:
+        """The latest issue time at which a forecast for the UTC hour(s) ``target`` is scored.
+
+        Calendar-day horizon: 12:00 Berlin on the day before the target hour's local day -
+        11:00 UTC when that day is in winter time, 10:00 UTC in summer time; every hour of
+        a 23- or 25-hour clock-change day gets the same deadline. Rolling horizons: the
+        target hour itself. Same kind out as in (Timestamp, DatetimeIndex or Series).
+        """
+        if not self.calendar_day:
+            return target
+        if isinstance(target, pd.Series):
+            deadline = self.issue_deadline(pd.DatetimeIndex(target))
+            return pd.Series(deadline, index=target.index, name=target.name)
+        if isinstance(target, pd.Timestamp):
+            return self.issue_deadline(pd.DatetimeIndex([target]))[0]
+        local_day = target.tz_convert(LOCAL_TZ).tz_localize(None).normalize()  # wall-clock dates
+        noon_before = local_day - pd.Timedelta(days=1) + pd.Timedelta(hours=AUCTION_CLOSE_HOUR)
+        return noon_before.tz_localize(LOCAL_TZ).tz_convert("UTC")  # noon is never ambiguous
 
 
 DAY_AHEAD = Horizon("day_ahead", min_lag_hours=24)

@@ -468,7 +468,8 @@ def record_event(
 def report_metrics(
     metrics: JobMetrics, decision: TriggerDecision, outcome: ChallengerOutcome | None
 ) -> None:
-    """Live accuracy, drift, trigger states and the retrain decision, tagged by champion."""
+    """Live accuracy and punctuality, drift, trigger states and the retrain decision, tagged by
+    champion."""
     champion = f"v{decision.champion_version}"
     if decision.performance is not None:
         for w in decision.performance.windows:
@@ -476,6 +477,7 @@ def report_metrics(
             metrics.gauge("model.mape", w.model_mape, **tags)
             metrics.gauge("official.mape", w.official_mape, **tags)
             metrics.gauge("model.improvement_pct", w.improvement_pct, **tags)
+            metrics.gauge("forecast.on_time_pct", w.on_time_pct, **tags)  # every version
     if decision.drift is not None:
         metrics.gauge("drift.share", decision.drift.share_drifted, model_version=champion)
     # The drift check never takes the monitor down, so its failure must be visible here.

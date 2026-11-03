@@ -135,6 +135,8 @@ def test_incremental_fetches_only_new_hours_without_duplicates(engine) -> None:
     assert results["weather_archive"].status == "ok"
     assert results["weather_forecast"].status == "ok"
     assert db.count_rows(engine, db.LoadForecastOfficial, source="smard") == 335
+    # the 48 h overlap re-read unchanged values: one revision per hour, no duplicates
+    assert db.count_rows(engine, db.LoadForecastOfficialRevision, source="smard") == 335
 
     # No duplicates, everything contiguous in UTC.
     load = db.read_load(engine)
@@ -170,6 +172,37 @@ def test_incremental_weather_forecast_does_not_overwrite_archive(engine) -> None
     assert (overlap["source"] == "archive").all()
     future = w[w["timestamp_utc"] > pd.Timestamp("2021-04-04T21:00Z")]
     assert (future["source"] == "forecast").all() and len(future) > 0
+
+
+# --- official forecast revisions ---
+def test_official_revisions_are_recorded_only_for_new_or_changed_values(engine) -> None:
+    span = {"start": "2021-03-21", "end": "2021-04-05", "sources": ("smard",)}
+    first_week = {DST_WEEK_STARTS_MS[0]: 167}
+    clients, _ = make_clients(weeks=first_week)
+    results = by_source(ingest.run_backfill(engine, clients, **span))
+    assert results["smard_forecast"].message == "167 new/changed hours"
+    assert db.count_rows(engine, db.LoadForecastOfficialRevision) == 167
+
+    results = by_source(ingest.run_backfill(engine, clients, **span))  # the same values again
+    assert results["smard_forecast"].message == "0 new/changed hours"
+    assert db.count_rows(engine, db.LoadForecastOfficialRevision) == 167
+
+    # SMARD revises one hour of week 1 and publishes week 2.
+    routes = smard_routes(SMARD_BASE, "DE")
+    series = routes[f"{SMARD_BASE}/411/DE/411_DE_hour_{DST_WEEK_STARTS_MS[0]}.json"]["series"]
+    ts_ms, old = series[10]
+    series[10] = [ts_ms, old + 500.0]
+    clients2, _ = make_clients(smard_routes_override=routes)
+    results = by_source(ingest.run_backfill(engine, clients2, **span))
+    assert results["smard_forecast"].message == "169 new/changed hours"  # 168 new + 1 changed
+
+    revisions = db.read_table(engine, db.LoadForecastOfficialRevision)
+    assert len(revisions) == 167 + 168 + 1
+    hour = pd.Timestamp(ts_ms, unit="ms", tz="UTC")
+    history = revisions[revisions["timestamp_utc"] == hour].sort_values("ingested_at")
+    assert list(history["forecast_mw"]) == [old, old + 500.0]  # the earlier value is kept
+    latest = db.read_table(engine, db.LoadForecastOfficial, start=hour, end=hour)
+    assert latest["forecast_mw"].tolist() == [old + 500.0]  # the scores use the latest value
 
 
 # --- CLI ---

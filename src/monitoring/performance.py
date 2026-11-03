@@ -3,8 +3,9 @@
 ``compute_report`` scores the model's stored day-ahead forecast and the official
 forecast against the actuals on exactly the same hours (inner join of the three
 tables) over rolling 7-day and 30-day windows ending at ``as_of``, plus a per-day
-series for the dashboard. The metric code is shared with the dashboard in
-``src.monitoring.metrics``.
+series for the dashboard. Only forecasts issued by their deadline are scored; each
+window also counts the hours whose forecast was on time, late or missing. The metric
+code is shared with the dashboard in ``src.monitoring.metrics``.
 
 ``backtest_vs_official`` covers the time before live history exists: it trains a
 LightGBM on all data strictly before the last ``days`` days, predicts that window with
@@ -39,6 +40,8 @@ from src.monitoring.metrics import (
     WindowMetrics,
     actual_vs_official,
     daily_metrics,
+    forecast_status,
+    model_issues,
     official_accuracy,
     score_pair,
     window_metrics,
@@ -91,6 +94,7 @@ class PerformanceReport:
             if not w.judged:
                 lines.append(
                     f"  {w.window_days:>2}d: {w.n_hours} aligned hours (< {MIN_WINDOW_HOURS}) - not judged"
+                    + punctuality(w)
                 )
                 continue
             verdict = "BEATS" if w.model_beats_official else "LOSES TO"
@@ -98,6 +102,7 @@ class PerformanceReport:
                 f"  {w.window_days:>2}d ({w.n_hours}h): model MAE {w.model_mae:,.0f} MW / "
                 f"{w.model_mape:.2f}%  vs official {w.official_mae:,.0f} MW / "
                 f"{w.official_mape:.2f}%  -> model {verdict} official ({w.improvement_pct:+.1f}%)"
+                + punctuality(w)
             )
         for days, m in self.official_only.items():
             lines.append(
@@ -107,6 +112,12 @@ class PerformanceReport:
         return "\n".join(lines)
 
 
+def punctuality(w: WindowMetrics) -> str:
+    if w.on_time_pct is None:
+        return ""
+    return f"; on time {w.on_time_pct:.0f}% ({w.n_late} late, {w.n_missing} missing)"
+
+
 def compute_report(
     engine: Engine,
     *,
@@ -114,14 +125,17 @@ def compute_report(
     windows: tuple[int, ...] = WINDOWS_DAYS,
     model_version: str | None = None,
 ) -> PerformanceReport:
+    """Head-to-head per window; the on-time counts always cover every model version."""
     as_of = db.to_utc(as_of) if as_of is not None else pd.Timestamp.now(tz="UTC").floor("h")
     start = as_of - pd.Timedelta(days=max(windows))
     base = actual_vs_official(engine, start=start, end=as_of)
     base = base[base["timestamp_utc"] > start].reset_index(drop=True)
-    aligned = with_model_forecast(engine, base, model_version=model_version)
+    issues = model_issues(engine, base)
+    aligned = with_model_forecast(engine, base, model_version=model_version, issues=issues)
+    status = forecast_status(engine, base, issues)
     report = PerformanceReport(
         as_of=as_of,
-        windows=[window_metrics(aligned, as_of, d) for d in windows],
+        windows=[window_metrics(aligned, as_of, d, status) for d in windows],
         daily=daily_metrics(aligned),
         n_aligned_hours=len(aligned),
         model_versions=[] if aligned.empty else sorted(aligned["model_version"].unique()),

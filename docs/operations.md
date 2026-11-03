@@ -16,6 +16,11 @@ backup. Late backups are harmless: `forecast` and `monitor-retrain` pass `--once
 on automatic runs and exit without doing anything once today's forecast / monitoring
 pass exists, and `ingest` is incremental.
 
+**The forecast's deadline.** A D+1 forecast counts only if it is issued by 12:00 Berlin on
+the day before its target day, when the day-ahead auction closes: 11:00 UTC in winter,
+10:00 UTC in summer. The 05:40 run has about 5 hours of margin (`forecast.deadline_margin_hours`).
+A later issue is stored and shown, but never scored (README §16.9).
+
 ## Setting up the external scheduler (once)
 
 Any service that can send a scheduled HTTP POST works; these steps use
@@ -66,7 +71,9 @@ Any service that can send a scheduled HTTP POST works; these steps use
   forecast* timestamps. `python -m src.models.registry --show` prints the champion.
 - **`forecast` is red but the forecast step ran.** The refresh (ingest) failed, e.g. Open-Meteo down, and the job forecast from the stored data anyway; it stays red so the failure is seen. Check the refresh step's log; the next hourly `ingest` catches up.
 - **Forecast again today on purpose.** Actions → *forecast* → *Run workflow* → tick
-  **force**. (Without it, the run exits because today's forecast exists.)
+  **force**. (Without it, the run exits because today's forecast exists.) The new issue is
+  added next to the earlier one. If it is made before the deadline, it replaces the earlier
+  one in the scores; after the deadline it is kept, but not scored.
 - **Rehearse a retrain without touching the champion.** Actions → *monitor-retrain* →
   *Run workflow* → mode **force**, **dry_run** ticked.
 - **Evaluate the calendar-day (D+1) forecast without touching production.** Actions →
@@ -154,9 +161,10 @@ names the command to run, before writing anything. `build_features`, `train`, `p
   ```
 
 - **A local database created before migrations** fails the same check: with
-  `DATABASE_URL` unset, record it at the baseline and upgrade it (0002 drops the four time
-  indexes if the file has them, and skips them if not), or delete the file and run the
-  backfill again:
+  `DATABASE_URL` unset, record it at the baseline and upgrade it, or delete the file and
+  run the backfill again. 0002 drops the four time indexes if the file has them, and skips
+  them if not. 0003 refuses if the file has forecasts of a model version without an export
+  (`make register` writes the exports):
 
   ```powershell
   Remove-Item Env:DATABASE_URL -ErrorAction SilentlyContinue   # target the local file
@@ -190,7 +198,7 @@ names the command to run, before writing anything. `build_features`, `train`, `p
 
   Roll back by reverting the merge: the old code ignores `alembic_version_app`. There is
   nothing to downgrade - the baseline `0001` refuses to, because that would drop every table.
-- **A later migration:** `.venv\Scripts\alembic revision --rev-id 0003 -m "<what changes>"`,
+- **A later migration:** `.venv\Scripts\alembic revision --rev-id 0004 -m "<what changes>"`,
   then append the id to `SCHEMA_REVISIONS` in `src/data/db.py` (`tests/test_migrations.py`
   checks they match). Before merging: a Neon backup branch, `alembic upgrade head`, `alembic
   check`. To roll back, `alembic downgrade <previous revision>` first, then revert the code.
@@ -325,6 +333,220 @@ ORDER BY 1, 2;
   2. Point the `DATABASE_URL` secrets at `backup-before-0002`: the GitHub secret with the
      owner role, the Streamlit secret with `dashboard_ro`. The branch has the same roles
      and passwords, under its own host.
+  3. Backfill: Actions → *ingest* → *Run workflow* → mode **backfill**.
+
+  Whatever was written to `main` after the backup does not come back: model forecasts,
+  monitoring events, and MLflow runs and model versions.
+
+## Keep every issued forecast (0003)
+
+Revision `0003` changes how forecasts are stored (README §16.9). In one transaction, it:
+
+1. checks that every stored forecast's model version has its export in `model_artifacts`
+   (the guard). If one has not, it stops before changing anything and names the versions;
+2. adds `horizon` to `load_forecast_model`, filled in from those exports, and makes the
+   primary key `(timestamp_utc, model_version, issued_at)`: a re-issue adds rows instead of
+   overwriting the earlier issue. On Postgres these are in-place `ALTER`s, so the table
+   keeps its rows and its grants;
+3. creates `load_forecast_official_revision`, every value the official forecast has had. It
+   starts as a copy of `load_forecast_official`, and any row-count difference aborts. From
+   then on, each ingest adds the hours whose value is new or changed. The copy is a
+   snapshot of the values held at the upgrade: its `ingested_at` is when each row was last
+   written (each ingest rewrites the hours it re-reads), not when the value was first seen,
+   and earlier revisions were never kept. The revision history is complete only from the
+   upgrade onward;
+4. creates `load_forecast_model_weather`, the per-city weather each stored forecast used, as
+   it was read. It starts empty.
+
+From the deploy on, an hour is scored with the latest issue made by its deadline (see the
+daily timeline). The dashboard, the monitor and Datadog report the on-time share.
+
+For every command below, as for 0002:
+- connect as the **owner role**, the one the jobs' `DATABASE_URL` uses;
+- use the **non-pooled** connection string;
+- set `DATABASE_URL` for the PowerShell session only.
+
+SQL to record before and after (Neon SQL editor, on the branch being migrated):
+
+```sql
+SELECT version_num FROM alembic_version_app;
+SELECT model_name, model_version, count(*) AS rows, min(issued_at), max(issued_at)
+FROM load_forecast_model GROUP BY 1, 2 ORDER BY 2;
+SELECT count(*) FROM load_forecast_official;
+SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint
+WHERE conrelid = 'load_forecast_model'::regclass AND contype = 'p';
+SELECT table_name, grantee, privilege_type FROM information_schema.role_table_grants
+WHERE table_name LIKE 'load_forecast%' ORDER BY 1, 2, 3;
+SELECT pg_size_pretty(pg_database_size(current_database()));
+-- The guard, in advance: forecasts of a version without an export. Must return no rows.
+SELECT DISTINCT f.model_name, f.model_version FROM load_forecast_model f
+WHERE NOT EXISTS (SELECT 1 FROM model_artifacts a
+                  WHERE a.name = f.model_name AND a.version = f.model_version);
+```
+
+After the upgrade only (the tables do not exist before):
+
+```sql
+SELECT model_version, horizon, count(*) FROM load_forecast_model GROUP BY 1, 2 ORDER BY 1;
+SELECT count(*) FROM load_forecast_official_revision;  -- = load_forecast_official at first
+SELECT count(*) FROM load_forecast_model_weather;      -- 0 at first
+```
+
+**If the guard query returns rows, stop and send me the output.** An export of that version
+was pruned, so its horizon is unknown.
+
+### Rehearsal (on a copy of production)
+
+1. Neon → *Branches* → *Create branch* `rehearse-0003` from `main` (current data). Create
+   it **after the day's 05:40 forecast is stored**. Tomorrow's hours then already have an
+   issue, which step 6 re-issues.
+2. On `rehearse-0003`, run the SQL above. Note the counts, the primary key, the grants and
+   the size. The guard query returns no rows.
+3. In PowerShell, from the repository root:
+
+   ```powershell
+   $env:DATABASE_URL = "<rehearse-0003: owner role, non-pooled>"
+   .venv\Scripts\alembic current      # 0002
+   $start = Get-Date
+   .venv\Scripts\alembic upgrade head
+   "upgrade took {0:n1} s" -f ((Get-Date) - $start).TotalSeconds
+   .venv\Scripts\alembic current      # 0003 (head)
+   .venv\Scripts\alembic check        # No new upgrade operations detected.
+   ```
+
+   The upgrade logs the horizon given to each version and the rows seeded into
+   `load_forecast_official_revision`. Note both.
+4. Run the SQL again, both parts. The counts match step 2. Every version has its export's
+   horizon. The primary key has three columns, and the grants of `load_forecast_model` are
+   unchanged. Then run the GRANT step of the production runbook (step 6 below) on the
+   branch: the branch has the same roles.
+5. **A real ingest** on the branch. It calls SMARD and Open-Meteo, and writes only to the
+   branch:
+
+   ```powershell
+   .venv\Scripts\python -m src.data.ingest
+   ```
+
+   It must end green. The summary line of `smard_forecast` says how many hours were new or
+   changed: the hours SMARD published since the branch was made, and any revision. Note it.
+6. **A dry-run forecast**, then **a real one** (both mandatory):
+
+   ```powershell
+   .venv\Scripts\python -m src.serving.batch_forecast --dry-run
+   .venv\Scripts\python -m src.serving.batch_forecast
+   ```
+
+   The dry run writes no forecast rows (it may store fetched weather on the branch). Note
+   the target window and the `deadline margin` from its output. The rehearsal's issue is
+   probably late (after 11:00 UTC); that does not matter for storage. The real run is the
+   only test of the new write against Postgres, and of "a re-issue appends". Check it on the
+   branch, with the target start from the output:
+
+   ```sql
+   SELECT issued_at, model_version, horizon, count(*) FROM load_forecast_model
+   WHERE timestamp_utc >= '<target start>' GROUP BY 1, 2, 3 ORDER BY 1;
+   SELECT issued_at, count(DISTINCT city) AS cities, count(DISTINCT timestamp_utc) AS hours,
+          count(*) AS rows FROM load_forecast_model_weather GROUP BY 1 ORDER BY 1;
+   ```
+
+   The first query shows two issues for the target hours, each with one row per hour (24;
+   23 or 25 on a clock-change day). One is production's at 05:40, unchanged; the other is
+   the new one, with `horizon` `d_plus_1`. The second query shows the new issue with
+   5 cities × the target hours (120 rows on a 24-hour day).
+7. The live scores on the branch, read-only:
+
+   ```powershell
+   .venv\Scripts\python -m src.monitoring.performance
+   ```
+
+   Note the 7-day and 30-day lines, including "on time X% (n late, m missing)".
+8. Rehearse the rollback, then upgrade again:
+
+   ```powershell
+   .venv\Scripts\alembic downgrade 0002
+   ```
+
+   Run the step 6 queries and the first part of the SQL. The target hours now have one
+   issue, the later one (the rehearsal's). The weather-inputs table and the revision table
+   are gone, and the primary key has two columns again. This is what a downgrade deletes
+   for good (see Rollback). Then:
+
+   ```powershell
+   .venv\Scripts\alembic upgrade head
+   .venv\Scripts\alembic check
+   Remove-Item Env:DATABASE_URL
+   ```
+
+9. Record the numbers in README §16.9, then delete the `rehearse-0003` branch.
+
+### Production
+
+1. **Before the window starts:** the PR is open and CI is green, so the merge is one click.
+2. **When:** right after an hourly `ingest` run is green (the scheduler starts it at :20).
+   Avoid 05:30–07:00 and around 08:30 UTC, when the forecast and monitor-retrain run. The
+   merge follows within minutes, before the next :20 ingest.
+3. Neon → *Branches* → *Create branch* `backup-before-0003` from `main` (current data).
+4. Run the SQL above on `main` and note the results. The guard query returns no rows.
+5. In PowerShell:
+
+   ```powershell
+   $env:DATABASE_URL = "<main: owner role, non-pooled>"
+   .venv\Scripts\alembic current      # 0002
+   (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss 'UTC'")   # the restore point: write it down
+   .venv\Scripts\alembic upgrade head
+   .venv\Scripts\alembic current      # 0003 (head)
+   .venv\Scripts\alembic check        # No new upgrade operations detected.
+   Remove-Item Env:DATABASE_URL
+   ```
+
+6. **Grants for the dashboard.** In the SQL editor, as the owner role (the one the upgrade
+   ran as):
+
+   ```sql
+   GRANT SELECT ON load_forecast_official_revision, load_forecast_model_weather TO dashboard_ro;
+   ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO dashboard_ro;
+   SELECT table_name, privilege_type FROM information_schema.role_table_grants
+   WHERE grantee = 'dashboard_ro' ORDER BY 1, 2;
+   ```
+
+   The last query lists `SELECT` on every application table, the two new ones included.
+   The default privileges make tables the owner role creates later readable too.
+7. Run the SQL again, both parts: the same counts, the three-column key, the grants.
+8. **Merge.** Until then, a job on the old code stops with `SchemaError` (revision 0003 is
+   unknown to it) and writes nothing.
+9. Actions → *ingest* → *Run workflow*. Check that it is green. Then Streamlit → *Manage
+   app* → ⋮ → *Reboot app*, and check that the dashboard loads (the change touches
+   `dashboard/`).
+10. The next morning:
+    - *forecast* and *monitor-retrain* are green;
+    - the forecast log shows `deadline margin` of about +5.3 h (winter);
+    - `SELECT issued_at, count(*) FROM load_forecast_model_weather GROUP BY 1;` shows the
+      new issue with 120 rows (5 cities × 24 hours);
+    - the dashboard shows the on-time share, and Datadog receives `forecast.on_time_pct`
+      and `forecast.deadline_margin_hours`.
+11. After a day of green jobs, delete the `backup-before-0003` branch.
+
+### Rollback
+
+- **What `alembic downgrade 0002` deletes for good:**
+  - every forecast issue except the latest per hour and model version;
+  - every official revision recorded since the upgrade (the table is dropped);
+  - every weather input recorded since the upgrade (the table is dropped).
+
+  No later upgrade brings them back. A downgrade is therefore for a code problem right
+  after the deploy. Later on, prefer a forward fix.
+- **Code problem, right after the deploy:** run `.venv\Scripts\alembic downgrade 0002`
+  against `main` first, then revert the merge and push. Do the two back to back, outside
+  05:30–07:00 UTC. In between, jobs on the new code stop with `SchemaError` and write
+  nothing, and the dashboard errors until the revert is deployed and the app rebooted.
+- **Data problem, within 6 hours of the restore point:** use Neon's instant restore to
+  restore `main` to the noted UTC time. Data, schema version and tables return to their
+  state at that time. Then revert the merge and push. The next ingest fetches the hours
+  stored since then again.
+- **Data problem, later than that:**
+  1. Revert the merge and push: `backup-before-0003` is at revision 0002.
+  2. Point the `DATABASE_URL` secrets at `backup-before-0003`: the GitHub secret with the
+     owner role, the Streamlit secret with `dashboard_ro`.
   3. Backfill: Actions → *ingest* → *Run workflow* → mode **backfill**.
 
   Whatever was written to `main` after the backup does not come back: model forecasts,
