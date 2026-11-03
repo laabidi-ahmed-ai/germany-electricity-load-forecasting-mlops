@@ -530,11 +530,12 @@ The duplicate indexes are dropped. Dropping ~900 chunks in one transaction can e
 
 | Rehearsal (`rehearse-0002`) | |
 |---|---|
-| `max_locks_per_transaction` / `max_connections` | `<…>` / `<…>` |
-| Locks held by the conversion before commit | `<…>` |
-| Upgrade duration | `<…>` s |
-| Rows: `load_actual` / `load_forecast_official` / `weather_hourly` / `load_forecast_model` | `<…>` / `<…>` / `<…>` / `<…>` |
-| Mode used | `<one transaction \| per table>` |
+| `max_locks_per_transaction` / `max_connections` | 64 / 901 |
+| Locks held by the conversion before commit | 13,651 |
+| Upgrade duration | 27.5 s |
+| Rows: `load_actual` / `load_forecast_official` / `weather_hourly` / `load_forecast_model` | 49,758 / 49,775 / 249,120 / 1,163 |
+| Mode used | one transaction |
+
 
 ---
 
