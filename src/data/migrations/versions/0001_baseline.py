@@ -7,14 +7,15 @@ Create Date: 2026-11-02
 A database created before migrations is recorded at this revision once with
 ``alembic stamp 0001`` (docs/operations.md); a new database can be built from it.
 
-Production (Neon) also has something no migration created: its four time-series tables -
+Production (Neon) also had something no migration created: its four time-series tables -
 ``load_actual``, ``load_forecast_official``, ``weather_hourly``, ``load_forecast_model`` -
-are TimescaleDB hypertables, converted by an early setup before migrations existed (the
-``timescaledb`` extension is still installed). Alembic cannot see that, except through the
-index ``create_hypertable`` gave each table, ``<table>_timestamp_utc_idx`` on
-``timestamp_utc DESC``: the baseline includes those four indexes so it describes
-production. The code never creates hypertables; a database built from this revision has
-plain tables with the same indexes.
+were TimescaleDB hypertables. ``init_db`` made them hypertables (when the ``timescaledb``
+extension was available) until commit c7e7058 removed that setup without converting them
+back. Alembic could not see that, except through the index ``create_hypertable`` gave each
+table, ``<table>_timestamp_utc_idx`` on ``timestamp_utc DESC``: the baseline includes those
+four indexes so it describes production at this revision. A database built from this
+revision has plain tables with the same indexes; 0002 converts the hypertables to plain
+tables and drops the indexes.
 
 Plain SQLAlchemy types, not the application's ``UTCDateTime``, so this file stays valid
 whatever ``src/data/db.py`` becomes. ``DateTime(timezone=True)`` creates what

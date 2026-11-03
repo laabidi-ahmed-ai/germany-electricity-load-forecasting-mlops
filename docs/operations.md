@@ -135,13 +135,15 @@ names the command to run, before writing anything. `build_features`, `train`, `p
 - **Our version table is `alembic_version_app`.** The `alembic_version` table in the same
   database belongs to MLflow (its own migrations; the workflows' `MLFLOW_TRACKING_URI` falls
   back to `DATABASE_URL`): never stamp or edit it. Alembic here sees only our tables.
-- **Production's time-series tables are TimescaleDB hypertables.** `load_actual`,
-  `load_forecast_official`, `weather_hourly` and `load_forecast_model` were converted by an
-  early setup, before migrations existed, and the `timescaledb` extension is still
-  installed. Alembic cannot see that, except through the index `create_hypertable` gave
-  each table: `<table>_timestamp_utc_idx` on `timestamp_utc DESC`. The models and the
-  baseline `0001` include those four indexes, so `alembic check` matches production. The
-  code never creates hypertables: a new database gets plain tables with the same indexes.
+- **Production's time-series tables were TimescaleDB hypertables until 0002.** `init_db`
+  made `load_actual`, `load_forecast_official`, `weather_hourly` and `load_forecast_model`
+  hypertables (when the `timescaledb` extension was available) until commit c7e7058
+  removed that setup without converting them back. Alembic could not see that, except
+  through the index `create_hypertable` gave each table: `<table>_timestamp_utc_idx` on
+  `timestamp_utc DESC`. The baseline `0001` includes those four indexes, so it describes
+  production at that revision. `0002` converts the hypertables to plain tables and drops
+  the indexes, which duplicated the primary keys (see "Convert the leftover hypertables
+  (0002)" below).
 - **Run Alembic** from the repository root, with the target database set for the current
   PowerShell session only (without it, Alembic uses `.env`'s value or the local SQLite file):
 
@@ -152,13 +154,14 @@ names the command to run, before writing anything. `build_features`, `train`, `p
   ```
 
 - **A local database created before migrations** fails the same check: with
-  `DATABASE_URL` unset, run `.venv\Scripts\alembic stamp 0001`, or delete the file and run
-  the backfill again. One that predates the four time indexes makes `alembic check` list
-  them as `add_index`; create them once from the models (an existing index is skipped):
+  `DATABASE_URL` unset, record it at the baseline and upgrade it (0002 drops the four time
+  indexes if the file has them, and skips them if not), or delete the file and run the
+  backfill again:
 
   ```powershell
   Remove-Item Env:DATABASE_URL -ErrorAction SilentlyContinue   # target the local file
-  .venv\Scripts\python -c "from src.data import db; e = db.get_engine(); print('target:', e.url); [ix.create(e, checkfirst=True) for t in db.Base.metadata.sorted_tables for ix in t.indexes]"
+  .venv\Scripts\alembic stamp 0001
+  .venv\Scripts\alembic upgrade head
   .venv\Scripts\alembic check
   ```
 - **Stamp the live database (once, before merging the change that introduced migrations).**
@@ -172,7 +175,7 @@ names the command to run, before writing anything. `build_features`, `train`, `p
      $env:DATABASE_URL = "<Neon connection string of main>"
      .venv\Scripts\alembic current      # no revision yet
      .venv\Scripts\alembic stamp 0001
-     .venv\Scripts\alembic current      # 0001 (head)
+     .venv\Scripts\alembic current      # 0001 (head at the time)
      .venv\Scripts\alembic check        # No new upgrade operations detected.
      Remove-Item Env:DATABASE_URL
      ```
@@ -187,10 +190,145 @@ names the command to run, before writing anything. `build_features`, `train`, `p
 
   Roll back by reverting the merge: the old code ignores `alembic_version_app`. There is
   nothing to downgrade - the baseline `0001` refuses to, because that would drop every table.
-- **A later migration:** `.venv\Scripts\alembic revision --rev-id 0002 -m "<what changes>"`,
+- **A later migration:** `.venv\Scripts\alembic revision --rev-id 0003 -m "<what changes>"`,
   then append the id to `SCHEMA_REVISIONS` in `src/data/db.py` (`tests/test_migrations.py`
   checks they match). Before merging: a Neon backup branch, `alembic upgrade head`, `alembic
   check`. To roll back, `alembic downgrade <previous revision>` first, then revert the code.
+
+## Convert the leftover hypertables (0002)
+
+Revision `0002` turns production's four hypertables into plain tables (README §16.8). On
+Postgres with TimescaleDB, in one transaction, it:
+
+1. locks the tables that are still hypertables against writes (reads still work);
+2. copies each table into a plain table and aborts on any row-count difference;
+3. copies the grants (the dashboard's `dashboard_ro`);
+4. drops the hypertable with its chunks and renames the copy;
+5. restores `<table>_pkey` and runs `ANALYZE`.
+
+Then, on every database, it drops the four `<table>_timestamp_utc_idx` indexes. A failure
+anywhere rolls everything back.
+
+Dropping about 900 chunks takes a lock per chunk and per chunk index, all held until
+commit. Every session shares one lock table, with room for about
+`max_locks_per_transaction × max_connections` locks. If the conversion runs out of room,
+it fails with `out of shared memory` (hint: `max_locks_per_transaction`). Nothing has
+changed at that point. The fallback, `alembic -x per_table=true upgrade head`, converts
+each table in its own transaction and holds about a third of the locks at once. The
+rehearsal tells which one production needs.
+
+For every command below:
+- Connect as the **owner role**, the one the jobs' `DATABASE_URL` uses. Only the owner can
+  drop the tables, and the migration refuses to run as any other role.
+- Use the **non-pooled** connection string. In Neon's *Connect* dialog, turn connection
+  pooling off; the host has no `-pooler`.
+- Set `DATABASE_URL` for the PowerShell session only.
+
+SQL to record before and after (Neon SQL editor, on the branch being converted):
+
+```sql
+SHOW max_locks_per_transaction;
+SHOW max_connections;
+SELECT hypertable_name, num_chunks FROM timescaledb_information.hypertables ORDER BY 1;
+SELECT 'load_actual' AS t, count(*) FROM load_actual
+UNION ALL SELECT 'load_forecast_official', count(*) FROM load_forecast_official
+UNION ALL SELECT 'weather_hourly', count(*) FROM weather_hourly
+UNION ALL SELECT 'load_forecast_model', count(*) FROM load_forecast_model;
+SELECT table_name, grantee, privilege_type FROM information_schema.role_table_grants
+WHERE table_name IN ('load_actual', 'load_forecast_official', 'weather_hourly', 'load_forecast_model')
+ORDER BY 1, 2, 3;
+SELECT tablename, indexname FROM pg_indexes
+WHERE tablename IN ('load_actual', 'load_forecast_official', 'weather_hourly', 'load_forecast_model')
+ORDER BY 1, 2;
+```
+
+### Rehearsal (on a copy of production)
+
+1. Neon → *Branches* → *Create branch* `rehearse-0002` from `main` (current data). Give its
+   compute the **same size as production's**: `max_connections` depends on it.
+2. On `rehearse-0002`, run the SQL above. Note `max_locks_per_transaction`,
+   `max_connections`, the chunk counts (297/297/297/7 when written), the row counts and the
+   grants.
+3. In PowerShell, from the repository root:
+
+   ```powershell
+   $env:DATABASE_URL = "<rehearse-0002: owner role, non-pooled>"
+   .venv\Scripts\alembic current      # 0001
+   $start = Get-Date
+   .venv\Scripts\alembic upgrade head
+   "upgrade took {0:n1} s" -f ((Get-Date) - $start).TotalSeconds
+   .venv\Scripts\alembic current      # 0002 (head)
+   .venv\Scripts\alembic check        # No new upgrade operations detected.
+   ```
+
+   The upgrade logs the rows per table and `Locks held by the conversion before commit`.
+   Note both.
+4. Run the SQL again. The hypertables query returns nothing. The row counts and grants
+   match step 2. Each table has one index left, `<table>_pkey`.
+5. Rehearse the rollback, then upgrade again. The second upgrade converts nothing and only
+   drops the indexes again:
+
+   ```powershell
+   .venv\Scripts\alembic downgrade 0001   # the four DESC indexes come back
+   .venv\Scripts\alembic upgrade head
+   .venv\Scripts\alembic check
+   Remove-Item Env:DATABASE_URL
+   ```
+
+6. **If step 3 fails with `out of shared memory`**, nothing has changed. Run
+   `.venv\Scripts\alembic -x per_table=true upgrade head` and continue from the same point.
+   Production then uses the same flag.
+7. Record the numbers in README §16.8: the two settings, the locks held, the duration and
+   the row counts. Then delete the `rehearse-0002` branch.
+
+### Production
+
+1. **Before the window starts:** the PR is open and CI is green, so the merge is one click.
+2. **When:** right after an hourly `ingest` run is green (the scheduler starts it at :20).
+   Avoid 05:30–07:00 and around 08:30 UTC, when the forecast and monitor-retrain run. The
+   merge follows within minutes, before the next :20 ingest.
+3. Neon → *Branches* → *Create branch* `backup-before-0002` from `main` (current data).
+4. Run the SQL above on `main` and note the results.
+5. In PowerShell:
+
+   ```powershell
+   $env:DATABASE_URL = "<main: owner role, non-pooled>"
+   .venv\Scripts\alembic current      # 0001
+   (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss 'UTC'")   # the restore point: write it down
+   .venv\Scripts\alembic upgrade head # add -x per_table=true if the rehearsal needed it
+   .venv\Scripts\alembic current      # 0002 (head)
+   .venv\Scripts\alembic check        # No new upgrade operations detected.
+   Remove-Item Env:DATABASE_URL
+   ```
+
+6. Run the SQL again: no hypertables, and the same row counts and grants.
+7. **Merge.** Until then, a job on the old code stops with `SchemaError` (revision 0002 is
+   unknown to it) and writes nothing.
+8. Actions → *ingest* → *Run workflow*. Check that it is green and that the dashboard
+   loads; it reads through `dashboard_ro`.
+9. After a day of green jobs:
+   - delete the `backup-before-0002` branch;
+   - in the SQL editor, confirm the hypertables query is still empty, then run
+     `DROP EXTENSION timescaledb;`.
+
+### Rollback
+
+- **Schema (code problem):** run `.venv\Scripts\alembic downgrade 0001` against `main`
+  first. The four indexes come back; the tables stay plain, and the 0001 code does not
+  need hypertables. Then revert the merge and push.
+- **Data problem, within 6 hours of the restore point:** use Neon's instant restore to
+  restore `main` to the noted UTC time. The data, the schema version and the hypertables
+  return to their state at that time. Then revert the merge and push. The next ingest
+  fetches the hours stored since then again.
+- **Data problem, later than that:**
+  1. Revert the merge and push: `backup-before-0002` is at revision 0001.
+  2. Point the `DATABASE_URL` secrets at `backup-before-0002`: the GitHub secret with the
+     owner role, the Streamlit secret with `dashboard_ro`. The branch has the same roles
+     and passwords, under its own host.
+  3. Backfill: Actions → *ingest* → *Run workflow* → mode **backfill**.
+
+  Whatever was written to `main` after the backup does not come back: model forecasts,
+  monitoring events, and MLflow runs and model versions.
 
 ## Dependencies: adding and upgrading packages
 
