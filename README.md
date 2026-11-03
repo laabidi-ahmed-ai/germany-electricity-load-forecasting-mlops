@@ -562,15 +562,16 @@ The migration was rehearsed on a Neon branch before it ran on `main`, including 
 
 | Rehearsal (`rehearse-0003`) | |
 |---|---|
-| Upgrade duration | _TBD_ s |
-| `load_forecast_model` rows / issues per version, with backfilled horizon | _TBD_ |
-| `load_forecast_official_revision` seeded (= `load_forecast_official`) | _TBD_ rows |
-| Real ingest on the branch: official hours new or changed | _TBD_ |
-| `batch_forecast --dry-run`: target window, deadline margin | _TBD_ → _TBD_, _TBD_ h |
-| Real forecast on the branch: new issue's rows / weather inputs; earlier issue kept | _TBD_ / _TBD_ (5 cities × _TBD_ h); _TBD_ |
-| Downgrade → upgrade: `load_forecast_model` rows | _TBD_ → _TBD_ → `alembic check` clean |
-| On-time share, 7 d / 30 d; hours now late | _TBD_ % / _TBD_ %; _TBD_ |
-| Database size before / after | _TBD_ / _TBD_ |
+| Upgrade duration | 19.2 s |
+| `load_forecast_model` rows / issues per version, with backfilled horizon | 1,163: v1 1,067 (`day_ahead`), v2 48 and v3 48 (`d_plus_1`) |
+| `load_forecast_official_revision` seeded (= `load_forecast_official`) | 49,799 rows |
+| Real ingest on the branch: official hours new or changed | 0 (branch minutes old) |
+| `batch_forecast --dry-run`: target window, deadline margin | 2026-11-03 23:00 → 2026-11-04 22:00 UTC, +1.0 h |
+| Real forecast on the branch: new issue's rows / weather inputs; earlier issue kept | 24 / 120 (5 cities × 24 h); yes, production's 05:42 issue unchanged |
+| Downgrade → upgrade: `load_forecast_model` rows | 1,187 → 1,163 (24 replaced rows deleted) → 1,163 → `alembic check` clean |
+| On-time share, 7 d / 30 d; hours now late | 86 % / 92 %; 23 late (7 d), 56 late + 3 missing (30 d) |
+| Database size before / after | 76 MB / <size from step 1> |
+
 
 
 ---
