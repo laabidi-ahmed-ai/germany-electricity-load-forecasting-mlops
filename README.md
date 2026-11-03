@@ -516,6 +516,26 @@ The 1,499 MW is run B's; v3's own training run (§15: 1,496 MW, `best_iteration`
 
 **The record.** MLflow runs: A `17229c7a7dbb4edda01cd328457b7c64`, B `c3bf57f0f56148a9a188e2a66b88d9c8`. The backtest numbers are recorded only in this section: the backtest is printed to the GitHub Actions log, and those logs expire. The procedure for the next change of this kind is in `docs/operations.md` (*Evaluate a model-code change against production*).
 
+### 16.8 Leftover TimescaleDB hypertables, converted to plain tables
+
+**What was found.** On 2 Nov 2026, the first `alembic check` against production reported four indexes no code declared: `<table>_timestamp_utc_idx` on `timestamp_utc DESC`, one per time-series table. They came from TimescaleDB. `init_db` made the four tables hypertables when the extension was available, until commit c7e7058 (1 Oct 2026) removed that setup without converting the tables back. Production kept 297/297/297/7 chunks (weekly, since March 2021), plus indexes that duplicate the primary keys. The baseline migration (`0001`) recorded them as they were.
+
+**The fix (revision `0002`).** Each hypertable is copied into a plain table, which then replaces it. One transaction does it all:
+- the tables are locked against writes, while reads continue;
+- any row-count difference aborts the conversion;
+- the grants are copied, so the dashboard's read-only role keeps working;
+- each primary key is restored under its usual name.
+
+The duplicate indexes are dropped. Dropping ~900 chunks in one transaction can exceed the Postgres lock table, so a one-transaction-per-table fallback is built in (`-x per_table=true`). The conversion was rehearsed on a Neon branch with a compute the size of production's before it ran on `main`. Runbook: `docs/operations.md` (*Convert the leftover hypertables*).
+
+| Rehearsal (`rehearse-0002`) | |
+|---|---|
+| `max_locks_per_transaction` / `max_connections` | `<…>` / `<…>` |
+| Locks held by the conversion before commit | `<…>` |
+| Upgrade duration | `<…>` s |
+| Rows: `load_actual` / `load_forecast_official` / `weather_hourly` / `load_forecast_model` | `<…>` / `<…>` / `<…>` / `<…>` |
+| Mode used | `<one transaction \| per table>` |
+
 ---
 
 ## 17. Roadmap

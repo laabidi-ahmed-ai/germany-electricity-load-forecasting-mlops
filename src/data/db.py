@@ -27,7 +27,6 @@ from sqlalchemy import (
     Column,
     DateTime,
     Float,
-    Index,
     Integer,
     LargeBinary,
     MetaData,
@@ -176,14 +175,6 @@ class LoadForecastModel(Base):
     ingested_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
 
 
-# Production's four time-series tables are TimescaleDB hypertables, converted by an early setup
-# before migrations existed, and ``create_hypertable`` gave each of them this index. The code
-# never creates hypertables; the indexes are declared so the models and the baseline migration
-# describe the schema production has.
-for _model in (LoadActual, LoadForecastOfficial, WeatherHourly, LoadForecastModel):
-    Index(f"{_model.__tablename__}_timestamp_utc_idx", _model.timestamp_utc.desc())
-
-
 class MonitoringEvent(Base):
     """One row per monitoring / retraining decision (the dashboard's event timeline).
 
@@ -259,7 +250,7 @@ def normalize_database_url(url: str) -> str:
 # MLflow's own migrations keep their revision there when it tracks into the same database.
 SCHEMA_VERSION_TABLE = "alembic_version_app"
 # Every revision, oldest first; tests/test_migrations.py checks it against the scripts.
-SCHEMA_REVISIONS: tuple[str, ...] = ("0001",)
+SCHEMA_REVISIONS: tuple[str, ...] = ("0001", "0002")
 SCHEMA_REVISION = SCHEMA_REVISIONS[-1]
 
 # The version table exactly as Alembic creates it, so ``init_db`` can record the revision of
