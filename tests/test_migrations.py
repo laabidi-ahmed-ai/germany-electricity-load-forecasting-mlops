@@ -18,6 +18,7 @@ from types import ModuleType
 
 import pandas as pd
 import pytest
+import sqlalchemy as sa
 from alembic import command
 from alembic.config import Config
 from alembic.migration import MigrationContext
@@ -31,6 +32,7 @@ from config.settings import PROJECT_ROOT
 from src.data import db
 
 MIGRATIONS = PROJECT_ROOT / "src" / "data" / "migrations"
+HEAD = db.SCHEMA_REVISION
 MLFLOW_REVISION = "mlflow_rev_1"
 # Production's hypertables until 0002, each with its ``<table>_timestamp_utc_idx`` at 0001.
 TIME_SERIES_TABLES = (
@@ -40,6 +42,19 @@ TIME_SERIES_TABLES = (
     "load_forecast_model",
 )
 TIME_INDEXES = {f"{table}_timestamp_utc_idx" for table in TIME_SERIES_TABLES}
+NEW_IN_0003 = {"load_forecast_official_revision", "load_forecast_model_weather"}
+MODEL_NAME = "germany-load-day-ahead"
+# ``load_forecast_model`` as it was up to 0002 - the current model has another key and
+# ``horizon`` - so databases at an older revision are seeded through this, not the model.
+FORECASTS_0002 = sa.table(
+    "load_forecast_model",
+    sa.column("timestamp_utc", db.UTCDateTime()),
+    sa.column("model_version"),
+    sa.column("model_name"),
+    sa.column("forecast_mw"),
+    sa.column("issued_at", db.UTCDateTime()),
+    sa.column("ingested_at", db.UTCDateTime()),
+)
 
 
 def alembic_config(url: str) -> Config:
@@ -70,13 +85,12 @@ def add_mlflow_tables(engine: Engine) -> None:
         conn.execute(text("INSERT INTO experiments VALUES (0)"))
 
 
-def add_time_indexes(engine: Engine) -> None:
-    """The indexes production's tables had at 0001 (``create_hypertable`` made them)."""
+def build_unversioned_0001(url: str, engine: Engine) -> None:
+    """The live database before migrations: 0001's tables - with the time indexes
+    ``create_hypertable`` gave production - and no schema version."""
+    command.upgrade(alembic_config(url), "0001")
     with engine.begin() as conn:
-        for table in TIME_SERIES_TABLES:
-            conn.execute(
-                text(f"CREATE INDEX {table}_timestamp_utc_idx ON {table} (timestamp_utc DESC)")
-            )
+        conn.execute(text(f"DROP TABLE {db.SCHEMA_VERSION_TABLE}"))
 
 
 def assert_mlflow_untouched(engine: Engine) -> None:
@@ -102,6 +116,49 @@ def explicit_indexes(engine: Engine) -> set[str]:
                 text("SELECT name FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL")
             ).scalars()
         )
+
+
+def insert_forecasts_0002(
+    engine: Engine, version: str, hours: pd.DatetimeIndex, issued_at: pd.Timestamp
+) -> None:
+    """One issue of ``version`` in the shape of revisions 0001 and 0002."""
+    with engine.begin() as conn:
+        conn.execute(
+            sa.insert(FORECASTS_0002),
+            [
+                {
+                    "timestamp_utc": ts,
+                    "model_version": version,
+                    "model_name": MODEL_NAME,
+                    "forecast_mw": 52_000.0 + i,
+                    "issued_at": issued_at,
+                    "ingested_at": issued_at,
+                }
+                for i, ts in enumerate(hours)
+            ],
+        )
+
+
+def add_export(engine: Engine, version: str, horizon: str) -> None:
+    """The ``model_artifacts`` row 0003 reads a version's horizon from."""
+    db.store_model_artifact(
+        engine,
+        name=MODEL_NAME,
+        version=version,
+        horizon=horizon,
+        features="[]",
+        bundle=b"zip",
+        bundle_sha256="0" * 64,
+        bundle_bytes=3,
+    )
+
+
+def primary_key(engine: Engine, name: str) -> list[str]:
+    return inspect(engine).get_pk_constraint(name)["constrained_columns"]
+
+
+def column_names(engine: Engine, name: str) -> set[str]:
+    return {c["name"] for c in inspect(engine).get_columns(name)}
 
 
 def assert_time_indexes(engine: Engine) -> None:
@@ -182,6 +239,18 @@ def test_both_paths_create_no_explicit_index(url: str, blank: Engine, build: str
     assert explicit_indexes(blank) == set()
 
 
+@pytest.mark.parametrize("build", ["init_db", "migrations"])
+def test_both_paths_build_the_models_primary_keys(url: str, blank: Engine, build: str) -> None:
+    """Checked here because ``alembic check`` does not compare primary keys."""
+    if build == "init_db":
+        db.init_db(blank)
+    else:
+        command.upgrade(alembic_config(url), "head")
+    for model_table in db.Base.metadata.sorted_tables:
+        expected = [c.name for c in model_table.primary_key.columns]
+        assert primary_key(blank, model_table.name) == expected, model_table.name
+
+
 # --- 0002: the hypertables become plain tables ---
 def test_0002_drops_and_its_downgrade_restores_the_time_indexes(url: str, blank: Engine) -> None:
     """On SQLite (no TimescaleDB) 0002 is only its index step, in both directions."""
@@ -206,14 +275,14 @@ def test_0002_drops_and_its_downgrade_restores_the_time_indexes(url: str, blank:
     assert db.count_rows(blank, db.LoadActual) == 1
 
 
-def test_0002_copies_every_column_of_the_models() -> None:
-    """The explicit column lists lose nothing, and the restored keys are the models' keys."""
+def test_0002_copies_every_column_of_its_tables(url: str, blank: Engine) -> None:
+    """The explicit column lists lose nothing, and the restored keys are the keys at 0002."""
+    command.upgrade(alembic_config(url), "0002")
     tables = migration("0002").TABLES
     assert tuple(tables) == TIME_SERIES_TABLES  # also the lock order
     for name, (columns, key) in tables.items():
-        table = db.Base.metadata.tables[name]
-        assert set(columns) == {c.name for c in table.columns}, name
-        assert key == tuple(c.name for c in table.primary_key.columns), name
+        assert set(columns) == column_names(blank, name), name
+        assert list(key) == primary_key(blank, name), name
 
 
 @pytest.mark.parametrize("counts", [(5, 4, 4), (5, 5, 4), (5, 4, 5), (0, 1, 1)])
@@ -222,6 +291,140 @@ def test_0002_aborts_on_a_row_count_mismatch(counts: tuple[int, int, int]) -> No
     check_copied("load_actual", 5, 5, 5)
     with pytest.raises(RuntimeError, match=r"load_actual.*nothing changed"):
         check_copied("load_actual", *counts)
+
+
+# --- 0003: every issue kept ---
+HOURS = pd.date_range("2026-10-01", periods=48, freq="h", tz="UTC")
+V1_ISSUED = pd.Timestamp("2026-09-30T05:40Z")
+V3_ISSUED = pd.Timestamp("2026-09-30T06:40Z")
+REISSUED = pd.Timestamp("2026-09-30T07:40Z")
+
+
+def seed_0002(engine: Engine) -> None:
+    """Production at 0002 in small: v1 (day_ahead) and v3 (d_plus_1) forecasts, with their
+    exports, and official forecast rows."""
+    insert_forecasts_0002(engine, "1", HOURS[:24], V1_ISSUED)
+    insert_forecasts_0002(engine, "3", HOURS, V3_ISSUED)
+    add_export(engine, "1", "day_ahead")
+    add_export(engine, "3", "d_plus_1")
+    db.upsert_rows(
+        engine,
+        db.LoadForecastOfficial,
+        [
+            {"timestamp_utc": ts, "source": "smard", "forecast_mw": 51_000.0 + i}
+            for i, ts in enumerate(HOURS)
+        ],
+    )
+
+
+def reissue_v3(engine: Engine) -> None:
+    """A second issue of v3 for the same hours, with the weather it used, as the job stores it."""
+    forecast = pd.DataFrame(
+        {
+            "timestamp_utc": HOURS,
+            "model_version": "3",
+            "model_name": MODEL_NAME,
+            "horizon": "d_plus_1",
+            "forecast_mw": 53_000.0,
+            "issued_at": REISSUED,
+        }
+    )
+    weather = pd.DataFrame(
+        {
+            "timestamp_utc": HOURS.repeat(2),
+            "city": ["Berlin", "Munich"] * len(HOURS),
+            "issued_at": REISSUED,
+            "source": "forecast",
+            "temperature_2m": 9.5,
+            "fetched_at": REISSUED - pd.Timedelta(minutes=30),
+        }
+    )
+    assert db.store_issue(engine, forecast, weather) == len(HOURS)
+
+
+def issues_per_version(engine: Engine) -> list[tuple[str, int, int]]:
+    """``(version, rows, distinct issue times)`` - read with plain SQL, any revision."""
+    with engine.connect() as conn:
+        return [
+            tuple(row)
+            for row in conn.execute(
+                text(
+                    "SELECT model_version, count(*), count(DISTINCT issued_at) "
+                    "FROM load_forecast_model GROUP BY 1 ORDER BY 1"
+                )
+            )
+        ]
+
+
+def test_0003_keeps_every_issue_and_its_downgrade_keeps_the_latest(url: str, blank: Engine) -> None:
+    cfg = alembic_config(url)
+    command.upgrade(cfg, "0002")
+    seed_0002(blank)
+
+    command.upgrade(cfg, "head")
+    assert recorded_revision(blank) == "0003"
+    command.check(cfg)
+    assert primary_key(blank, "load_forecast_model") == [
+        "timestamp_utc",
+        "model_version",
+        "issued_at",
+    ]
+    forecasts = db.read_table(blank, db.LoadForecastModel)
+    assert len(forecasts) == 24 + 48
+    by_version = forecasts.groupby("model_version")["horizon"].unique().map(list).to_dict()
+    assert by_version == {"1": ["day_ahead"], "3": ["d_plus_1"]}  # backfilled from the exports
+    # The revision history starts as a copy of the official forecast, ingested_at included.
+    official = db.read_table(blank, db.LoadForecastOfficial)
+    revisions = db.read_table(blank, db.LoadForecastOfficialRevision)
+    pd.testing.assert_frame_equal(revisions, official[revisions.columns])
+    assert db.count_rows(blank, db.LoadForecastModelWeather) == 0
+
+    reissue_v3(blank)  # appended next to the first issue, not over it
+    assert issues_per_version(blank) == [("1", 24, 1), ("3", 96, 2)]
+    assert db.count_rows(blank, db.LoadForecastModelWeather) == 2 * len(HOURS)
+
+    command.downgrade(cfg, "0002")
+    assert recorded_revision(blank) == "0002"
+    assert primary_key(blank, "load_forecast_model") == ["timestamp_utc", "model_version"]
+    assert "horizon" not in column_names(blank, "load_forecast_model")
+    assert not NEW_IN_0003 & set(inspect(blank).get_table_names())
+    assert issues_per_version(blank) == [("1", 24, 1), ("3", 48, 1)]  # only the latest kept
+
+    command.upgrade(cfg, "head")
+    command.check(cfg)
+    db.init_db(blank)
+    v3 = db.read_table(blank, db.LoadForecastModel, model_version="3")
+    assert (v3["issued_at"] == REISSUED).all() and (v3["forecast_mw"] == 53_000.0).all()
+    assert db.count_rows(blank, db.LoadForecastOfficialRevision) == len(HOURS)
+
+
+def test_0003_refuses_before_any_change_if_a_forecast_has_no_export(
+    url: str, blank: Engine
+) -> None:
+    cfg = alembic_config(url)
+    command.upgrade(cfg, "0002")
+    seed_0002(blank)
+    insert_forecasts_0002(blank, "9", HOURS[:3], V3_ISSUED)  # its export was pruned
+
+    with pytest.raises(RuntimeError, match=r"no export in model_artifacts.*v9'\]\. Nothing"):
+        command.upgrade(cfg, "head")
+    # SQLite runs Alembic's DDL outside a transaction: the guard is what kept it untouched.
+    assert recorded_revision(blank) == "0002"
+    assert "horizon" not in column_names(blank, "load_forecast_model")
+    assert primary_key(blank, "load_forecast_model") == ["timestamp_utc", "model_version"]
+    assert not NEW_IN_0003 & set(inspect(blank).get_table_names())
+
+    add_export(blank, "9", "d_plus_1")
+    command.upgrade(cfg, "head")
+    command.check(cfg)
+
+
+@pytest.mark.parametrize("counts", [(5, 4, 4), (5, 5, 4), (0, 1, 1)])
+def test_0003_aborts_when_the_revision_seed_is_short(counts: tuple[int, int, int]) -> None:
+    check_copied = migration("0003").check_copied
+    check_copied(5, 5, 5)
+    with pytest.raises(RuntimeError, match="load_forecast_official_revision - aborted"):
+        check_copied(*counts)
 
 
 # --- init_db ---
@@ -235,21 +438,20 @@ def test_init_db_creates_and_stamps_a_fresh_database(url: str, blank: Engine) ->
 
 
 def test_the_live_database_is_stamped_once_then_upgraded(url: str, blank: Engine) -> None:
-    """The live state before migrations: our tables (with production's time indexes) from
-    create_all, MLflow's beside them, no version. Stamped at the baseline, then upgraded."""
-    db.Base.metadata.create_all(blank)
-    add_time_indexes(blank)
+    """The live state before migrations: our tables (with production's time indexes),
+    MLflow's beside them, no version. Stamped at the baseline, then upgraded."""
+    build_unversioned_0001(url, blank)
     add_mlflow_tables(blank)
     with pytest.raises(db.SchemaError, match=r"alembic stamp 0001"):
         db.init_db(blank)
 
     cfg = alembic_config(url)
     command.stamp(cfg, "0001")  # the runbook step
-    with pytest.raises(db.SchemaError, match=r"at revision 0001, this code needs 0002"):
+    with pytest.raises(db.SchemaError, match=rf"at revision 0001, this code needs {HEAD}"):
         db.init_db(blank)
     command.upgrade(cfg, "head")
     db.init_db(blank)
-    assert recorded_revision(blank) == "0002"
+    assert recorded_revision(blank) == HEAD
     command.check(cfg)  # MLflow's tables are not reported as extra
     assert_mlflow_untouched(blank)
 
@@ -257,11 +459,11 @@ def test_the_live_database_is_stamped_once_then_upgraded(url: str, blank: Engine
 def test_init_db_refuses_an_older_schema(blank: Engine) -> None:
     db.init_db(blank)
     set_recorded_revisions(blank, "0001")
-    with pytest.raises(db.SchemaError, match=r"at revision 0001, this code needs 0002.*upgrade"):
+    with pytest.raises(db.SchemaError, match=rf"at revision 0001, this code needs {HEAD}.*upgrade"):
         db.init_db(blank)
 
 
-@pytest.mark.parametrize("revision", ["0003", "zzz"])
+@pytest.mark.parametrize("revision", ["0004", "zzz"])
 def test_init_db_refuses_an_unknown_or_newer_schema(blank: Engine, revision: str) -> None:
     db.init_db(blank)
     set_recorded_revisions(blank, revision)
@@ -297,14 +499,13 @@ def test_the_baseline_cannot_be_downgraded(url: str, blank: Engine) -> None:
     command.downgrade(alembic_config(url), "0001")
     with pytest.raises(RuntimeError, match="baseline"):
         command.downgrade(alembic_config(url), "base")
-    assert set(db.Base.metadata.tables) <= set(inspect(blank).get_table_names())
+    assert set(db.Base.metadata.tables) - NEW_IN_0003 <= set(inspect(blank).get_table_names())
     assert recorded_revision(blank) == "0001"
 
 
 # --- The runbook, through the real CLI and alembic.ini ---
 def test_runbook_commands_through_the_cli(url: str, blank: Engine) -> None:
-    db.Base.metadata.create_all(blank)  # an existing database that predates migrations
-    add_time_indexes(blank)
+    build_unversioned_0001(url, blank)  # an existing database that predates migrations
     add_mlflow_tables(blank)
 
     def alembic(*args: str) -> str:
@@ -322,7 +523,7 @@ def test_runbook_commands_through_the_cli(url: str, blank: Engine) -> None:
     alembic("stamp", "0001")
     assert "0001" in alembic("current")
     alembic("upgrade", "head")
-    assert "0002 (head)" in alembic("current")
+    assert f"{HEAD} (head)" in alembic("current")
     assert "No new upgrade operations detected" in alembic("check")
     db.init_db(blank)
     assert_mlflow_untouched(blank)
@@ -369,6 +570,17 @@ def postgres() -> Iterator[Engine]:
         engine.dispose()
 
 
+def create_reader_role(engine: Engine) -> str | None:
+    """A role to grant to, like the dashboard's; None if this login may not create roles
+    (the PUBLIC grant still checks that grants are kept)."""
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(f"CREATE ROLE {READER_ROLE} NOLOGIN"))
+    except DBAPIError:
+        return None
+    return READER_ROLE
+
+
 def postgres_indexes(engine: Engine, table: str) -> set[str]:
     with engine.connect() as conn:
         return set(
@@ -386,6 +598,9 @@ def test_migrations_and_init_db_on_postgres(postgres: Engine) -> None:
     command.upgrade(cfg, "head")
     command.check(cfg)
     db.init_db(engine)  # migrated: passes
+    assert inspect(engine).get_pk_constraint("load_forecast_model")["name"] == (
+        "load_forecast_model_pkey"
+    )
 
     command.downgrade(cfg, "0001")  # without hypertables, 0002 is only its index step
     for table in TIME_SERIES_TABLES:
@@ -444,20 +659,7 @@ def seed_time_series(engine: Engine) -> None:
             for city in ("berlin", "munich")
         ],
     )
-    db.upsert_rows(
-        engine,
-        db.LoadForecastModel,
-        [
-            {
-                "timestamp_utc": ts,
-                "model_version": "3",
-                "model_name": "load-forecaster",
-                "forecast_mw": 52_000.0 + i,
-                "issued_at": issued,
-            }
-            for i, ts in enumerate(hours)
-        ],
-    )
+    insert_forecasts_0002(engine, "3", hours, issued)
 
 
 def snapshot(engine: Engine) -> dict[str, list[tuple]]:
@@ -488,13 +690,9 @@ def test_0002_converts_hypertables_on_postgres(postgres: Engine, per_table: bool
     module = migration("0002")
     cfg = alembic_config(POSTGRES_URL or "")
     command.upgrade(cfg, "0001")
+    role: str | None = None
     try:
-        role: str | None = READER_ROLE
-        try:
-            with engine.begin() as conn:
-                conn.execute(text(f"CREATE ROLE {READER_ROLE} NOLOGIN"))
-        except DBAPIError:
-            role = None  # not allowed to create roles: the PUBLIC grant still covers the copy
+        role = create_reader_role(engine)
         with engine.begin() as conn:
             conn.execute(text("CREATE EXTENSION IF NOT EXISTS timescaledb"))
             for table in TIME_SERIES_TABLES:
@@ -529,7 +727,7 @@ def test_0002_converts_hypertables_on_postgres(postgres: Engine, per_table: bool
 
         if per_table:
             cfg.cmd_opts = argparse.Namespace(x=["per_table=true"])
-        command.upgrade(cfg, "head")
+        command.upgrade(cfg, "0002")
 
         assert recorded_revision(engine) == "0002"
         assert snapshot(engine) == rows
@@ -547,13 +745,16 @@ def test_0002_converts_hypertables_on_postgres(postgres: Engine, per_table: bool
                 assert key == f"{table}_pkey"
         for table in TIME_SERIES_TABLES:
             assert postgres_indexes(engine, table) == {f"{table}_pkey"}
+        add_export(engine, "3", "d_plus_1")  # what 0003 backfills the forecasts' horizon from
+        command.upgrade(cfg, "head")
         command.check(cfg)
         db.init_db(engine)
 
         # Again after a downgrade: nothing is a hypertable any more, only the index step runs.
         command.downgrade(cfg, "0001")
-        command.upgrade(cfg, "head")
+        command.upgrade(cfg, "0002")
         assert snapshot(engine) == rows
+        command.upgrade(cfg, "head")
         command.check(cfg)
     finally:
         drop_application_schema(engine)
@@ -562,3 +763,50 @@ def test_0002_converts_hypertables_on_postgres(postgres: Engine, per_table: bool
                 conn.execute(text(f"DROP ROLE {role}"))
             if not installed:
                 conn.execute(text("DROP EXTENSION IF EXISTS timescaledb"))
+
+
+@pytest.mark.integration
+@requires_postgres
+def test_0003_alters_in_place_on_postgres(postgres: Engine) -> None:
+    """The key is swapped under its name by ``ALTER``s: the table, its rows and grants stay."""
+    engine = postgres
+    cfg = alembic_config(POSTGRES_URL or "")
+    grants_of = migration("0002").table_grants
+    command.upgrade(cfg, "0002")
+    role: str | None = None
+    try:
+        role = create_reader_role(engine)
+        with engine.begin() as conn:
+            conn.execute(text("GRANT SELECT ON load_forecast_model TO PUBLIC"))
+            if role:
+                conn.execute(text(f"GRANT SELECT ON load_forecast_model TO {role}"))
+        with engine.connect() as conn:
+            grants = grants_of(conn, "load_forecast_model")
+        seed_0002(engine)
+
+        command.upgrade(cfg, "head")
+        command.check(cfg)
+        key = inspect(engine).get_pk_constraint("load_forecast_model")
+        assert key["name"] == "load_forecast_model_pkey"
+        assert key["constrained_columns"] == ["timestamp_utc", "model_version", "issued_at"]
+        with engine.connect() as conn:
+            assert grants_of(conn, "load_forecast_model") == grants
+        assert db.count_rows(engine, db.LoadForecastOfficialRevision) == len(HOURS)
+        reissue_v3(engine)  # the one-transaction write, on Postgres
+        assert issues_per_version(engine) == [("1", 24, 1), ("3", 96, 2)]
+
+        command.downgrade(cfg, "0002")
+        key = inspect(engine).get_pk_constraint("load_forecast_model")
+        assert key["name"] == "load_forecast_model_pkey"
+        assert key["constrained_columns"] == ["timestamp_utc", "model_version"]
+        assert issues_per_version(engine) == [("1", 24, 1), ("3", 48, 1)]
+        with engine.connect() as conn:
+            assert grants_of(conn, "load_forecast_model") == grants
+        command.upgrade(cfg, "head")
+        command.check(cfg)
+        db.init_db(engine)
+    finally:
+        drop_application_schema(engine)
+        if role:  # only the role this test created
+            with engine.begin() as conn:
+                conn.execute(text(f"DROP ROLE {role}"))

@@ -1,16 +1,19 @@
-"""Serving tests (offline): feature reconstruction parity, forecast window, batch upsert, API."""
+"""Serving tests (offline): feature reconstruction parity, forecast window, storing every issue
+with its weather inputs, the deadline margin, API."""
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import numpy as np
 import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy.exc import IntegrityError
 
 from src.data import db
-from src.data.weather_client import City
+from src.data.weather_client import WEATHER_VARS, City
 from src.features.build_features import TARGET, build_features
 from src.features.horizons import D_PLUS_1, DAY_AHEAD, NOWCAST, select_features
 from src.models.registry import LoadedModel
@@ -94,7 +97,7 @@ def fake_model(features: list[str]) -> LoadedModel:
 
 @pytest.fixture
 def day_ahead_features(seeded) -> list[str]:
-    served, _ = build_serving_features(seeded, as_of=LAST_ACTUAL - pd.Timedelta(days=5))
+    served, _, _ = build_serving_features(seeded, as_of=LAST_ACTUAL - pd.Timedelta(days=5))
     return select_features(served.columns, DAY_AHEAD)
 
 
@@ -115,7 +118,7 @@ def test_forecast_window_is_the_24_hours_after_the_last_actual() -> None:
 def test_served_features_equal_training_features_exactly(seeded) -> None:
     """Serve 'as of' a past hour; the same hours in the training frame must match bit-for-bit."""
     as_of = pd.Timestamp("2024-01-20T23:00Z")
-    served, last_actual = build_serving_features(seeded, as_of=as_of)
+    served, last_actual, _ = build_serving_features(seeded, as_of=as_of)
     assert last_actual == as_of
     assert list(served.index) == list(forecast_window(as_of))
 
@@ -132,20 +135,20 @@ def test_served_features_equal_training_features_exactly(seeded) -> None:
 def test_served_features_never_contain_information_after_the_cutoff(seeded) -> None:
     """Change the load *after* the as-of time: served day-ahead features must not move."""
     as_of = pd.Timestamp("2024-01-20T23:00Z")
-    base, _ = build_serving_features(seeded, as_of=as_of)
+    base, _, _ = build_serving_features(seeded, as_of=as_of)
     cols = select_features(base.columns, DAY_AHEAD)
 
     later = db.read_load(seeded, start=as_of + pd.Timedelta(hours=1))
     later["load_mw"] += 1e6
     db.upsert_dataframe(seeded, db.LoadActual, later.assign(source="smard"))
 
-    after, _ = build_serving_features(seeded, as_of=as_of)
+    after, _, _ = build_serving_features(seeded, as_of=as_of)
     pd.testing.assert_frame_equal(base[cols], after[cols], check_exact=True)
 
 
 def test_nowcast_only_features_are_nan_for_the_served_hours(seeded) -> None:
     """lag_1 / rolling stats of the target hours depend on unobserved load -> NaN, never used."""
-    served, _ = build_serving_features(seeded, as_of="2024-01-20T23:00Z")
+    served, _, _ = build_serving_features(seeded, as_of="2024-01-20T23:00Z")
     nowcast_only = set(select_features(served.columns, NOWCAST)) - set(
         select_features(served.columns, DAY_AHEAD)
     )
@@ -179,7 +182,7 @@ def test_fill_short_gaps_bridges_short_runs_only() -> None:
 
 def test_one_missing_hour_is_interpolated_for_serving_only(seeded) -> None:
     (gap,) = _delete_load_hours(seeded, "2024-01-20T05:00Z", 1)  # t-24 for 2024-01-21T05
-    served, _ = build_serving_features(seeded, as_of="2024-01-20T23:00Z")
+    served, _, _ = build_serving_features(seeded, as_of="2024-01-20T23:00Z")
     lag = served.loc[pd.Timestamp("2024-01-21T05:00Z"), "load_lag_24"]
     load = db.read_load(seeded).set_index("timestamp_utc")[TARGET]
     neighbours = load.loc[[gap - pd.Timedelta(hours=1), gap + pd.Timedelta(hours=1)]]
@@ -223,7 +226,7 @@ def test_d_plus_1_targets_tomorrow_and_refuses_stale_actuals() -> None:
 
 def test_d_plus_1_forecast_covers_the_next_local_day_without_the_24h_lag(seeded) -> None:
     as_of = pd.Timestamp("2024-01-20T05:00Z")  # issued Saturday morning, latest actual 05:00
-    served, last_actual = build_serving_features(seeded, horizon=D_PLUS_1, as_of=as_of)
+    served, last_actual, _ = build_serving_features(seeded, horizon=D_PLUS_1, as_of=as_of)
     assert list(served.index) == list(calendar_day_window(pd.Timestamp("2024-01-21")))
     assert last_actual == as_of
 
@@ -272,7 +275,7 @@ def test_forecast_weather_does_not_overwrite_archive(seeded) -> None:
 
 
 def test_missing_weather_without_client_gives_nan_weather_not_an_error(seeded) -> None:
-    served, _ = build_serving_features(seeded)  # target beyond the archive, no client
+    served, _, _ = build_serving_features(seeded)  # target beyond the archive, no client
     assert served.filter(like="_de_avg").isna().all().all()
     assert served[["load_lag_24", "load_lag_168", "hour"]].notna().all().all()
 
@@ -301,30 +304,90 @@ def test_forecast_refuses_model_with_different_features(seeded, day_ahead_featur
         make_day_ahead_forecast(seeded, reordered)
 
 
-def test_store_forecast_is_idempotent_and_versioned(seeded, day_ahead_features) -> None:
+def test_store_forecast_keeps_every_issue_with_its_weather(seeded, day_ahead_features) -> None:
     model = fake_model(day_ahead_features)
     r1 = make_day_ahead_forecast(seeded, model, weather_client=FakeWeatherClient(LAST_ACTUAL))
+    assert len(r1.weather) == len(CITIES) * 24
     assert store_forecast(seeded, r1) == 24
-    assert store_forecast(seeded, r1) == 24
+    assert store_forecast(seeded, r1) == 24  # the same issue again adds no rows
     assert db.count_rows(seeded, db.LoadForecastModel) == 24
+    assert db.count_rows(seeded, db.LoadForecastModelWeather) == len(CITIES) * 24
+    assert (db.read_table(seeded, db.LoadForecastModel)["horizon"] == "day_ahead").all()
 
-    # Re-issue with the same version -> rows updated in place (new issued_at).
+    # A re-issue with the same version is added; the earlier issue stays.
     r2 = make_day_ahead_forecast(seeded, model, weather_client=FakeWeatherClient(LAST_ACTUAL))
     r2.issued_at = r1.issued_at + pd.Timedelta(minutes=5)
     store_forecast(seeded, r2)
-    assert db.count_rows(seeded, db.LoadForecastModel) == 24
+    assert db.count_rows(seeded, db.LoadForecastModel) == 48
+    assert db.count_rows(seeded, db.LoadForecastModel, issued_at=r1.issued_at) == 24
+    assert db.count_rows(seeded, db.LoadForecastModelWeather) == 2 * len(CITIES) * 24
     latest = db.read_latest_model_forecast(seeded)
     assert len(latest) == 24 and (latest["issued_at"] == r2.issued_at).all()
     assert (latest["model_name"] == "germany-load-day-ahead").all()
 
-    # A different model version keeps its own rows.
+    # A different model version adds its own issue.
     v8 = fake_model(day_ahead_features)
     v8.version = "8"
     store_forecast(
         seeded, make_day_ahead_forecast(seeded, v8, weather_client=FakeWeatherClient(LAST_ACTUAL))
     )
-    assert db.count_rows(seeded, db.LoadForecastModel) == 48
+    assert db.count_rows(seeded, db.LoadForecastModel) == 72
     assert db.count_rows(seeded, db.LoadForecastModel, model_version="8") == 24
+
+
+def test_stored_weather_inputs_are_what_was_read_and_survive_the_archive(
+    seeded, day_ahead_features
+) -> None:
+    result = make_day_ahead_forecast(
+        seeded, fake_model(day_ahead_features), weather_client=FakeWeatherClient(LAST_ACTUAL)
+    )
+    store_forecast(seeded, result)
+    target = dict(start=result.target_start, end=result.target_end)
+    cols = ["timestamp_utc", "city", "source", *WEATHER_VARS, "fetched_at"]
+    keys = ["timestamp_utc", "city"]
+    read = db.read_table(seeded, db.WeatherHourly, **target)
+    inputs = db.read_table(seeded, db.LoadForecastModelWeather)
+    assert set(inputs["issued_at"]) == {result.issued_at}
+    assert (inputs["source"] == "forecast").all()
+    pd.testing.assert_frame_equal(
+        inputs[cols].sort_values(keys).reset_index(drop=True),
+        read.rename(columns={"ingested_at": "fetched_at"})[cols]
+        .sort_values(keys)
+        .reset_index(drop=True),
+    )
+
+    # Days later the archive overwrites those hours in weather_hourly; the inputs stay.
+    archive = _weather_rows(result.frame.index, "archive").assign(temperature_2m=-30.0)
+    db.upsert_dataframe(seeded, db.WeatherHourly, archive, update_where=db.weather_update_where)
+    assert (db.read_table(seeded, db.WeatherHourly, **target)["temperature_2m"] == -30.0).all()
+    pd.testing.assert_frame_equal(db.read_table(seeded, db.LoadForecastModelWeather), inputs)
+
+
+def test_a_failed_weather_write_stores_no_forecast_rows(seeded, day_ahead_features) -> None:
+    """One transaction: an issue is stored with its weather inputs or not at all."""
+    result = make_day_ahead_forecast(
+        seeded, fake_model(day_ahead_features), weather_client=FakeWeatherClient(LAST_ACTUAL)
+    )
+    result.weather = result.weather.assign(source=None)  # NOT NULL in the inputs table
+    with pytest.raises(IntegrityError):
+        store_forecast(seeded, result)
+    assert db.count_rows(seeded, db.LoadForecastModel) == 0
+    assert db.count_rows(seeded, db.LoadForecastModelWeather) == 0
+
+
+def test_deadline_margin_is_measured_to_the_earliest_deadline(seeded, day_ahead_features) -> None:
+    result = make_day_ahead_forecast(
+        seeded, fake_model(day_ahead_features), weather_client=FakeWeatherClient(LAST_ACTUAL)
+    )
+    # day_ahead: each hour is its own deadline, the first target hour comes first
+    result.issued_at = result.target_start - pd.Timedelta(hours=2)
+    assert result.deadline_margin_hours == pytest.approx(2.0)
+    # d_plus_1 over 31 Jan 00:00-23:00 UTC: the 00:00 hour is 31 Jan in Berlin, due 30 Jan
+    # 11:00 UTC; the 23:00 hour is already 1 Feb, due a day later. The earlier one counts.
+    d1 = replace(result, horizon=D_PLUS_1.name, issued_at=pd.Timestamp("2024-01-30T05:40Z"))
+    assert d1.deadline_margin_hours == pytest.approx(5 + 20 / 60)
+    late = replace(d1, issued_at=pd.Timestamp("2024-01-30T12:00Z"))
+    assert late.deadline_margin_hours == pytest.approx(-1.0)
 
 
 def test_batch_cli_dry_run_and_write(
@@ -338,10 +401,38 @@ def test_batch_cli_dry_run_and_write(
 
     assert batch_forecast.main(["--dry-run", "--database-url", url]) == 0
     assert db.count_rows(seeded, db.LoadForecastModel) == 0
-    assert "germany-load-day-ahead v7" in capsys.readouterr().out
+    assert db.count_rows(seeded, db.LoadForecastModelWeather) == 0
+    out = capsys.readouterr().out
+    assert "germany-load-day-ahead v7" in out and "deadline margin" in out
 
     assert batch_forecast.main(["--database-url", url, "--hours", "12"]) == 0
     assert db.count_rows(seeded, db.LoadForecastModel) == 12
+    assert db.count_rows(seeded, db.LoadForecastModelWeather) == 12 * len(CITIES)
+
+
+def test_batch_refuses_to_store_an_as_of_replay(
+    seeded, day_ahead_features, monkeypatch, capsys
+) -> None:
+    """Stored, a replay would be a late issue that shows as the latest forecast."""
+    monkeypatch.setattr(
+        batch_forecast, "load_champion", lambda engine: fake_model(day_ahead_features)
+    )
+    monkeypatch.setattr(batch_forecast, "WeatherClient", lambda: FakeWeatherClient(LAST_ACTUAL))
+    url = str(seeded.url)
+    as_of = "2024-01-20T23:00Z"
+
+    with pytest.raises(SystemExit) as exit_info:
+        batch_forecast.main(["--as-of", as_of, "--database-url", url])
+    assert exit_info.value.code == 2
+    assert "only allowed with --dry-run" in capsys.readouterr().err
+    with pytest.raises(ValueError, match="only allowed with --dry-run"):
+        batch_forecast.run(as_of=pd.Timestamp(as_of), database_url=url)
+    assert db.count_rows(seeded, db.LoadForecastModel) == 0
+    assert db.count_rows(seeded, db.LoadForecastModelWeather) == 0
+
+    assert batch_forecast.main(["--as-of", as_of, "--dry-run", "--database-url", url]) == 0
+    assert "target 2024-01-21 00:00:00+00:00" in capsys.readouterr().out
+    assert db.count_rows(seeded, db.LoadForecastModel) == 0
 
 
 def test_batch_once_per_day_skips_when_today_is_already_issued(

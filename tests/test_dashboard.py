@@ -17,6 +17,7 @@ from sqlalchemy.engine import Engine
 from config.settings import PROJECT_ROOT
 from dashboard import queries as q
 from src.data import db
+from src.features.horizons import D_PLUS_1
 from src.models.evaluate import compute_metrics
 
 START = pd.Timestamp("2024-01-01T00:00Z")
@@ -83,6 +84,36 @@ def daily_curve(n: int) -> np.ndarray:
     return 55_000 + 8_000 * np.sin((hours - 6) / 24 * 2 * np.pi)
 
 
+V1_LEAD = pd.Timedelta(hours=5, minutes=20)  # issued 05:40 UTC, due 11:00 UTC (winter)
+# v2's last issue: the whole Berlin day of 11 Jan (10 Jan 23:00 - 11 Jan 22:00 UTC)
+LATEST_TARGET_END = pd.Timestamp("2024-01-11T22:00Z")
+# A late re-issue of v1 for Berlin 6 Jan (due 5 Jan 11:00 UTC), stored but never scored
+LATE_HOURS = pd.date_range("2024-01-06T00:00Z", "2024-01-06T22:00Z", freq="h")
+LATE_ISSUED_AT = pd.Timestamp("2024-01-06T14:00Z")
+
+
+def issue(
+    hours: pd.DatetimeIndex,
+    forecast_mw: np.ndarray | float,
+    *,
+    version: str,
+    lead: pd.Timedelta = V1_LEAD,
+    issued_at: pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    """D+1 rows; each Berlin day issued ``lead`` before its deadline unless ``issued_at``."""
+    hours = pd.Series(hours)
+    return pd.DataFrame(
+        {
+            "timestamp_utc": hours,
+            "model_version": version,
+            "model_name": q.MODEL_NAME,
+            "horizon": D_PLUS_1.name,
+            "forecast_mw": forecast_mw,
+            "issued_at": D_PLUS_1.issue_deadline(hours) - lead if issued_at is None else issued_at,
+        }
+    )
+
+
 @pytest.fixture
 def seeded(engine: Engine) -> Engine:
     """Ten days of actuals + official forecast, two forecast issues, two model versions, events."""
@@ -107,42 +138,37 @@ def seeded(engine: Engine) -> Engine:
             }
         ),
     )
-    # Model forecasts: v1 on days 3-9 (issued early), then v2 re-issues the last 2 days
-    # (later issue wins) plus the not-yet-observed day 10.
+    # D+1 model forecasts, issued daily before each Berlin day's deadline: v1 on days 3-9
+    # at 05:40 UTC, then v2 an hour later on the last 2 days (the later on-time issue wins)
+    # and on the not-yet-observed Berlin day after them. A late re-issue is kept, not scored.
     ts_v1 = ts[24 * 3 :]
     db.upsert_dataframe(
         engine,
         db.LoadForecastModel,
-        pd.DataFrame(
-            {
-                "timestamp_utc": ts_v1,
-                "model_version": "1",
-                "model_name": q.MODEL_NAME,
-                "forecast_mw": load[24 * 3 :] + 3_000,  # deliberately worse than the official
-                "issued_at": datetime(2024, 1, 3, 5, tzinfo=UTC),
-            }
-        ),
+        issue(ts_v1, load[24 * 3 :] + 3_000, version="1"),  # deliberately worse than the official
     )
-    ts_v2 = pd.date_range(START + pd.Timedelta(days=DAYS - 2), periods=24 * 3, freq="h", tz="UTC")
+    ts_v2 = pd.date_range(START + pd.Timedelta(days=DAYS - 2), LATEST_TARGET_END, freq="h")
     db.upsert_dataframe(
         engine,
         db.LoadForecastModel,
-        pd.DataFrame(
-            {
-                "timestamp_utc": ts_v2,
-                "model_version": "2",
-                "model_name": q.MODEL_NAME,
-                "forecast_mw": daily_curve(len(ts_v2)) + rng.normal(0, 300, len(ts_v2)),
-                "issued_at": datetime(2024, 1, 10, 5, tzinfo=UTC),
-            }
+        issue(
+            ts_v2,
+            daily_curve(len(ts_v2)) + rng.normal(0, 300, len(ts_v2)),
+            version="2",
+            lead=V1_LEAD - pd.Timedelta(hours=1),
         ),
+    )
+    db.upsert_dataframe(
+        engine,
+        db.LoadForecastModel,
+        issue(LATE_HOURS, 99_999.0, version="1", issued_at=LATE_ISSUED_AT),
     )
     for version, cv_mape in (("1", 3.1), ("2", 2.4)):
         db.store_model_artifact(
             engine,
             name=q.MODEL_NAME,
             version=version,
-            horizon="day_ahead",
+            horizon=D_PLUS_1.name,
             features="[]",
             train_start=START.to_pydatetime(),
             train_end=(START + pd.Timedelta(days=5)).to_pydatetime(),
@@ -163,7 +189,21 @@ def seeded(engine: Engine) -> Engine:
         model_mape_7d=2.5,
         official_mape_7d=2.8,
         drift_share=0.0,
-        details=json.dumps({"decision": {"checks": [], "drift": None}, "outcome": None}),
+        details=json.dumps(
+            {
+                "decision": {
+                    "checks": [],
+                    "drift": None,
+                    "performance": {
+                        "windows": [
+                            {"window_days": 7, "on_time_pct": 98.2},
+                            {"window_days": 30, "on_time_pct": 99.6},
+                        ]
+                    },
+                },
+                "outcome": None,
+            }
+        ),
     )
     db.insert_monitoring_event(
         engine,
@@ -213,7 +253,7 @@ def test_coverage(seeded: Engine) -> None:
     assert cov["n_hours"] == cov["expected_hours"] == 24 * DAYS
     assert cov["completeness_pct"] == 100.0
     assert cov["last_official"] == START + pd.Timedelta(hours=24 * (DAYS + 1) - 1)
-    assert cov["last_model_forecast"] == START + pd.Timedelta(hours=24 * (DAYS + 1) - 1)
+    assert cov["last_model_forecast"] == LATEST_TARGET_END
 
 
 def test_coverage_counts_gaps(seeded: Engine) -> None:
@@ -233,14 +273,70 @@ def test_coverage_counts_gaps(seeded: Engine) -> None:
 # --- Latest forecast ---
 def test_latest_forecast_frame_is_the_latest_issue_with_context(seeded: Engine) -> None:
     frame = q.latest_forecast_frame(seeded, context_hours=48)
-    assert len(frame) == 48 + 72  # context + the v2 issue (3 days)
+    assert len(frame) == 48 + 24  # context + v2's last issue (Berlin 11 Jan)
     window = frame[frame["model_mw"].notna()]
-    assert len(window) == 72 and set(window["model_version"]) == {"2"}
+    assert len(window) == 24 and set(window["model_version"]) == {"2"}
+    assert window["timestamp_utc"].max() == LATEST_TARGET_END
     assert frame["timestamp_utc"].is_monotonic_increasing
-    # Actuals exist for the context and the first two forecast days, not the third.
-    assert frame["actual_mw"].notna().sum() == 48 + 48
+    # Actuals exist for the context and the first forecast hour (10 Jan 23:00 UTC) only.
+    assert frame["actual_mw"].notna().sum() == 48 + 1
     assert frame["official_mw"].notna().all()
     assert frame["issued_at"].notna().all()
+    assert set(frame["horizon"]) == {D_PLUS_1.name}
+
+    due = q.deadline_status(window)
+    assert due == {"deadline": pd.Timestamp("2024-01-10T11:00Z"), "n_hours": 24, "n_on_time": 24}
+    late = window.assign(issued_at=pd.Timestamp("2024-01-10T12:00Z"))
+    assert q.deadline_status(late)["n_on_time"] == 0
+
+
+def make_latest_issue_late(engine: Engine) -> pd.DatetimeIndex:
+    """A forced re-issue after the auction for Berlin 10 Jan, whose hours all have actuals."""
+    hours = pd.date_range("2024-01-09T23:00Z", "2024-01-10T22:00Z", freq="h")  # due 9 Jan 11:00
+    late = issue(
+        hours, daily_curve(24) + 500.0, version="2", issued_at=pd.Timestamp("2024-01-10T12:00Z")
+    )
+    db.upsert_dataframe(engine, db.LoadForecastModel, late)
+    return hours
+
+
+def test_so_far_mae_uses_only_the_scored_hours_of_the_shown_issue(seeded: Engine) -> None:
+    window = q.latest_forecast_frame(seeded).query("model_mw.notna()")
+    scored = q.scored_hours(window)  # on time, and only the first hour has an actual yet
+    assert list(scored["timestamp_utc"]) == [pd.Timestamp("2024-01-10T23:00Z")]
+
+    hours = make_latest_issue_late(seeded)
+    window = q.latest_forecast_frame(seeded).query("model_mw.notna()")
+    assert list(window["timestamp_utc"]) == list(hours) and window["actual_mw"].notna().all()
+    assert q.scored_hours(window).empty  # observed, but issued after the deadline
+
+
+def test_forecast_caption_shows_no_mae_when_no_hour_is_scored(
+    seeded: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from streamlit.testing.v1 import AppTest
+
+    make_latest_issue_late(seeded)
+    monkeypatch.setenv("DATABASE_URL", str(seeded.url))
+    at = AppTest.from_file(str(PROJECT_ROOT / "dashboard" / "app.py"), default_timeout=60).run()
+    assert not at.exception, [e.value for e in at.exception]
+    (caption,) = [c.value for c in at.caption if c.value.startswith("Issued")]
+    assert "24 of 24 hours issued after their deadline" in caption
+    assert "no hour scored yet" in caption and "MAE" not in caption
+
+
+def test_a_late_reissue_is_kept_but_never_scored(seeded: Engine) -> None:
+    as_of = START + pd.Timedelta(days=DAYS, hours=-1)
+    base = q.actual_vs_official(seeded, days=30, as_of=as_of)
+    issues = q.model_issues(seeded, base)
+    late = issues[~issues["on_time"]]
+    assert list(late["timestamp_utc"]) == list(LATE_HOURS)  # stored, and known to be late
+    aligned = q.aligned_frame(seeded, base, issues).set_index("timestamp_utc")
+    assert (aligned.loc[LATE_HOURS, "model_mw"] != 99_999.0).all()  # v1's on-time issue scores
+    status = q.forecast_status(seeded, base, issues)
+    w7 = q.window_summary(aligned.reset_index(), days=7, as_of=as_of, status=status)
+    assert (w7["on_time_pct"], w7["n_late"], w7["n_missing"]) == (100.0, 0, 0)
+    assert w7["n_on_time"] == 24 * 7
 
 
 def aligned_last(engine: Engine, *, days: int, as_of: pd.Timestamp | None = None) -> pd.DataFrame:
@@ -446,6 +542,8 @@ def test_event_timeline_status(seeded: Engine) -> None:
     assert list(timeline["kind"]) == ["retrain", "check", "check"]
     assert list(timeline["status"]) == ["promoted", "triggered", "ok"]
     assert timeline.loc[2, "model_mape_7d"] == 2.5
+    assert timeline.loc[2, "on_time_pct_7d"] == 98.2  # from the pass's details
+    assert timeline.loc[:1, "on_time_pct_7d"].isna().all()  # passes recorded without it
 
 
 def test_latest_check_survives_unparseable_details(engine: Engine) -> None:
@@ -522,6 +620,8 @@ def test_app_renders_every_panel(seeded: Engine, monkeypatch: pytest.MonkeyPatch
         "Accuracy over time: model vs. official forecast",
         "Monitoring status",
     ]
+    assert any("on time (deadline" in c.value for c in at.caption)  # the latest issue
+    assert any("so far, on 1 scored hour(s): model MAE" in c.value for c in at.caption)
 
 
 def test_app_renders_an_empty_database(engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:

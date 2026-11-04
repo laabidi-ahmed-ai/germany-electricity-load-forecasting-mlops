@@ -71,11 +71,15 @@ def load_accuracy(url: str, days: int) -> dict[str, Any]:
     eng = engine_for(url)
     as_of = pd.Timestamp.now(tz="UTC").floor("h")
     base = q.actual_vs_official(eng, days=days, as_of=as_of)  # days >= 30 (slider minimum)
-    aligned = q.aligned_frame(eng, base)
+    issues = q.model_issues(eng, base)
+    aligned = q.aligned_frame(eng, base, issues)
+    status = q.forecast_status(eng, base, issues)
     return {
         "aligned": aligned,
         "daily": q.daily_accuracy(aligned),
-        "windows": [q.window_summary(aligned, days=d, as_of=as_of) for d in q.WINDOWS_DAYS],
+        "windows": [
+            q.window_summary(aligned, days=d, as_of=as_of, status=status) for d in q.WINDOWS_DAYS
+        ],
         "official_only": q.official_only_summary(base, days=max(q.WINDOWS_DAYS), as_of=as_of),
     }
 
@@ -119,6 +123,12 @@ def to_tz(series: pd.Series, tz: str) -> pd.Series:
     return series.dt.tz_convert(tz)
 
 
+def on_time_text(window: dict[str, Any]) -> str:
+    """`` · on time 98 %`` for a window summary with on-time counts, else nothing."""
+    pct = window.get("on_time_pct")
+    return "" if pct is None else f" · on time {pct:.0f} %"
+
+
 # --- Panels ---
 def panel_headline(head: dict[str, Any], acc: dict[str, Any], tz: str) -> None:
     champ, cov = head["champion"], head["coverage"]
@@ -146,11 +156,12 @@ def panel_headline(head: dict[str, Any], acc: dict[str, Any], tz: str) -> None:
                 delta=f"{gap:+.2f} pp vs official",
                 delta_color="inverse",
             )
-            st.caption(f"{w7['n_hours']} forecast hours scored against actuals")
+            st.caption(f"{w7['n_hours']} forecast hours scored against actuals{on_time_text(w7)}")
         else:
             st.metric("Model MAPE · last 7 days", NA)
             st.caption(
                 f"{w7['n_hours']} hour(s) scored so far · needs {q.MIN_WINDOW_HOURS} to judge"
+                + on_time_text(w7)
             )
     with c3:
         st.metric("Official forecast MAPE · 30 days", fmt_pct(official30["mape"]))
@@ -177,7 +188,8 @@ def panel_forecast(frame: pd.DataFrame, tz: str) -> None:
         st.info("No model forecast in the database yet - the daily forecast job has not run.")
         return
     window = frame[frame["model_mw"].notna()]
-    scored = window[window["actual_mw"].notna()]
+    observed = window[window["actual_mw"].notna()]
+    scored = q.scored_hours(window)  # on time and observed: what the accuracy panel counts
     issued = window["issued_at"].iloc[0]
     version = window["model_version"].iloc[0]
     x = to_tz(frame["timestamp_utc"], tz)
@@ -228,13 +240,25 @@ def panel_forecast(frame: pd.DataFrame, tz: str) -> None:
     )
     st.plotly_chart(fig, width="stretch")
 
+    due = q.deadline_status(window)
+    if due["n_on_time"] == due["n_hours"]:
+        timing = f"on time (deadline {fmt_ts(due['deadline'], tz)})"
+    else:
+        late = due["n_hours"] - due["n_on_time"]
+        timing = f"{late} of {due['n_hours']} hours issued after their deadline: kept, not scored"
     parts = [
-        f"Issued {fmt_ts(issued, tz)} · {len(window)} hours · {len(scored)} already have actuals"
+        f"Issued {fmt_ts(issued, tz)} · {timing} · {len(window)} hours · "
+        f"{len(observed)} already have actuals"
     ]
     if len(scored) >= 1:
         model_mae = q.compute_metrics(scored["actual_mw"], scored["model_mw"])["mae"]
         official_mae = q.compute_metrics(scored["actual_mw"], scored["official_mw"])["mae"]
-        parts.append(f"so far: model MAE {fmt_mw(model_mae)} · official MAE {fmt_mw(official_mae)}")
+        parts.append(
+            f"so far, on {len(scored)} scored hour(s): model MAE {fmt_mw(model_mae)} · "
+            f"official MAE {fmt_mw(official_mae)}"
+        )
+    else:
+        parts.append("no hour scored yet")
     st.caption(" — ".join(parts))
 
 
@@ -248,11 +272,13 @@ def panel_accuracy(acc: dict[str, Any], head: dict[str, Any], days: int, tz: str
             if not w["judged"]:
                 st.markdown(
                     f"**Last {w['days']} days** — {w['n_hours']} hour(s) scored, need {q.MIN_WINDOW_HOURS}"
+                    + on_time_text(w)
                 )
                 continue
             verdict = "model ahead" if w["model_beats_official"] else "official ahead"
             st.markdown(
                 f"**Last {w['days']} days** — {w['n_hours']} hours · {verdict} by {abs(w['improvement_pct']):.1f} % on MAE"
+                + on_time_text(w)
             )
             table = pd.DataFrame(
                 {
@@ -466,6 +492,7 @@ def panel_monitoring(mon: dict[str, Any], tz: str) -> None:
             model_version=timeline["model_version"].map(lambda v: "" if v is None else f"v{v}"),
             # stored as a fraction (0.25 = 25 %); may be NULL when the drift check failed
             drift_share=pd.to_numeric(timeline["drift_share"]) * 100,
+            on_time_pct_7d=pd.to_numeric(timeline["on_time_pct_7d"]),  # None before Step 8
         )
         st.dataframe(
             shown,
@@ -476,6 +503,7 @@ def panel_monitoring(mon: dict[str, Any], tz: str) -> None:
                 "official_mape_7d": st.column_config.NumberColumn(
                     "official MAPE 7d", format="%.2f %%"
                 ),
+                "on_time_pct_7d": st.column_config.NumberColumn("on time 7d", format="%.0f %%"),
                 "drift_share": st.column_config.NumberColumn("drift share", format="%.0f %%"),
             },
         )
