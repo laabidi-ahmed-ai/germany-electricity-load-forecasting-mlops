@@ -570,7 +570,7 @@ The migration was rehearsed on a Neon branch before it ran on `main`, including 
 | Real forecast on the branch: new issue's rows / weather inputs; earlier issue kept | 24 / 120 (5 cities × 24 h); yes, production's 05:42 issue unchanged |
 | Downgrade → upgrade: `load_forecast_model` rows | 1,187 → 1,163 (24 replaced rows deleted) → 1,163 → `alembic check` clean |
 | On-time share, 7 d / 30 d; hours now late | 86 % / 92 %; 23 late (7 d), 56 late + 3 missing (30 d) |
-| Database size before / after | 76 MB / <size from step 1> |
+| Database size before the upgrade | 76 MB |
 
 
 
