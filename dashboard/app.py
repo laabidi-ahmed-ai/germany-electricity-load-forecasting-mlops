@@ -156,7 +156,10 @@ def panel_headline(head: dict[str, Any], acc: dict[str, Any], tz: str) -> None:
                 delta=f"{gap:+.2f} pp vs official",
                 delta_color="inverse",
             )
-            st.caption(f"{w7['n_hours']} forecast hours scored against actuals{on_time_text(w7)}")
+            st.caption(
+                f"{w7['n_hours']} forecast hours scored against actuals · "
+                f"every version live in the window{on_time_text(w7)}"
+            )
         else:
             st.metric("Model MAPE · last 7 days", NA)
             st.caption(
@@ -165,7 +168,10 @@ def panel_headline(head: dict[str, Any], acc: dict[str, Any], tz: str) -> None:
             )
     with c3:
         st.metric("Official forecast MAPE · 30 days", fmt_pct(official30["mape"]))
-        st.caption(f"the benchmark to beat · {official30['n_hours']} hours")
+        st.caption(
+            f"the benchmark to beat · {official30['n_hours']} hours, "
+            "including those without a model forecast"
+        )
     with c4:
         pct = cov["completeness_pct"]
         st.metric("Data coverage", NA if pct is None else f"{pct:.1f} %")
@@ -264,6 +270,10 @@ def panel_forecast(frame: pd.DataFrame, tz: str) -> None:
 
 def panel_accuracy(acc: dict[str, Any], head: dict[str, Any], days: int, tz: str) -> None:
     st.subheader("Accuracy over time: model vs. official forecast")
+    st.caption(
+        "Each hour is scored with the latest forecast issued by its deadline, whichever model "
+        "version issued it; late issues are stored but not scored."
+    )
     daily, windows = acc["daily"], acc["windows"]
 
     cols = st.columns(2)
@@ -359,6 +369,11 @@ def panel_monitoring(mon: dict[str, Any], tz: str) -> None:
             st.markdown(
                 f"{q.pass_headline(check)} · as of {fmt_ts(check['as_of'], tz)} · "
                 f"champion at this pass v{check['champion_version']}"
+            )
+            st.caption(
+                "The error and official triggers score only the champion's own forecasts, up to "
+                "the time of this pass; the figures above include every version, up to now, so "
+                "they can differ."
             )
             checks = check["checks"]
             if not checks.empty:
@@ -499,11 +514,15 @@ def panel_monitoring(mon: dict[str, Any], tz: str) -> None:
             hide_index=True,
             width="stretch",
             column_config={
-                "model_mape_7d": st.column_config.NumberColumn("model MAPE 7d", format="%.2f %%"),
-                "official_mape_7d": st.column_config.NumberColumn(
-                    "official MAPE 7d", format="%.2f %%"
+                "model_mape_7d": st.column_config.NumberColumn(
+                    "champion MAPE 7d", format="%.2f %%"
                 ),
-                "on_time_pct_7d": st.column_config.NumberColumn("on time 7d", format="%.0f %%"),
+                "official_mape_7d": st.column_config.NumberColumn(
+                    "official MAPE 7d (champion's hours)", format="%.2f %%"
+                ),
+                "on_time_pct_7d": st.column_config.NumberColumn(
+                    "on time 7d (all versions)", format="%.0f %%"
+                ),
                 "drift_share": st.column_config.NumberColumn("drift share", format="%.0f %%"),
             },
         )

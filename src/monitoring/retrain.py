@@ -197,7 +197,8 @@ def evaluate_triggers(
                 threshold=cfg.official_gap_pct,
                 detail=(
                     f"{cfg.official_window_days}d: model MAE {w_off.model_mae:,.0f} vs official "
-                    f"{w_off.official_mae:,.0f} MW ({leader} better by {abs(gap):.1f}%)"
+                    f"{w_off.official_mae:,.0f} MW over {w_off.n_hours}h "
+                    f"({leader} better by {abs(gap):.1f}%)"
                 ),
             )
         )
