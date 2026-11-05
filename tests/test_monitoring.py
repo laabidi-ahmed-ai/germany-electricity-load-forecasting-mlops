@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -587,6 +589,25 @@ def test_official_trigger_fires_when_benchmark_is_much_better(engine, cfg) -> No
     off = d.checks[1]
     assert off.fired and off.value > 15
     assert not d.checks[0].fired  # 1.5 GW noise ~ 2.5% MAPE, under the error threshold
+
+
+def test_official_detail_states_the_hours_it_covers(engine, cfg) -> None:
+    """The 30-day label alone hides how few champion hours were scored."""
+    load = seed_db(engine, days=60, model_noise=1_500, official_noise=300)
+    frame = feature_frame(load)
+    champ = fake_loaded_model(select_features(frame.columns, DAY_AHEAD))
+    d = retrain.evaluate_triggers(
+        engine,
+        champ,
+        cfg,
+        as_of=load["timestamp_utc"].max(),
+        frame=frame,
+        drift_runner=fake_runner(set()),
+    )
+    m = re.search(r"MW over (\d+)h \((official|model) better by", d.checks[1].detail)
+    assert m is not None, d.checks[1].detail
+    n_hours = d.performance.window(cfg.official_window_days).n_hours
+    assert int(m.group(1)) == n_hours > 0
 
 
 def test_drift_trigger_fires_and_drift_errors_are_contained(engine, cfg) -> None:
