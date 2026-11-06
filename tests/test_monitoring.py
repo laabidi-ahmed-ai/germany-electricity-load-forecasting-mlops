@@ -551,17 +551,55 @@ def test_triggers_insufficient_data_do_not_fire(engine, cfg) -> None:
     assert "not triggered" in d.summary()
 
 
-def test_error_trigger_fires_on_high_mape(engine, cfg) -> None:
-    load = seed_db(engine, days=60, model_noise=100, model_bias=4_000)  # ~7% MAPE
+def _error_check(engine, cfg, **seed_kwargs) -> tuple[retrain.TriggerDecision, retrain.Check]:
+    load = seed_db(engine, days=60, **seed_kwargs)
     frame = feature_frame(load)
     champ = fake_loaded_model(select_features(frame.columns, DAY_AHEAD))
-    as_of = load["timestamp_utc"].max()
     d = retrain.evaluate_triggers(
-        engine, champ, cfg, as_of=as_of, frame=frame, drift_runner=fake_runner(set())
+        engine,
+        champ,
+        cfg,
+        as_of=load["timestamp_utc"].max(),
+        frame=frame,
+        drift_runner=fake_runner(set()),
     )
-    err = d.checks[0]
-    assert err.fired and err.value > 3.5
+    return d, d.checks[0]
+
+
+def test_error_trigger_fires_when_official_is_better(engine, cfg) -> None:
+    d, err = _error_check(engine, cfg, model_noise=100, model_bias=3_000)  # ~5.6% vs ~1.5%
+    w = d.performance.window(cfg.error_window_days)
+    assert err.value > err.threshold and w.official_mape < w.model_mape
+    assert err.fired and "(official as good or better)" in err.detail
     assert d.triggered and any("MAPE" in r for r in d.reasons)
+
+
+def test_error_trigger_holds_when_official_is_worse_on_the_same_hours(engine, cfg) -> None:
+    """A week that is hard for both forecasts is weather, not model decay."""
+    d, err = _error_check(engine, cfg, model_noise=100, model_bias=3_000, official_noise=7_000)
+    w = d.performance.window(cfg.error_window_days)
+    assert err.threshold < err.value < cfg.error_ceiling_factor * err.threshold
+    assert w.official_mape > w.model_mape
+    assert not err.fired and "(model still ahead)" in err.detail
+    assert f"official {w.official_mape:.2f}% on the same hours" in err.detail
+    assert not d.triggered
+
+
+def test_error_trigger_fires_over_twice_the_limit_even_if_official_is_worse(engine, cfg) -> None:
+    """The backstop: a broken model in a week that is hard for both still fires."""
+    d, err = _error_check(engine, cfg, model_noise=100, model_bias=6_000, official_noise=12_000)
+    w = d.performance.window(cfg.error_window_days)
+    assert err.value > cfg.error_ceiling_factor * err.threshold
+    assert w.official_mape > w.model_mape  # the official forecast is even worse
+    assert err.fired and "(over twice the limit)" in err.detail
+    assert d.triggered
+
+
+def test_error_trigger_does_not_fire_below_the_limit(engine, cfg) -> None:
+    d, err = _error_check(engine, cfg)  # model ~0.7% MAPE
+    assert err.value < err.threshold
+    assert not err.fired and "(under the limit)" in err.detail
+    assert not d.triggered
 
 
 def test_error_threshold_follows_the_champions_horizon() -> None:

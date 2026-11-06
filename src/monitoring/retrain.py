@@ -3,9 +3,11 @@
 Any one of three triggers fires a retrain: the champion's rolling 7-day MAPE on its
 live forecasts exceeds its horizon's limit (``MAPE_THRESHOLD_BY_HORIZON``: about 1.4x the
 cross-validated MAPE - 3.5 % for day_ahead at 2.44 %, 4.0 % for d_plus_1 at 2.88 % -
-because a harder task has a higher normal error); over 30 days the official forecast beats
-the model by more than ``official_gap_pct``; or ``src.monitoring.drift`` flags dataset
-or prediction drift.
+because a harder task has a higher normal error) and the official forecast did no better
+on the same hours (a week that is hard for both is not decay), or it exceeds
+``error_ceiling_factor`` x the limit whatever the official forecast did (a backstop for a
+broken model in a hard week); over 30 days the official forecast beats the model by more
+than ``official_gap_pct``; or ``src.monitoring.drift`` flags dataset or prediction drift.
 
 Champion / challenger, fair by construction: the holdout is data that arrived after
 the champion's ``train_end`` (capped at ``holdout_days``); with fewer than
@@ -55,7 +57,9 @@ from src.observability import JobMetrics, job_metrics
 log = logging.getLogger(__name__)
 
 
-# 7-day MAPE above which the error trigger fires, per horizon: ~1.4x the CV MAPE.
+# 7-day MAPE above which the error trigger fires, per horizon: ~1.4x the CV MAPE. It fires
+# only if the official forecast's MAPE on the same hours is no better than the model's, or
+# if the MAPE is over error_ceiling_factor x this limit (backstop: 8.0 % D+1, 7.0 % day_ahead).
 MAPE_THRESHOLD_BY_HORIZON: dict[str, float] = {"day_ahead": 3.5, "d_plus_1": 4.0}
 DEFAULT_MAPE_THRESHOLD = 3.5
 
@@ -65,6 +69,8 @@ class RetrainConfig:
     # error trigger (None = the champion's horizon limit from MAPE_THRESHOLD_BY_HORIZON)
     error_window_days: int = 7
     mape_threshold_pct: float | None = None
+    # above this multiple of the limit the error trigger fires whatever the official forecast did
+    error_ceiling_factor: float = 2.0
     # official-forecast trigger
     official_window_days: int = 30
     official_gap_pct: float = 15.0
@@ -173,13 +179,30 @@ def evaluate_triggers(
     w_err = perf.window(cfg.error_window_days)
     limit = mape_threshold(cfg, champion.horizon.name)
     if w_err is not None and w_err.judged:
+        # Over the limit counts only if the official forecast did no better on the same hours:
+        # a week that is hard for both forecasts is weather, not model decay. Over the ceiling
+        # it counts regardless, so a broken model in a hard week still fires.
+        over = w_err.model_mape > limit
+        over_ceiling = w_err.model_mape > cfg.error_ceiling_factor * limit
+        official_ahead = w_err.official_mape <= w_err.model_mape
+        if not over:
+            case = "under the limit"
+        elif over_ceiling:
+            case = "over twice the limit"
+        elif official_ahead:
+            case = "official as good or better"
+        else:
+            case = "model still ahead"
         checks.append(
             Check(
                 "error",
-                fired=w_err.model_mape > limit,
+                fired=over_ceiling or (over and official_ahead),
                 value=w_err.model_mape,
                 threshold=limit,
-                detail=f"{cfg.error_window_days}d MAPE {w_err.model_mape:.2f}% over {w_err.n_hours}h",
+                detail=(
+                    f"{cfg.error_window_days}d MAPE {w_err.model_mape:.2f}% over {w_err.n_hours}h, "
+                    f"official {w_err.official_mape:.2f}% on the same hours ({case})"
+                ),
             )
         )
     else:

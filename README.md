@@ -215,7 +215,7 @@ Automated retraining here means a disciplined, guarded pipeline — not online l
 
 - **Performance monitoring** — each day, once the real load is published, compute the champion's error and the official forecast's error over the same hours; track both. Every issued forecast is kept. An hour is scored with the latest issue made by its deadline, 12:00 Berlin on the day before for D+1, when the day-ahead auction closes; a later issue is never scored. The share of hours with an on-time forecast is tracked too (§16.9).
 - **Data drift detection** — compare recent data (and features) against the training distribution with **Evidently**. Thresholds are calibrated against historical regime shifts rather than left at library defaults, so ordinary year-to-year variation does not trigger false alarms.
-- **Trigger** — retraining fires when rolling error crosses a threshold, when the official forecast beats the model by too much, or when drift is detected.
+- **Trigger** — retraining fires when rolling error crosses a threshold and the official forecast did no better on the same hours (a week that is hard for both is not decay) or exceeds twice that threshold whatever the official forecast did (a backstop for a broken model), when the official forecast beats the model by too much, or when drift is detected.
 - **Champion / challenger** — a challenger is trained on the latest data and evaluated against the champion on data that arrived *after* the champion's training window (a true out-of-time holdout).
 - **Promotion or rollback** — the challenger is promoted **only if it beats the champion by a minimum margin**; the previous model is retained for one-step rollback. Every decision is logged to MLflow and a monitoring-events table.
 
@@ -464,7 +464,7 @@ So each job now reports a few metrics to **Datadog** when it ends — rows writt
 | Ingest stopped (no run for 3 h) | the external scheduler or its token broke |
 | Actual load data stale (> 6 h) | SMARD stopped publishing, or an ingest step keeps failing |
 | No forecast today (forecast older than 25 h) | the forecast job never ran — reported by the *hourly ingest*, so it works even when the forecast job cannot report anything |
-| 7-day MAPE above the champion's limit (4.0 % for D+1) | the model is degrading (the retrain loop reacts; this tells a human) |
+| Model error trigger fired (7-day MAPE over the champion's limit and the official forecast no better, or over twice the limit) | the model is degrading (the retrain loop reacts; this tells a human) |
 | A job failed | any failure, per job, in the same place as everything else |
 | Drift check unavailable | a drift check that errors but, by design, does not fail the monitor job |
 
@@ -478,7 +478,7 @@ Setup and the exact monitor queries: `docs/observability.md`. Without the `DD_AP
 
 **How it was decided.** Changing the task is a product decision, not something the automatic retraining should do, so the model was first trained in an *evaluate-only* run (`bootstrap` with `horizon=d_plus_1`, `promote` off) and judged on evidence: does it beat honest baselines (cross-validation) and, above all, the official forecast on the same task (one-year backtest)? Its error is naturally higher than v1's (2.88 % vs 2.44 % CV MAPE) because it forecasts further ahead with less information — comparing those two numbers would be comparing a 100 m and a 200 m time. Against the official forecast on the same hours it had 24.6 % lower MAE in a one-year retrospective backtest using measured weather, so it was promoted; rollback was `python -m src.models.registry --promote 1`. Its successor, the current champion, is the same D+1 model refit on its full training window (§16.7): 25.2 % lower MAE in a one-year retrospective backtest using measured weather (§15).
 
-**Consequences.** The retraining error trigger is now per horizon — about 1.4× the cross-validated MAPE: 3.5 % for the rolling model, 4.0 % for D+1 — so the harder task does not cause pointless retrains or alerts (the Datadog monitor follows the same limit).
+**Consequences.** The retraining error trigger is now per horizon — about 1.4× the cross-validated MAPE: 3.5 % for the rolling model, 4.0 % for D+1 — so the harder task does not cause pointless retrains or alerts (the Datadog monitor followed the same limit until §16.10).
 
 **What the backtest taught.** The model's worst day of the year was 4 June 2026 (10 % vs the official 2 %): Corpus Christi, a public holiday in only some German states, which the model deliberately ignores. The official forecast's worst stretch was 7–12 January 2026 (9–10 %), where the model stayed at 2–6 %. Regional holidays are now on the roadmap.
 
@@ -571,6 +571,12 @@ The migration was rehearsed on a Neon branch before it ran on `main`, including 
 | Downgrade → upgrade: `load_forecast_model` rows | 1,187 → 1,163 (24 replaced rows deleted) → 1,163 → `alembic check` clean |
 | On-time share, 7 d / 30 d; hours now late | 86 % / 92 %; 23 late (7 d), 56 late + 3 missing (30 d) |
 | Database size before the upgrade | 76 MB |
+
+### 16.10 A hard week is not decay: the error trigger now checks the official forecast
+
+**The problem.** On 6 November 2026 a cold snap took the D+1 champion's 7-day MAPE to about 3.85 % (Datadog warning at 3.7 %), while the official forecast scored about 5.4 % on the same hours. A fixed limit would keep alerting all winter on weather, not on model decay.
+
+**The fix.** The error trigger now also requires the official forecast to be no worse than the model on the same hours: it fires only when the champion's 7-day MAPE is over its limit and the official forecast's MAPE is at or below the model's. A broken model in a week that is hard for both still fires above twice the limit. Datadog monitor 4 relays `trigger.fired{trigger:error}` instead of repeating the threshold, so the alert and the retrain decision cannot disagree.
 
 
 
