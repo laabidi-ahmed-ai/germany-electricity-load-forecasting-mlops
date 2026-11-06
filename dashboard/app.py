@@ -373,7 +373,9 @@ def panel_monitoring(mon: dict[str, Any], tz: str) -> None:
             st.caption(
                 "The error and official triggers score only the champion's own forecasts, up to "
                 "the time of this pass; the figures above include every version, up to now, so "
-                "they can differ."
+                "they can differ. Above its threshold, the error trigger fires only if the "
+                "official forecast did no better on the same hours, or the error is over twice "
+                "the threshold; the detail column says which case applied."
             )
             checks = check["checks"]
             if not checks.empty:
