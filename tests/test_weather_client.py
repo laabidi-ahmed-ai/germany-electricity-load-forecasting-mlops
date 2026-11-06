@@ -13,7 +13,7 @@ from src.data.weather_client import (
     WeatherClient,
     national_average,
 )
-from tests.conftest import FakeSession, open_meteo_route
+from tests.conftest import FakeSession, open_meteo_route, previous_runs_route
 
 ARCHIVE = "https://archive.test/v1/archive"
 FORECAST_BASE = "https://forecast.test/v1"
@@ -116,3 +116,63 @@ def test_rows_with_all_variables_missing_are_dropped() -> None:
     df = client.fetch_historical("2021-03-27", "2021-03-27")
     assert len(df) == 5 * 2
     assert df["timestamp_utc"].max() == pd.Timestamp("2021-03-27T04:00Z")
+
+
+# --- Previous Runs (archived forecasts; fair backtest only) ---
+PREVIOUS_RUNS = "https://previous-runs.test/v1/forecast"
+
+
+def test_fetch_previous_runs_requests_lagged_variables_and_tags_offsets() -> None:
+    from src.data.weather_client import PREVIOUS_RUN_COLUMNS
+
+    session = FakeSession(routes={PREVIOUS_RUNS: previous_runs_route})
+    client = WeatherClient(session=session, cities=TWO_CITIES, previous_runs_url=PREVIOUS_RUNS)
+    df = client.fetch_previous_runs(
+        pd.Timestamp("2025-11-01T07:00Z"), pd.Timestamp("2025-11-02T22:00Z"), offsets=(1, 2)
+    )
+
+    assert list(df.columns) == PREVIOUS_RUN_COLUMNS
+    assert len(df) == 48 * 2 * 2  # hours x cities x offsets
+    assert str(df["timestamp_utc"].dt.tz) == "UTC"
+    for (offset, city), rows in df.groupby(["offset_days", "city"]):
+        lat = next(c.latitude for c in TWO_CITIES if c.name == city)
+        assert (rows[list(WEATHER_VARS)] == 100.0 * offset + lat / 100).all().all()
+
+    # One request per city: whole UTC dates, UTC clock, every variable at each offset, and
+    # no model / relative-window parameters (same default model mix as the live forecast).
+    assert len(session.calls) == 2
+    for url, params in session.calls:
+        assert url == PREVIOUS_RUNS
+        assert params["start_date"] == "2025-11-01" and params["end_date"] == "2025-11-02"
+        assert params["timezone"] == "UTC"
+        assert params["hourly"].split(",") == [
+            f"{v}_previous_day{n}" for n in (1, 2) for v in WEATHER_VARS
+        ]
+        assert not {"models", "past_days", "forecast_days"} & set(params)
+
+
+def test_fetch_previous_runs_leaves_out_hours_without_values() -> None:
+    def route(url, params):
+        payload = previous_runs_route(url, params)
+        for name in payload["hourly"]:
+            if name.endswith("_previous_day2"):
+                payload["hourly"][name][:3] = [None, None, None]
+        del payload["hourly"]["cloud_cover_previous_day1"]  # a series left out entirely
+        return payload
+
+    session = FakeSession(routes={PREVIOUS_RUNS: route})
+    client = WeatherClient(session=session, cities=TWO_CITIES[:1], previous_runs_url=PREVIOUS_RUNS)
+    df = client.fetch_previous_runs("2025-11-01", "2025-11-01")
+    assert (df["offset_days"] == 2).sum() == 21
+    day1 = df[df["offset_days"] == 1]
+    assert len(day1) == 24 and day1["cloud_cover"].isna().all()
+
+
+def test_fetch_previous_runs_rejects_bad_ranges() -> None:
+    client = WeatherClient(
+        session=FakeSession(), cities=TWO_CITIES, previous_runs_url=PREVIOUS_RUNS
+    )
+    with pytest.raises(ValueError, match="before start"):
+        client.fetch_previous_runs("2025-11-02", "2025-11-01")
+    with pytest.raises(ValueError, match="offsets"):
+        client.fetch_previous_runs("2025-11-01", "2025-11-01", offsets=(0, 1))

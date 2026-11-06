@@ -10,11 +10,13 @@ code is shared with the dashboard in ``src.monitoring.metrics``.
 ``backtest_vs_official`` covers the time before live history exists: it trains a
 LightGBM on all data strictly before the last ``days`` days, predicts that window with
 day-ahead features and scores it against the official forecast on the same hours. It
-never uses the champion itself, which has seen those hours.
+never uses the champion itself, which has seen those hours. Its holdout weather is what
+``weather_hourly`` holds - mostly measured (reanalysis); ``--fair-weather`` replays each D+1
+issue with the weather forecast available at the time instead (``src.monitoring.fair_backtest``).
 
 CLI::
 
-    python -m src.monitoring.performance [--as-of ...] [--backtest-days 30]
+    python -m src.monitoring.performance [--as-of ...] [--backtest-days 30 [--fair-weather]]
 """
 
 from __future__ import annotations
@@ -172,6 +174,32 @@ class BacktestReport(HeadToHead):
         )
 
 
+def split_for_backtest(
+    frame: pd.DataFrame, days: int, as_of: pd.Timestamp | None = None
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """``(train, holdout)``: every row up to ``as_of - days``, then the ``days`` after it.
+
+    ``as_of`` defaults to the frame's last hour. Raises when there is less than a year to
+    train on or nothing to score.
+    """
+    from src.models.evaluate import DEFAULT_MIN_TRAIN_HOURS
+
+    as_of = db.to_utc(as_of) if as_of is not None else frame.index.max()
+    holdout_start = as_of - pd.Timedelta(days=days)
+    train = frame[frame.index <= holdout_start]
+    holdout = frame[(frame.index > holdout_start) & (frame.index <= as_of)]
+    if len(train) < DEFAULT_MIN_TRAIN_HOURS or holdout.empty:
+        raise ValueError("not enough data for a backtest (need >= 1 year of training rows)")
+    return train, holdout
+
+
+def read_official(engine: Engine, start: pd.Timestamp, end: pd.Timestamp) -> pd.Series:
+    """The official (SMARD) day-ahead forecast for ``[start, end]``, indexed by hour."""
+    return db.read_table(
+        engine, db.LoadForecastOfficial, start=start, end=end, source=SOURCE_SMARD
+    ).set_index("timestamp_utc")["forecast_mw"]
+
+
 def backtest_vs_official(
     engine: Engine,
     *,
@@ -182,27 +210,15 @@ def backtest_vs_official(
     horizon: Horizon = DAY_AHEAD,
 ) -> BacktestReport:
     """Train once before the window, forecast it with ``horizon``-valid features, compare."""
-    from src.models.evaluate import DEFAULT_MIN_TRAIN_HOURS
     from src.models.train import fit_model
 
     frame = frame if frame is not None else build_features(engine, output=None)
-    as_of = db.to_utc(as_of) if as_of is not None else frame.index.max()
-    holdout_start = as_of - pd.Timedelta(days=days)
-    train = frame[frame.index <= holdout_start]
-    holdout = frame[(frame.index > holdout_start) & (frame.index <= as_of)]
-    if len(train) < DEFAULT_MIN_TRAIN_HOURS or holdout.empty:
-        raise ValueError("not enough data for a backtest (need >= 1 year of training rows)")
+    train, holdout = split_for_backtest(frame, days, as_of)
 
     model, cols = fit_model(train, horizon, params)
     pred = pd.Series(model.predict(holdout[cols]), index=holdout.index, name="model_mw")
 
-    official = db.read_table(
-        engine,
-        db.LoadForecastOfficial,
-        start=holdout.index.min(),
-        end=holdout.index.max(),
-        source=SOURCE_SMARD,
-    ).set_index("timestamp_utc")["forecast_mw"]
+    official = read_official(engine, holdout.index.min(), holdout.index.max())
     aligned = pd.DataFrame({"actual_mw": holdout[TARGET], "model_mw": pred}).join(
         official.rename("official_mw"), how="inner"
     )
@@ -244,10 +260,21 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--as-of", default=None)
     p.add_argument("--model-version", default=None)
     p.add_argument("--backtest-days", type=int, default=0, help="also run an OOS backtest")
+    p.add_argument(
+        "--fair-weather",
+        action="store_true",
+        help="backtest with the weather forecast available at each D+1 issue (Open-Meteo "
+        "Previous Runs), next to measured weather on the same hours (src.monitoring.fair_backtest)",
+    )
     # The production champion's horizon, like src.models.train.
     p.add_argument("--horizon", choices=sorted(HORIZONS), default=D_PLUS_1.name)
     p.add_argument("--database-url", default=None)
     args = p.parse_args(argv)
+    horizon = HORIZONS[args.horizon]
+    if args.fair_weather and not args.backtest_days:
+        p.error("--fair-weather needs --backtest-days")
+    if args.fair_weather and not horizon.calendar_day:
+        p.error(f"--fair-weather replays the D+1 issue; horizon {horizon.name} has none")
 
     engine = db.get_engine(args.database_url)
     report = compute_report(
@@ -256,12 +283,27 @@ def main(argv: list[str] | None = None) -> int:
         model_version=args.model_version,
     )
     print(report.summary())
-    if args.backtest_days:
+    if args.fair_weather:
+        from src.monitoring.fair_backtest import fair_backtest_vs_official
+
+        print()
+        fair = fair_backtest_vs_official(
+            engine,
+            days=args.backtest_days,
+            as_of=pd.Timestamp(args.as_of) if args.as_of else None,
+            horizon=horizon,
+            progress=lambda line: print(line, flush=True),
+        )
+        print()
+        print(fair.summary())
+        print("\nPer month (MAE, MW; Berlin target months):")
+        print(fair.monthly().to_string(index=False, float_format=lambda v: f"{v:,.0f}"))
+    elif args.backtest_days:
         bt = backtest_vs_official(
             engine,
             days=args.backtest_days,
             as_of=pd.Timestamp(args.as_of) if args.as_of else None,
-            horizon=HORIZONS[args.horizon],
+            horizon=horizon,
         )
         print()
         print(bt.summary())

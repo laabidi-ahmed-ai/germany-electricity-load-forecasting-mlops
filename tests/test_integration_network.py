@@ -12,7 +12,7 @@ import pytest
 
 from src.data.smard_client import SmardClient
 from src.data.validation import validate_load, validate_weather
-from src.data.weather_client import GERMAN_CITIES, WeatherClient
+from src.data.weather_client import GERMAN_CITIES, WEATHER_VARS, WeatherClient
 
 pytestmark = pytest.mark.integration
 
@@ -43,3 +43,13 @@ def test_open_meteo_forecast_one_city() -> None:
     df = client.fetch_forecast(past_days=1, forecast_days=2)
     validate_weather(df, min_rows=48)
     assert df["timestamp_utc"].max() > pd.Timestamp.now(tz="UTC")
+
+
+def test_open_meteo_previous_runs_one_day_one_city() -> None:
+    """The fair backtest's archived forecasts: day1 and day2 of all five variables."""
+    client = WeatherClient(cities=GERMAN_CITIES[:1])
+    df = client.fetch_previous_runs("2025-11-03", "2025-11-03")
+    assert sorted(df["offset_days"].unique()) == [1, 2]
+    assert len(df) == 24 * 2
+    assert df[list(WEATHER_VARS)].notna().all().all()
+    assert df["temperature_2m"].between(-30, 40).all()

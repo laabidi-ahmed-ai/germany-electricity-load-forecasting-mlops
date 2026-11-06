@@ -89,6 +89,12 @@ def test_bootstrap_can_evaluate_a_horizon_without_touching_production() -> None:
     assert '--horizon "${{ inputs.horizon }}"' in train_step["run"]
     backtest = next(s for n, s in by_name.items() if n.startswith("Out-of-sample backtest"))
     assert "!inputs.promote" in backtest["if"] and "--horizon" in backtest["run"]
+    # the champion's horizon gets the fair backtest (issue-time weather, src.monitoring.fair_backtest)
+    assert (
+        'if [ "${{ inputs.horizon }}" = "d_plus_1" ]; then FLAGS="--fair-weather"; fi'
+        in backtest["run"]
+    )
+    assert backtest["run"].rstrip().endswith("$FLAGS")
     for prefix in ("Register", "First forecast", "Monitoring check"):
         step = next(s for n, s in by_name.items() if n.startswith(prefix))
         assert "inputs.promote" in step["if"] and "!inputs.promote" not in step["if"]
