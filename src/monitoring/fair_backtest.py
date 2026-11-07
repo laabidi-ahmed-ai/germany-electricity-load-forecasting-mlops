@@ -12,8 +12,10 @@ of hours, three ways:
   archive cannot replay it;
 * ``day2`` (sensitivity) - the forecast made two days ahead for every hour, which needs no
   assumption about publication delays;
-* ``measured`` - measured (reanalysis) weather, as ``backtest_vs_official`` uses, scored on
-  the same hours as the other two.
+* ``measured`` - the stored weather (``weather_hourly``), as ``backtest_vs_official`` uses,
+  scored on the same hours as the other two. That is reanalysis except for about the last
+  week before the run: the archive lags (ingest re-reads 7 days of it), so those hours still
+  hold short-lead forecasts.
 
 The issue. The live D+1 job is triggered at 05:40 UTC on the day before the Berlin target day
 (``ISSUE_TIME_UTC``; real issues land a minute or two later, so this is the stricter bound).
@@ -38,11 +40,13 @@ exact live run, but it is archived only from 2 April 2026, so it cannot cover a 
 No leakage. The model is trained once, exactly as in ``backtest_vs_official``, on rows up to
 ``as_of - days`` with their archive weather (what the live model trains on). A target day is
 scored only if the last training hour could have been published by its issue
-(``issue - ACTUALS_PUBLISHED_LAG >= train_end``), so the model has seen nothing the live job
-could not have known at any issue it is scored on. Only the holdout's five weather columns are
-replaced; its load
-lags (>= 48 h for D+1) and calendar features are already known at the issue. The same cities,
-variables and national averaging as live are used (``src.data.weather_client``).
+(``issue - ACTUALS_PUBLISHED_LAG >= train_end``), so the model has no load information from
+after any issue it is scored on. Its last few training days do carry archive weather that the
+live job would still have held as forecasts (the archive lags by days): about 5 of some 1,700
+training days, and none of it about a scored hour. Only the holdout's five weather columns are
+replaced; its load lags (>= 48 h for D+1) and calendar features are already known at the
+issue. The same cities, variables and national averaging as live are used
+(``src.data.weather_client``).
 
 Uncertainty. Hourly errors are not independent: every hour of a target day shares one issue
 and one weather run, and weather-forecast errors come in regimes that last several days. The

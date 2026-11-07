@@ -271,10 +271,11 @@ def test_every_holdout_weather_value_was_issued_before_its_forecasts_issue_time(
         assert (hours[f"offset_{mode}"] >= 1).all()
     assert set(hours[f"offset_{fb.NEWEST}"]) == {1, 2} and set(hours[f"offset_{fb.DAY2}"]) == {2}
 
-    # The rest of each feature row: its newest load value is older than the issue too.
+    # The rest of each feature row: its newest load value was published by the issue too.
     lags = [most_recent_load_lag(c) for c in select_features(frame.columns, D_PLUS_1)]
     newest_lag = pd.Timedelta(hours=min(lag for lag in lags if lag is not None))
-    assert (hours.index - newest_lag < hours["issue_time"]).all()
+    published = hours.index - newest_lag + fb.ACTUALS_PUBLISHED_LAG
+    assert (published <= hours["issue_time"]).all()
 
     # Trained once, on the archive weather; the last training hour was public by every scored
     # issue, and the target day before the first scored one (21 Jan) was dropped.
@@ -364,12 +365,15 @@ def test_only_a_calendar_day_horizon_has_an_issue_to_replay(engine) -> None:
 
 
 # --- CLI ---
-def test_cli_runs_the_fair_backtest_with_read_only_rights(engine, monkeypatch, capsys) -> None:
+def test_cli_runs_the_fair_backtest_with_read_only_rights(
+    engine, monkeypatch, capsys, request
+) -> None:
     seed(engine)
     uri = Path(engine.url.database).resolve().as_uri() + "?mode=ro"
     read_only = sqlalchemy.create_engine(
         "sqlite://", creator=lambda: sqlite3.connect(uri, uri=True)
     )
+    request.addfinalizer(read_only.dispose)  # release the file before tmp_path is cleaned up
     with (
         pytest.raises(sqlalchemy.exc.OperationalError, match="readonly"),
         read_only.begin() as conn,

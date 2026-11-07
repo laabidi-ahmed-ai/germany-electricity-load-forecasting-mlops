@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+from datetime import timedelta
 
 import pytest
 import yaml
@@ -180,6 +181,17 @@ def test_schedule_order_ingest_then_forecast_then_monitor() -> None:
     # the daily jobs run after that hour's ingest, and the monitor after the forecast
     assert int(ingest[0]) < int(forecast[0])
     assert (int(forecast[1]), int(forecast[0])) < (int(monitor[1]), int(monitor[0]))
+
+
+def test_the_fair_backtest_issue_is_not_later_than_the_forecast_schedule() -> None:
+    """The fair backtest replays each D+1 issue at ISSUE_TIME_UTC. If the forecast moved
+    earlier without it, the replay would read weather forecasts the live job did not have."""
+    from src.monitoring.fair_backtest import ISSUE_TIME_UTC
+
+    minute, hour, *rest = load("forecast.yml")["on"]["schedule"][0]["cron"].split()
+    assert rest == ["*", "*", "*"]  # daily
+    scheduled = timedelta(hours=int(hour), minutes=int(minute))
+    assert scheduled >= ISSUE_TIME_UTC
 
 
 def test_daily_jobs_run_once_per_day_and_monitor_follows_the_forecast() -> None:
