@@ -5,8 +5,10 @@
 # Re-running is safe: every step is idempotent (upserts) or creates a new model version.
 #
 # Evaluate a horizon without touching production: skip_backfill, pick the horizon (default
-# d_plus_1, the champion's), promote=false -> CV report + a 365-day backtest vs the official
-# forecast in the log and MLflow, nothing registered. Switch to it: the same with
+# d_plus_1, the champion's), promote=false -> CV report (log + MLflow) and a 365-day backtest
+# vs the official forecast (log), nothing registered. For d_plus_1 the backtest is the fair
+# one: each issue replayed with the weather forecast available at the time (Open-Meteo
+# Previous Runs), next to measured weather on the same hours. Switch to it: the same with
 # promote=true (docs/operations.md).
 name: bootstrap
 
@@ -72,9 +74,14 @@ jobs:
         if: ${{ !inputs.skip_training }}
         run: python -m src.models.train --horizon "${{ inputs.horizon }}"
 
+      # d_plus_1: the fair backtest. The measured-weather row is printed before the archived
+      # forecasts are fetched, so an Open-Meteo outage still leaves it in the log (step red).
       - name: Out-of-sample backtest vs the official forecast (last 365 days)
         if: ${{ !inputs.skip_training && !inputs.promote }}
-        run: python -m src.monitoring.performance --backtest-days 365 --horizon "${{ inputs.horizon }}"
+        run: |
+          FLAGS=""
+          if [ "${{ inputs.horizon }}" = "d_plus_1" ]; then FLAGS="--fair-weather"; fi
+          python -m src.monitoring.performance --backtest-days 365 --horizon "${{ inputs.horizon }}" $FLAGS
 
       - name: Register + promote champion (exported to the database)
         if: ${{ !inputs.skip_training && inputs.promote }}

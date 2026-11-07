@@ -79,8 +79,8 @@ Any service that can send a scheduled HTTP POST works; these steps use
 - **Evaluate the calendar-day (D+1) forecast without touching production.** Actions →
   *bootstrap* → *Run workflow* → tick **skip_backfill**, horizon **d_plus_1**, untick
   **promote**. The log shows the cross-validation report (LightGBM vs the 48 h and 168 h
-  baselines) and a 365-day backtest against the official forecast; the run is in MLflow,
-  nothing is registered or forecast.
+  baselines) and the one-year fair backtest against the official forecast (*Run the fair
+  backtest*, below); the run is in MLflow, nothing is registered or forecast.
 - **Switch production to D+1** (after a good evaluation): the same with **promote** ticked.
   It trains, registers and promotes the D+1 champion and issues its first forecast; from
   then on the daily jobs, monitoring and retraining follow the champion's horizon. Roll
@@ -94,10 +94,18 @@ Any service that can send a scheduled HTTP POST works; these steps use
      from `main` (A), then immediately from the branch (B, *Use workflow from*), so both see
      the same data. Avoid roughly 05:30–07:00 and 08:30 UTC: both workflows share the
      `promotion` queue with monitor-retrain, and a newer queued run cancels a waiting one.
-  3. Compare B with A: CV mean MAE, the paired folds (same validation windows, how many B
-     wins), the both-baselines verdict, and the backtest's gain over the official forecast.
+  3. Compare B with A on:
+     - the CV mean MAE;
+     - the paired folds (same validation windows, how many B wins);
+     - the both-baselines verdict;
+     - the fair backtest's **headline row** (issue-time weather: MAE, gain over the official
+       forecast, CI). The measured-weather row is not the comparison.
+
      `best_iteration` (MLflow) should match if the data was the same; the official
-     forecast's backtest MAE must be identical.
+     forecast's backtest MAE must be identical. If a run's backtest step is red with
+     "Previous Runs weather fetch failed: giving up on …", Open-Meteo was down, and the model
+     code is not at fault. Run A and B again later, back to back, so that they see the same
+     data. Other fetch errors are not outages (*Run the fair backtest*, below).
   4. Merge only if B holds. Then promote: *bootstrap* from `main` with **skip_backfill** and
      **promote** ticked (the promoting run skips the backtest).
   5. Record the numbers in README §16, including the backtest: it is only in the Actions log,
@@ -127,6 +135,81 @@ Any service that can send a scheduled HTTP POST works; these steps use
   activity for 60 days; push at least once every two months.
 - **Renew the scheduler token** before it expires (step 1 above, then update the
   `Authorization` header in both cron jobs).
+
+## Run the fair backtest (D+1)
+
+The one-year backtest behind README §15:
+- the model is trained once, on data up to a year before the latest actual;
+- each D+1 issue of the following year is replayed with the weather forecast that existed at
+  05:40 UTC on the day before (Open-Meteo Previous Runs);
+- the same model is also scored with measured weather, on the same hours.
+
+Why and how: README §16.11. It only reads the database: nothing is registered, forecast or
+written.
+
+**The production number.** Push the branch with the code to evaluate, then Actions →
+*bootstrap* → *Run workflow*:
+- *Use workflow from*: that branch (or `main`);
+- **skip_backfill** ticked, **skip_training** unticked, horizon **d_plus_1**, **promote**
+  unticked.
+
+Avoid roughly 05:30–07:00 and 08:30 UTC (the `promotion` queue, above). The run also logs a
+training run to MLflow, so the `--promote-latest` warning above applies.
+
+In the log of the step *Out-of-sample backtest vs the official forecast*, keep:
+1. the line `Measured-weather backtest (...)`, which is printed before anything is fetched;
+2. the `Fair backtest:` block, down to the `autocorrelation` line;
+3. the `Per month` table.
+
+Check:
+- The official MAE is the same in all three rows: they score the same hours.
+- The summary says `0 dropped for missing archived forecasts`, or a handful (above 1 % the
+  log warns).
+- There are 364 or 365 target days, depending on the hour of the latest actual. There are 365
+  when it is stamped between 23:00 and 03:00 UTC (22:00 and 03:00 in summer) and 364
+  otherwise; run #7, with the latest actual at 21:00 UTC, gave 364.
+- The verdict line says `clearly beats`, `does not clearly beat` or `clearly loses to` the
+  official forecast. `too few blocks for a reliable interval` means fewer than 10 weeks were
+  scored, and there is no verdict.
+
+Record the numbers in README §15 and §16.11 with the run's URL: they are only in the Actions
+log, and those logs expire.
+
+**The backtest step is red with "Previous Runs weather fetch failed".** The measured-weather
+line above the error was already scored. What follows the colon says which case it is:
+- **`giving up on … after 4 attempts`** (HTTP 5xx, 408/429, timeouts, connection errors,
+  bodies that are not JSON): Open-Meteo is down, as with the 503s of 2 Nov 2026 (README
+  §16.2). The model code is not at fault. Re-run the bootstrap later.
+- **`… returned HTTP 400`** (or another final 4xx), or a bare field name such as `'hourly'`
+  (a missing field): this is not an outage. Either the window starts before the archive
+  (best_match is kept from January 2024), or the API changed. Re-running will not help: check
+  `--backtest-days` / `--as-of`, then `WeatherClient.fetch_previous_runs`.
+
+**Locally** (PowerShell; the connection string lives only in this session):
+
+```powershell
+$env:DATABASE_URL = "<connection string>"
+.venv\Scripts\python -m src.monitoring.performance --backtest-days 365 --horizon d_plus_1 --fair-weather
+Remove-Item Env:DATABASE_URL
+```
+
+Without `DATABASE_URL` it runs on the local SQLite file (`make data` brings it up to date).
+It needs no ENTSO-E token (the official forecast comes from SMARD). It trains one model and
+sends five requests to Open-Meteo.
+
+**Which database role.** The command only reads `load_actual`, `load_forecast_official`,
+`load_forecast_model` and `weather_hourly`.
+- Verified, by the offline tests: it runs against a SQLite file opened read-only. It never
+  calls `init_db`, so there is no schema-version check and no read of `alembic_version_app`.
+- Not verified: the grants in production. `docs/cloud-setup.md` gives `dashboard_ro`
+  `SELECT` on all tables plus default privileges, so its connection string should work. A
+  permission error means a missing grant: use the owner connection string instead.
+
+**If the forecast trigger moves.** `ISSUE_TIME_UTC` in `src/monitoring/fair_backtest.py`
+(05:40 UTC) mirrors the external scheduler's `forecast` job. If that job ever moves earlier
+than 05:40 UTC, move the constant with it. Otherwise the replay would use weather forecasts
+that the live job did not have yet. A later trigger is safe, because the replay is then
+stricter than live.
 
 ## Schema migrations
 

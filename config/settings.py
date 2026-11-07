@@ -46,6 +46,10 @@ class Settings(BaseSettings):
         default="https://archive-api.open-meteo.com/v1/archive",
         description="Open-Meteo historical archive endpoint.",
     )
+    open_meteo_previous_runs_url: str = Field(
+        default="https://previous-runs-api.open-meteo.com/v1/forecast",
+        description="Open-Meteo Previous Runs endpoint (archived forecasts; fair backtest only).",
+    )
     smard_base_url: str = Field(
         default="https://www.smard.de/app/chart_data",
         description="SMARD (Bundesnetzagentur) chart-data endpoint (no key required).",

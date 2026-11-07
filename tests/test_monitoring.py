@@ -333,6 +333,58 @@ def test_performance_cli_defaults_to_the_champion_horizon(monkeypatch) -> None:
     assert seen["horizon"] == "d_plus_1"
 
 
+def test_performance_cli_fair_weather_runs_the_fair_backtest(monkeypatch, capsys) -> None:
+    """Stubbed like the test above: --fair-weather replaces the measured-only backtest."""
+    from src.monitoring import fair_backtest
+
+    seen = {}
+
+    class _Stub:
+        def summary(self) -> str:
+            return "fair summary"
+
+        def monthly(self) -> pd.DataFrame:
+            return pd.DataFrame({"month": ["2026-01"], "hours": [744]})
+
+    def fake_fair(engine, *, days, horizon, progress, **kwargs):
+        seen.update(days=days, horizon=horizon.name)
+        progress("measured row")
+        return _Stub()
+
+    def not_this_one(*args, **kwargs):
+        raise AssertionError("--fair-weather must not run the measured-only backtest")
+
+    monkeypatch.setattr(perf.db, "get_engine", lambda url=None: None)
+
+    class _Live:
+        def summary(self) -> str:
+            return "live report"
+
+    monkeypatch.setattr(perf, "compute_report", lambda *a, **k: _Live())
+    monkeypatch.setattr(perf, "backtest_vs_official", not_this_one)
+    monkeypatch.setattr(fair_backtest, "fair_backtest_vs_official", fake_fair)
+    assert perf.main(["--backtest-days", "365", "--fair-weather"]) == 0
+    assert seen == {"days": 365, "horizon": "d_plus_1"}
+    out = capsys.readouterr().out
+    order = [out.index(s) for s in ("live report", "measured row", "fair summary", "Per month")]
+    assert order == sorted(order)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [["--fair-weather"], ["--fair-weather", "--backtest-days", "7", "--horizon", "day_ahead"]],
+)
+def test_performance_cli_refuses_fair_weather_without_a_d_plus_1_backtest(
+    argv, monkeypatch
+) -> None:
+    def no_database(url=None):
+        raise AssertionError("arguments are checked before any database is opened")
+
+    monkeypatch.setattr(perf.db, "get_engine", no_database)
+    with pytest.raises(SystemExit):
+        perf.main(argv)
+
+
 # --- Drift ---
 def test_drift_columns_exclude_calendar_and_nowcast_features() -> None:
     frame = feature_frame(

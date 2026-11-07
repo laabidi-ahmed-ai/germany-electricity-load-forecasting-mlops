@@ -6,17 +6,27 @@
 
 ## Headline result
 
-In a one-year retrospective backtest (2 Nov 2025 – 2 Nov 2026, 8,760 hours; trained once before the window, never retrained), the D+1 model had **25.2 % lower MAE than the official grid-operator day-ahead forecast** on the same target days: 1,515 MW vs 2,025 MW.
+In a one-year backtest that replays every D+1 forecast with the weather forecast available when it was issued (target days 8 Nov 2025 – 6 Nov 2026; trained once before the window, never retrained), the D+1 model had **22.0 % lower MAE than the official grid-operator day-ahead forecast** on the same hours, with a 95 % confidence interval of +15.9 to +27.8 %: 1,590 MW vs 2,039 MW. With measured weather on the same hours, the gain would be 24.5 % (+18.4 to +30.2 %).
 
 ```mermaid
 xychart-beta
     title "One-year backtest, same D+1 hours: MAE in MW (lower is better)"
-    x-axis ["Official TSO day-ahead forecast", "LightGBM (D+1)"]
+    x-axis ["Official TSO day-ahead", "LightGBM, weather forecast at issue", "LightGBM, measured weather"]
     y-axis "MAE (MW)" 0 --> 2500
-    bar [2025, 1515]
+    bar [2039, 1590, 1540]
 ```
 
-**Main limitation:** the backtest used *measured* weather for the past year, whereas a real forecast — ours live, and the official one — can only use weather *forecasts*. The live gap is therefore expected to be smaller; the live record on the dashboard is the final judge. Cross-validation against baselines and the full numbers: §15.
+**How to read it.** For this once-trained model, the two numbers bracket the effect of the weather information over the year:
+- The replayed weather forecasts are about a day older than the ones the live job reads, so 22.0 % is the lower bound.
+- Measured weather is information no real forecast has, so 24.5 % is the upper bound.
+
+The live forecast also differs by retraining: its champion is retrained when it decays.
+
+**Main limitations:**
+- It is one window, scored with one model trained a year before its end. In its last week (1–6 Nov 2026, a cold snap), that model lost to the official forecast when given the replayed weather.
+- The official forecast is scored at its latest stored value, not as published.
+
+The live record on the dashboard is the final judge. Method: §16.11. Cross-validation against baselines and the full numbers: §15.
 
 ---
 
@@ -201,7 +211,7 @@ Day-ahead load forecasting is a **supervised** problem. The model progresses fro
 1. **Naive baselines** — "same hour 2 days ago" and "same hour last week" (seasonal naive) for the D+1 champion. These set the bar every other model must beat. ("Same hour yesterday", used for the first champion, leaks for D+1 — §16.5.)
 2. **Gradient boosting** — **LightGBM** on lag, calendar, and weather features. This is a genuinely strong baseline for load forecasting.
 
-**Horizon-aware features.** For an honest day-ahead forecast, a feature may only use information available at forecast-issue time. The model therefore uses load lags at or beyond its horizon's cutoff — 48 h and longer for the D+1 champion (`load_lag_24` is dropped), 24 h and longer for the first champion (v1) — plus calendar features, and weather (available as a forecast), and deliberately excludes features that depend on the most recent, still-unobserved hours — which keeps the *load information* on par with the official day-ahead forecast. One caveat: the batch job forecasts the 24 hours after the latest published actual (lead times of 1–24 h, with a same-morning weather forecast), whereas the official forecast is issued the previous day for the whole calendar day (roughly 12–36 h ahead); the comparison is therefore favourable to the model on lead time and weather freshness. **That caveat applied to the first champion; the task mismatch is now removed:** since November 2026 the champion uses the calendar-day horizon `d_plus_1` — every morning it forecasts all of tomorrow, 00:00–24:00 Berlin time, the same task (same target day) as the official forecast. The weather information is still not equal: the one-year backtest uses measured weather rather than the forecasts available at issue time (§15), and live, the two forecasts are not built from the same weather forecast. Tomorrow's hours are 19–43 h after the latest actual, so its information cutoff is 48 h: it keeps `load_lag_48` and `load_lag_168` but drops `load_lag_24`, and it is compared with honest baselines ("same hour 2 days ago", "same hour last week"). See §16.5 for the evaluation and the decision.
+**Horizon-aware features.** For an honest day-ahead forecast, a feature may only use information available at forecast-issue time. The model therefore uses load lags at or beyond its horizon's cutoff — 48 h and longer for the D+1 champion (`load_lag_24` is dropped), 24 h and longer for the first champion (v1) — plus calendar features, and weather (available as a forecast), and deliberately excludes features that depend on the most recent, still-unobserved hours — which keeps the *load information* on par with the official day-ahead forecast. One caveat: the batch job forecasts the 24 hours after the latest published actual (lead times of 1–24 h, with a same-morning weather forecast), whereas the official forecast is issued the previous day for the whole calendar day (roughly 12–36 h ahead); the comparison is therefore favourable to the model on lead time and weather freshness. **That caveat applied to the first champion; the task mismatch is now removed:** since November 2026 the champion uses the calendar-day horizon `d_plus_1` — every morning it forecasts all of tomorrow, 00:00–24:00 Berlin time, the same task (same target day) as the official forecast. The weather information is still not equal: live, the two forecasts are not built from the same weather forecast, and the one-year backtest replays the weather forecasts available at each issue, which are about a day older than the ones the live job reads (§16.11). Tomorrow's hours are 19–43 h after the latest actual, so its information cutoff is 48 h: it keeps `load_lag_48` and `load_lag_168` but drops `load_lag_24`, and it is compared with honest baselines ("same hour 2 days ago", "same hour last week"). See §16.5 for the evaluation and the decision.
 
 **Validation.** Strict **time-series cross-validation** (expanding window) — never random splits, which would leak the future into the past. Early stopping is done on a chronological tail of the training data (the last 10 %), never on the evaluation fold. The tail only picks the number of trees: the model is then refit on every training row with that number, so the most recent months are in the model. CV folds, the backtest, the challenger and the final model all use this same procedure, so the reported numbers describe how the deployed model is trained.
 
@@ -276,7 +286,7 @@ germany-electricity-load-forecasting-mlops/
 │   ├── features/                  # build_features, horizons (leakage-safe, horizon-aware)
 │   ├── models/                    # baselines, train, evaluate, registry, tracking
 │   ├── serving/                   # api (FastAPI), forecast, batch_forecast
-│   ├── monitoring/                # drift, performance, retrain
+│   ├── monitoring/                # drift, performance, fair_backtest, retrain
 │   └── observability.py           # optional job metrics -> Datadog
 ├── dashboard/
 │   ├── app.py                     # Streamlit dashboard
@@ -365,16 +375,32 @@ The champion is **v3**: the D+1 LightGBM refit on its full training window after
 | Seasonal naive (same hour, 168 h ago) | 2,827 | 5.33 |
 | **LightGBM (D+1)** | **1,496** | **2.84** |
 
-One-year out-of-sample backtest against the official forecast, with the champion's training code (trained on data up to 2 Nov 2025, never retrained, then scored on every hour from 2 Nov 2025 to 2 Nov 2026 — 8,760 hours; recorded from evaluation run B, §16.7):
+One-year out-of-sample backtest against the official forecast, the *fair backtest* of §16.11:
+- **Training:** once, with the champion's training code, on data up to 6 Nov 2025 21:00 UTC; never retrained.
+- **Scoring:** every D+1 issue of the following year is replayed at 05:40 UTC on the day before its target day. That covers target days 8 Nov 2025 – 6 Nov 2026, 8,735 hours, the same for every row.
+- **Source:** `bootstrap` run #7, 7 Nov 2026.
 
-| | MAE (MW) | MAPE (%) |
-|---|---:|---:|
-| **LightGBM (D+1)** | **1,515** | **2.87** |
-| Official TSO day-ahead forecast | 2,025 | 3.82 |
+| Weather the model was given | MAE (MW) | MAPE (%) | MAE lower than official | 95 % CI | Days won |
+|---|---:|---:|---:|---:|---:|
+| **Weather forecast available at the issue (headline)** | **1,590** | **2.99** | **+22.0 %** | **[+15.9, +27.8] %** | 242 |
+| The same, but the two-day-old forecast for every hour (sensitivity) | 1,592 | 3.00 | +21.9 % | [+15.9, +27.7] % | 238 |
+| Measured weather (reanalysis): the upper bound | 1,540 | 2.92 | +24.5 % | [+18.4, +30.2] % | 254 |
+| Official TSO day-ahead forecast | 2,039 | 3.84 | | | |
+
+*Days won* counts the Berlin target days on which the model's daily MAE was lower than the official forecast's, out of 364.
 
 - LightGBM beats the best baseline by 47.1 % (MAE) and wins on every one of the 12 folds.
-- On the official forecast's task (same target days) it had **25.2 % lower MAE in a one-year retrospective backtest using measured weather**, and a lower daily MAE on **255 of 366 days**. These are UTC days: the window ends at the latest published hour, not at midnight, so its first and last days are partial.
-- Caveat: the backtest uses *measured* weather for the past year, whereas live forecasts (ours and the official one) must use weather *forecasts* — so the live gap is expected to be smaller. The live record (dashboard) is the final judge.
+- **With the weather forecast it really had at the issue, the model clearly beats the official forecast.** Its MAE is 22.0 % lower, and the whole 95 % interval is above zero. The interval comes from a block bootstrap over whole weeks of target days, because errors on neighbouring days are correlated (§16.11).
+- **A bracket, not a single number.** For this once-trained model, the two numbers bracket the effect of the weather information. The replayed forecasts are about a day older than the ones the live job reads, so 22.0 % is the lower bound; 24.5 % with measured weather is the upper bound. The live forecast also differs by retraining, which this bracket does not cover. The bracket holds for the year as a whole, not month by month. In August and October 2026 the model did better with issue-time weather than with measured weather: noise around a small gap.
+- **In its oldest week, the model loses.** On 1–6 Nov 2026 (143 hours) it scored 2,704 MW against the official 2,578 MW. The backtest model is trained once, a year earlier, and never retrained, so these are its oldest forecasts, and they fall in the cold snap of §16.10. The live champion is retrained when it decays; the backtest model is not. The measured-weather column (2,524 MW for 1–6 Nov) is not reanalysis there: `weather_hourly` still holds forecasts for about the last week before the run, because the archive lags (ingest re-reads 7 days of it), so those hours carry short-lead forecasts; that is 143 of 8,735 hours, so the year's figure is hardly affected.
+- **Not directly comparable with the earlier figures** (§16.7, run B: 1,515 vs 2,025 MW, 255 of 366 days won):
+  - The hours differ: the window is four days later, and its first target day, issued before the training data ended, is now left out.
+  - Days won now count Berlin target days, not UTC days.
+- **Limits:**
+  - It is one window.
+  - The official forecast is scored at its latest stored value. Its revisions have been kept only since 4 Nov 2026 (§16.9), so the past year cannot be replayed as the official forecast stood at its deadline.
+
+  The live record (dashboard) is the final judge.
 
 ### First champion (v1): the 24 hours after the latest actual
 
@@ -476,7 +502,7 @@ Setup and the exact monitor queries: `docs/observability.md`. Without the `DD_AP
 
 **What was built (Batch C).** A second horizon, `d_plus_1`: every morning, all of tomorrow 00:00–24:00 Berlin time (23 or 25 hours on clock-change days). Tomorrow's hours are 19–43 h after the latest actual, so `load_lag_24` would be leakage and is dropped; the information cutoff is 48 h, leaving 4–5 h of slack for a late SMARD publication, and the forecast refuses to run if the latest actual is too old to cover the whole day. Serving, retraining, drift monitoring and the backtest all follow the **champion's** horizon. Building it surfaced two details worth knowing: "same hour yesterday" is itself a leaking *baseline* for D+1 (replaced by "same hour 2 days ago"), and computing "tomorrow" as "midnight + 24 h" picks the wrong day on the autumn clock change (fixed with calendar dates, and tested).
 
-**How it was decided.** Changing the task is a product decision, not something the automatic retraining should do, so the model was first trained in an *evaluate-only* run (`bootstrap` with `horizon=d_plus_1`, `promote` off) and judged on evidence: does it beat honest baselines (cross-validation) and, above all, the official forecast on the same task (one-year backtest)? Its error is naturally higher than v1's (2.88 % vs 2.44 % CV MAPE) because it forecasts further ahead with less information — comparing those two numbers would be comparing a 100 m and a 200 m time. Against the official forecast on the same hours it had 24.6 % lower MAE in a one-year retrospective backtest using measured weather, so it was promoted; rollback was `python -m src.models.registry --promote 1`. Its successor, the current champion, is the same D+1 model refit on its full training window (§16.7): 25.2 % lower MAE in a one-year retrospective backtest using measured weather (§15).
+**How it was decided.** Changing the task is a product decision, not something the automatic retraining should do, so the model was first trained in an *evaluate-only* run (`bootstrap` with `horizon=d_plus_1`, `promote` off) and judged on evidence: does it beat honest baselines (cross-validation) and, above all, the official forecast on the same task (one-year backtest)? Its error is naturally higher than v1's (2.88 % vs 2.44 % CV MAPE) because it forecasts further ahead with less information — comparing those two numbers would be comparing a 100 m and a 200 m time. Against the official forecast on the same hours it had 24.6 % lower MAE in a one-year retrospective backtest using measured weather, so it was promoted; rollback was `python -m src.models.registry --promote 1`. Its successor, the current champion, is the same D+1 model refit on its full training window (§16.7): 25.2 % lower MAE in a one-year retrospective backtest using measured weather (§16.7). Both figures are kept here as history: measured weather is information no real forecast has. Replayed with the weather forecast available at each issue, the current champion's training code gives 22.0 % lower MAE (§16.11).
 
 **Consequences.** The retraining error trigger is now per horizon — about 1.4× the cross-validated MAPE: 3.5 % for the rolling model, 4.0 % for D+1 — so the harder task does not cause pointless retrains or alerts (the Datadog monitor followed the same limit until §16.10).
 
@@ -578,7 +604,52 @@ The migration was rehearsed on a Neon branch before it ran on `main`, including 
 
 **The fix.** The error trigger now also requires the official forecast to be no worse than the model on the same hours: it fires only when the champion's 7-day MAPE is over its limit and the official forecast's MAPE is at or below the model's. A broken model in a week that is hard for both still fires above twice the limit. Datadog monitor 4 relays `trigger.fired{trigger:error}` instead of repeating the threshold, so the alert and the retrain decision cannot disagree.
 
+### 16.11 The fair backtest: each issue replayed with the weather it had
 
+**Why.** The one-year backtest behind the earlier headline (25.2 % lower MAE, §16.7) predicted its holdout from `weather_hourly`. There, Open-Meteo's archive replaces forecast values with reanalysis: measured weather. The official forecast, and our live one, only ever have weather *forecasts*. So the backtest gave the model information neither of them had, and the README could only say that the live gap was "expected to be smaller".
+
+**Method** (`src/monitoring/fair_backtest.py`; the evaluate-only `bootstrap` runs it for `d_plus_1`):
+- **The issue.** The backtest replays the forecast at 05:40 UTC on the day before the Berlin target day, when the external scheduler starts the forecast job. Real issues land a minute or two later, so this is the stricter bound. All 23, 24 or 25 hours of a target day share it.
+- **The weather.** For every hour t, Open-Meteo's Previous Runs API keeps the value from the newest model run started at or before t − N × 24 h (`<variable>_previous_dayN`; checked against single ICON runs).
+  - **Publication delay.** A run is taken to be public 6 h after it starts. Open-Meteo gives 4–6 h for global models and 1–3 h for regional ones, and the default model mix the live job reads blends both.
+  - **Headline.** `_previous_day1` where it was public by the issue, otherwise `_previous_day2`. In practice that is day1 for only the first hour or two of the target day: 6.6 % of the hours.
+  - **Sensitivity row.** `_previous_day2` for every hour. It needs no assumption about the delay: it holds for any delay under 7 h 40 min.
+  - **Guard and parity.** The code refuses any value that was not public by its issue. Cities, variables, national averaging and model mix are the live job's.
+- **The model.** It is trained once, with the champion's training code, on everything up to a year before the latest actual, with the archive weather the live model also trains on. For the scored hours only the five weather columns are replaced; the load lags (48 h and older) and the calendar features were already known at the issue.
+- **No leakage of load.** A target day is scored only if the last training hour was published by its issue (2 h after its timestamp), so the model has no load information from after any issue it is scored on. Its last few training days do carry archive weather that the live job would still have held as forecasts: about 5 of some 1,700 training days, and none of it about a scored hour.
+- **The same hours for every row.** An hour counts if it has an official forecast (from SMARD, so no ENTSO-E token is needed) and complete archived weather for both variants. The measured-weather row is scored on exactly those hours, with `weather_hourly`: reanalysis, except for about the last week before the run (1–6 Nov 2026), which the lagging archive has not reached and which still holds short-lead forecasts.
+- **Uncertainty.** Hourly errors are not independent: the hours of a target day share one issue and one weather run, and weather-forecast errors come in spells of several days.
+  - **The interval.** The 95 % interval comes from a block bootstrap on the paired hourly errors: non-overlapping blocks of 7 whole target days, 10,000 resamples, seed 0, percentile interval. A week holds each weekday once, and a year still gives 52 blocks.
+  - **Why blocks.** The daily loss difference has a lag-1 autocorrelation of +0.34 (lags 2–6 between −0.01 and +0.07, and +0.10 at 7 days), and 1-day blocks would give the narrower interval [+17.1, +26.6] %.
+  - **Too few blocks.** Below 10 blocks the code gives no verdict.
+- **Outages.** The measured-weather row is printed before the archived forecasts are fetched. If Open-Meteo is down, the step fails, but that row is already in the log.
+
+**Result** (full table: §15).
+- With the weather forecast available at the issue, the model had 22.0 % lower MAE than the official forecast, 95 % CI [+15.9, +27.8] % (448 MW lower, [+308, +600] MW). With measured weather on the same hours it had 24.5 % lower MAE, [+18.4, +30.2] %.
+- Measured weather was worth 2.5 points (50 MW).
+- The two issue-time variants differ by 0.1 points (1,590 vs 1,592 MW), so the result does not depend on the publication-delay assumption.
+
+**What changed in the claim.**
+
+| | Before | Now |
+|---|---|---|
+| Headline | 25.2 % lower MAE, with measured weather, no interval | 22.0 % lower MAE with the weather forecast available at the issue, 95 % CI [+15.9, +27.8] % |
+| What the number is | optimistic: "the live gap is expected to be smaller" | for this once-trained model, the lower bound of the weather information's effect over the year (replayed forecasts about a day older than live's). Measured weather (24.5 %) is the upper bound. Live also differs by retraining |
+| Days won | 255 of 366 UTC days | 242 of 364 Berlin target days (the unit of an issue) |
+
+Three limits remain, each narrower than the old caveat:
+1. **The replayed weather is staler than the live job's.** The live job reads the run of 00 or 03 UTC on the issue day. Previous Runs keeps each hour only at leads just over 24 h and 48 h, so that run cannot be replayed, and the replay reads runs about a day older.
+   - Open-Meteo's Single Runs API serves exact runs, but its archive starts on 2 April 2026.
+   - Once it covers a full year, it can replay the exact run the live job read and measure what this staleness costs. That is not built yet.
+2. **The official forecast as stored, not as published.** It is scored at its latest stored value. Its revisions are kept only since revision `0003` (4 Nov 2026, §16.9), so the past year cannot be replayed as published by its deadline; only the model side is replayed as of the issue.
+3. **One window, one model trained a year before the window ends.**
+   - The bracket holds for the year, not month by month: in August and October 2026 issue-time weather scored better than measured weather, which is noise around a small gap.
+   - In its oldest week, 1–6 Nov 2026, during the cold snap of §16.10, the model with issue-time weather loses: 2,704 MW against 2,578 MW.
+
+**The record.**
+- **Run:** `bootstrap` run #7, evaluate-only (`skip_backfill`, horizon `d_plus_1`, `promote` off), from branch `fair-backtest` at commit `0f16526`, on 7 Nov 2026. The latest actual was 6 Nov 2026 21:00 UTC. https://github.com/laabidi-ahmed-ai/germany-electricity-load-forecasting-mlops/actions/runs/42314970853
+- **Where the numbers live:** only here, because Actions logs expire.
+- **To re-run it:** `docs/operations.md` (*Run the fair backtest*).
 
 ---
 

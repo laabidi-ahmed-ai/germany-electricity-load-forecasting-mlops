@@ -174,6 +174,18 @@ def open_meteo_route(start: str, end: str) -> Callable[[str, dict[str, Any] | No
     return _route
 
 
+def previous_runs_route(url: str, params: dict[str, Any] | None) -> dict:
+    """Fake Previous Runs API: every requested ``<var>_previous_day<N>`` series for the whole
+    UTC dates asked for, valued 100 x N + latitude / 100 so offset and city can be read back."""
+    assert params is not None
+    times = pd.date_range(params["start_date"], f"{params['end_date']}T23:00", freq="h", tz="UTC")
+    hourly: dict[str, list] = {"time": [t.strftime("%Y-%m-%dT%H:%M") for t in times]}
+    for name in params["hourly"].split(","):
+        offset = int(name.rsplit("_previous_day", 1)[1])
+        hourly[name] = [100.0 * offset + float(params["latitude"]) / 100] * len(times)
+    return {"latitude": params["latitude"], "hourly": hourly}
+
+
 # --- Database ---
 @pytest.fixture
 def engine(tmp_path) -> Engine:
