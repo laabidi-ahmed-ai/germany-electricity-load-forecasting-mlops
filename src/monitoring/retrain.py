@@ -13,11 +13,24 @@ Champion / challenger, fair by construction: the holdout is data that arrived af
 the champion's ``train_end`` (capped at ``holdout_days``); with fewer than
 ``min_holdout_hours`` the comparison is skipped, because a champion cannot be
 dethroned on data it was trained on. The candidate is a LightGBM trained on everything
-before the holdout with the same day-ahead features. It is promoted only if its
-holdout MAE is at least ``min_improvement_pct`` lower than the champion's (the
-anti-churn margin), in which case it is refitted on all data, logged with the standard
-CV report, registered and aliased. Rollback:
+before the holdout with the same day-ahead features. Two gates, in this order:
+
+1. the margin: its holdout MAE must be at least ``min_improvement_pct`` lower than the
+   champion's (the anti-churn margin);
+2. the CV gate: the expanding-window CV of the training recipe on all data must beat every
+   seasonal-naive baseline on mean MAE (``CVResult.beats_all_baselines``) - the bar the
+   first champion had to clear.
+
+Failing either keeps the champion (decision ``kept``). Passing both, the recipe is refitted
+on all data, logged with that CV report, registered and aliased. A dry run evaluates both
+gates and stops there: ``promoted (dry-run)`` or ``kept (dry-run)``. Rollback:
 ``python -m src.models.registry --promote <old version>``.
+
+What is evaluated is not exactly what is promoted. The holdout judges a candidate trained
+*before* the holdout; the promoted model is the same recipe refitted on everything, holdout
+included, so the holdout cannot judge it. The CV describes the recipe over the last year,
+not the promoted object either. Neither is an out-of-sample test of the model that serves:
+its first out-of-sample evidence is its own live record, and nothing checks that record yet.
 
 Every decision is logged to MLflow (tags ``stage=retrain``, ``decision``, ``reason``)
 and to the ``monitoring_events`` table.
@@ -282,22 +295,34 @@ class ChallengerOutcome:
     improvement_pct: float | None = None
     training_run_id: str | None = None
     triggers: list[str] = field(default_factory=list)
+    # CV gate: None = the CV did not run (skipped, or the margin already failed)
+    cv_beats_all_baselines: bool | None = None
+    cv_mae: dict[str, float] = field(default_factory=dict)  # mean CV MAE per model (MW)
+
+    @property
+    def cv_gate(self) -> str:
+        """``passed`` | ``failed`` | ``not run``: the MLflow tag and the Datadog gauge."""
+        if self.cv_beats_all_baselines is None:
+            return "not run"
+        return "passed" if self.cv_beats_all_baselines else "failed"
 
     def summary(self) -> str:
         head = f"Champion/challenger: {self.decision.upper()} - {self.reason}"
         if self.champion_mae is None:
             return head
-        return (
-            f"{head}\n  holdout {self.holdout_start:%Y-%m-%d} -> {self.holdout_end:%Y-%m-%d} "
+        lines = [
+            head,
+            f"  holdout {self.holdout_start:%Y-%m-%d} -> {self.holdout_end:%Y-%m-%d} "
             f"({self.holdout_hours}h): champion v{self.champion_version} MAE {self.champion_mae:,.0f} "
             f"({self.champion_mape:.2f}%) vs challenger MAE {self.challenger_mae:,.0f} "
-            f"({self.challenger_mape:.2f}%) -> improvement {self.improvement_pct:+.1f}%"
-            + (
-                f"\n  promoted challenger as v{self.challenger_version}"
-                if self.challenger_version
-                else ""
-            )
-        )
+            f"({self.challenger_mape:.2f}%) -> improvement {self.improvement_pct:+.1f}%",
+        ]
+        if self.cv_mae:
+            maes = ", ".join(f"{m} {v:,.0f}" for m, v in self.cv_mae.items())
+            lines.append(f"  CV mean MAE (MW): {maes} -> CV gate {self.cv_gate}")
+        if self.challenger_version:
+            lines.append(f"  promoted challenger as v{self.challenger_version}")
+        return "\n".join(lines)
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -365,18 +390,14 @@ def run_champion_challenger(
         improvement_pct=improvement,
         triggers=triggers or [],
     )
+    suffix = " (dry-run)" if dry_run else ""  # a dry run's decision never counts as a real one
     if improvement < cfg.min_improvement_pct:
+        outcome.decision = f"kept{suffix}"
         outcome.reason = f"challenger improves MAE by {improvement:+.1f}% < required {cfg.min_improvement_pct}% margin"
         return outcome
+    margin = f"challenger beats champion by {improvement:+.1f}% (>= {cfg.min_improvement_pct}%)"
 
-    outcome.reason = (
-        f"challenger beats champion by {improvement:+.1f}% (>= {cfg.min_improvement_pct}%)"
-    )
-    if dry_run:
-        outcome.decision = "promoted (dry-run)"
-        return outcome
-
-    # Refit the winner on everything, log it exactly like `make train`, register, promote.
+    # The CV gate: the recipe that would be promoted must beat every baseline in the CV.
     cv = evaluate.cross_validate(
         frame,
         {**baseline_factories(horizon), train.MODEL_NAME: train.lightgbm_factory(cfg.lgbm_params)},
@@ -385,6 +406,19 @@ def run_champion_challenger(
         val_hours=cfg.cv_val_hours,
         min_train_hours=cfg.cv_min_train_hours,
     )
+    outcome.cv_mae = {str(m): cv.mean(str(m)) for m in cv.summary.index}
+    outcome.cv_beats_all_baselines = cv.beats_all_baselines()
+    if not outcome.cv_beats_all_baselines:
+        outcome.decision = f"kept{suffix}"
+        outcome.reason = f"{margin}, but its CV does not beat every baseline: {_cv_losses(cv)}"
+        return outcome
+
+    outcome.reason = f"{margin} and its CV beats every baseline"
+    if dry_run:
+        outcome.decision = "promoted (dry-run)"
+        return outcome
+
+    # Refit the winner on everything, log it exactly like `make train`, register, promote.
     final, final_cols = train.fit_model(frame, horizon, cfg.lgbm_params)
     run_id = train.log_training_run(
         final, final_cols, cv, horizon, frame, run_name="retrain_challenger"
@@ -396,6 +430,17 @@ def run_champion_challenger(
     outcome.training_run_id = run_id
     log.info("promoted challenger v%s (rollback: --promote %s)", mv.version, champion.version)
     return outcome
+
+
+def _cv_losses(cv: evaluate.CVResult) -> str:
+    """The baselines the recipe does not beat, with both mean MAEs (for the decision reason)."""
+    model = train.MODEL_NAME
+    if model not in cv.summary.index:  # beats_baselines() is then empty too
+        return f"the challenger's recipe ({model}) was not scored by the CV"
+    lost = [b for b, v in cv.beats_baselines().items() if not v["beats"]]
+    if not lost:  # the recipe was scored, but no baseline was
+        return "no baseline was scored"
+    return "; ".join(f"{model} {cv.mean(model):,.0f} MW vs {b} {cv.mean(b):,.0f} MW" for b in lost)
 
 
 # --- Logging of decisions ---
@@ -429,6 +474,7 @@ def log_decision(
                 "triggered": str(decision.triggered),
                 "decision": outcome.decision if outcome else "check-only",
                 "reason": (reason or "no trigger")[:250],
+                "cv_gate": outcome.cv_gate if outcome else "not run",
             }
         )
         mlflow.log_params({f"cfg_{k}": v for k, v in asdict(cfg).items() if k != "lgbm_params"})
@@ -457,6 +503,9 @@ def log_decision(
                     "promoted": int(outcome.decision.startswith("promoted")),
                 }
             )
+        if outcome is not None and outcome.cv_beats_all_baselines is not None:
+            mlflow.log_metric("cv_beats_all_baselines", int(outcome.cv_beats_all_baselines))
+            mlflow.log_metrics({f"cv_{m}_mae_mean": v for m, v in outcome.cv_mae.items()})
         mlflow.log_dict(decision.to_dict(), "trigger_decision.json")
         if outcome is not None:
             mlflow.log_dict(outcome.to_dict(), "challenger_outcome.json")
@@ -509,7 +558,10 @@ def report_metrics(
     for c in decision.checks:
         metrics.gauge("trigger.fired", int(c.fired), trigger=c.name, model_version=champion)
     metrics.gauge("retrain.ran", int(outcome is not None), model_version=champion)
-    if outcome is not None:  # decision: promoted | promoted (dry-run) | kept | skipped
+    # Sent on every pass as 0 or 1, so a monitor on it recovers on the next pass.
+    cv_failed = outcome is not None and outcome.cv_gate == "failed"
+    metrics.gauge("retrain.cv_gate_failed", int(cv_failed), model_version=champion)
+    if outcome is not None:  # promoted | kept | skipped; promoted and kept may be " (dry-run)"
         decision_tag = outcome.decision.split(" ")[0]
         dry_run = str("dry-run" in outcome.decision).lower()
         metrics.gauge(

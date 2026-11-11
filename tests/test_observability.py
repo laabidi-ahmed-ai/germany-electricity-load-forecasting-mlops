@@ -185,7 +185,7 @@ def test_monitor_metrics_accuracy_drift_triggers_and_decision() -> None:
             SimpleNamespace(name="drift", fired=True),
         ],
     )
-    outcome = SimpleNamespace(decision="promoted (dry-run)")
+    outcome = SimpleNamespace(decision="promoted (dry-run)", cv_gate="passed")
     m, rec = enabled("monitor")
     monitor_metrics(m, decision, outcome)
     m.flush()
@@ -199,8 +199,26 @@ def test_monitor_metrics_accuracy_drift_triggers_and_decision() -> None:
     assert value(got, "trigger.fired", trigger="drift") == 1
     assert value(got, "trigger.fired", trigger="error") == 0
     assert value(got, "retrain.ran") == 1
+    assert value(got, "retrain.cv_gate_failed") == 0
     # a dry-run "promotion" never counts as a real one
     assert value(got, "retrain.promoted", decision="promoted", dry_run="true") == 0
+
+
+def test_monitor_metrics_send_the_cv_gate_on_every_pass() -> None:
+    """0 or 1 on every pass: a gauge sent only when it is 1 would leave a monitor in alert."""
+    decision = SimpleNamespace(champion_version="1", performance=None, drift=None, checks=[])
+    for outcome, expected in [
+        (None, 0),  # a clear pass: no challenger at all
+        (SimpleNamespace(decision="skipped", cv_gate="not run"), 0),
+        (SimpleNamespace(decision="kept", cv_gate="not run"), 0),  # the margin failed first
+        (SimpleNamespace(decision="kept", cv_gate="failed"), 1),
+        (SimpleNamespace(decision="kept (dry-run)", cv_gate="failed"), 1),
+        (SimpleNamespace(decision="promoted", cv_gate="passed"), 0),
+    ]:
+        m, rec = enabled("monitor")
+        monitor_metrics(m, decision, outcome)
+        m.flush()
+        assert value(rec.metrics(), "retrain.cv_gate_failed", model_version="v1") == expected
 
 
 def test_monitor_metrics_flag_a_drift_check_that_could_not_run() -> None:
