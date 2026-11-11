@@ -115,6 +115,30 @@ def test_last_run_helpers_and_happened_today(engine) -> None:
     assert not db.happened_today(None)
 
 
+def test_latest_monitoring_event_matches_kind_and_decision(engine) -> None:
+    def event(as_of: str, kind: str, decision: str | None) -> None:
+        db.insert_monitoring_event(
+            engine, as_of=pd.Timestamp(as_of).to_pydatetime(), kind=kind, decision=decision
+        )
+
+    event("2026-10-05T09:00Z", "retrain", "kept")
+    event("2026-10-06T09:00Z", "retrain", "kept (dry-run)")
+    event("2026-10-07T09:00Z", "check", None)
+    event("2026-10-01T09:00Z", "retrain", "kept")  # recorded last, evaluated earliest
+
+    got = db.latest_monitoring_event(engine, [("retrain", "kept")])
+    assert got["as_of"] == pd.Timestamp("2026-10-05T09:00Z") and got["decision"] == "kept"
+    assert db.latest_monitoring_event(engine, [("check", None)])["kind"] == "check"
+    either = db.latest_monitoring_event(engine, [("retrain", "kept"), ("check", None)])
+    assert either["kind"] == "check"
+    early = db.latest_monitoring_event(
+        engine, [("retrain", "kept")], as_of_at_most=pd.Timestamp("2026-10-04T00:00Z")
+    )
+    assert early["as_of"] == pd.Timestamp("2026-10-01T09:00Z")
+    assert db.latest_monitoring_event(engine, [("retrain", "promoted")]) is None
+    assert db.latest_monitoring_event(engine, []) is None
+
+
 def test_read_table_window(engine, load_frame) -> None:
     db.upsert_dataframe(engine, db.LoadActual, _rows(load_frame))
     start = pd.Timestamp("2021-03-28T00:00Z")

@@ -69,6 +69,10 @@ SOURCE_SMARD = "smard"
 # champion/challenger (triggered or forced) is a retrain. Here so the dashboard can share them.
 EVENT_CHECK = "check"
 EVENT_RETRAIN = "retrain"
+# ``decision`` of a retrain event that the promotion policy reads back: a real rejection
+# starts the cooldown; a pass the cooldown held trained nothing.
+DECISION_KEPT = "kept"
+DECISION_COOLDOWN = "cooldown"
 
 
 # --- UTC handling ---
@@ -635,6 +639,38 @@ def insert_monitoring_event(engine: Engine, **fields: Any) -> int:
     with engine.begin() as conn:
         result = conn.execute(insert(MonitoringEvent).values(**fields))
         return int(result.inserted_primary_key[0])
+
+
+def latest_monitoring_event(
+    engine: Engine,
+    matches: Sequence[tuple[str, str | None]],
+    *,
+    as_of_at_most: DateLike | None = None,
+) -> dict[str, Any] | None:
+    """The event with the latest ``as_of`` matching any ``(kind, decision)`` pair, or None.
+
+    ``decision=None`` matches every decision of that kind. ``as_of_at_most`` ignores events
+    evaluated after that time (a pass replayed with an older ``--as-of`` must not see them).
+    """
+    if not matches:
+        return None
+    ev = MonitoringEvent
+    conditions = [
+        (ev.kind == kind) if decision is None else ((ev.kind == kind) & (ev.decision == decision))
+        for kind, decision in matches
+    ]
+    stmt = select(ev.__table__).where(or_(*conditions))
+    if as_of_at_most is not None:
+        stmt = stmt.where(ev.as_of <= to_utc(as_of_at_most).to_pydatetime())
+    stmt = stmt.order_by(ev.as_of.desc(), ev.id.desc()).limit(1)
+    with engine.connect() as conn:
+        row = conn.execute(stmt).mappings().first()
+    if row is None:
+        return None
+    out = dict(row)
+    out["as_of"] = to_utc(out["as_of"])
+    out["created_at"] = to_utc(out["created_at"])
+    return out
 
 
 def read_monitoring_events(engine: Engine, *, limit: int = 100) -> pd.DataFrame:

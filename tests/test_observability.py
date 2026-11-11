@@ -221,6 +221,23 @@ def test_monitor_metrics_send_the_cv_gate_on_every_pass() -> None:
         assert value(rec.metrics(), "retrain.cv_gate_failed", model_version="v1") == expected
 
 
+def test_monitor_metrics_send_the_cooldown_on_every_pass() -> None:
+    """A held pass is 1 and trained nothing; every other pass sends 0."""
+    decision = SimpleNamespace(champion_version="1", performance=None, drift=None, checks=[])
+    for outcome, cooldown, ran in [
+        (None, 0, 0),
+        (SimpleNamespace(decision="cooldown", cv_gate="not run"), 1, 0),
+        (SimpleNamespace(decision="kept", cv_gate="not run"), 0, 1),
+        (SimpleNamespace(decision="promoted", cv_gate="passed"), 0, 1),
+    ]:
+        m, rec = enabled("monitor")
+        monitor_metrics(m, decision, outcome)
+        m.flush()
+        got = rec.metrics()
+        assert value(got, "retrain.cooldown", model_version="v1") == cooldown
+        assert value(got, "retrain.ran", model_version="v1") == ran
+
+
 def test_monitor_metrics_flag_a_drift_check_that_could_not_run() -> None:
     decision = SimpleNamespace(champion_version="1", performance=None, drift=None, checks=[])
     m, rec = enabled("monitor")
