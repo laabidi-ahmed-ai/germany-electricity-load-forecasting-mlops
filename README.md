@@ -10,8 +10,8 @@ In a one-year backtest that replays every D+1 forecast with the weather forecast
 
 ```mermaid
 xychart-beta
-    title "One-year backtest, same D+1 hours: MAE in MW (lower is better)"
-    x-axis ["Official TSO day-ahead", "LightGBM, weather forecast at issue", "LightGBM, measured weather"]
+    title "One-year D+1 backtest: MAE in MW, official vs LightGBM"
+    x-axis ["Official", "Issue-time weather", "Measured weather"]
     y-axis "MAE (MW)" 0 --> 2500
     bar [2039, 1590, 1540]
 ```
