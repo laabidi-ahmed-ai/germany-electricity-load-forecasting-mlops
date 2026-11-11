@@ -473,6 +473,9 @@ def panel_monitoring(mon: dict[str, Any], tz: str) -> None:
         "promoted": COLORS["model"],
         "kept": "#f59e0b",
         "skipped": COLORS["official"],
+        "cooldown": "#6b7280",
+        "promoted (dry-run)": "#93c5fd",
+        "kept (dry-run)": "#fcd34d",
     }
     fig = go.Figure()
     for status, g in timeline.groupby("status", sort=False):
