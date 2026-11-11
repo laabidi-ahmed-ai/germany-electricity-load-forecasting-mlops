@@ -517,6 +517,53 @@ def test_latest_pass_triggered_retrain_that_kept_the_champion(engine: Engine) ->
     assert q.pass_headline(check) == "🔴 retraining triggered · champion kept"
 
 
+def test_latest_pass_kept_by_the_cv_gate(engine: Engine) -> None:
+    outcome = {
+        "decision": "kept",
+        "champion_version": "5",
+        "triggers": ["drift"],
+        "cv_beats_all_baselines": False,
+    }
+    record_pass(engine, kind=db.EVENT_RETRAIN, triggered=True, outcome=outcome)
+    check = q.latest_check(q.monitoring_events(engine))
+    assert check["cv_gate"] == "failed" and check["champion_version"] == "5"
+    assert q.pass_headline(check) == (
+        "🔴 retraining triggered · champion kept (its CV did not beat every baseline)"
+    )
+
+
+def test_latest_pass_held_by_the_cooldown(engine: Engine) -> None:
+    outcome = {
+        "decision": "cooldown",
+        "champion_version": "5",
+        "triggers": ["7d MAPE"],
+        "cooldown": "held",
+    }
+    record_pass(engine, kind=db.EVENT_RETRAIN, triggered=True, outcome=outcome)
+    events = q.monitoring_events(engine)
+    check = q.latest_check(events)
+    assert check["outcome"] == "cooldown" and check["cooldown"] == "held"
+    assert check["cv_gate"] is None
+    assert q.pass_headline(check) == (
+        "🔴 retraining triggered · cooldown after a rejected challenger: nothing trained"
+    )
+    assert list(q.event_timeline(events)["status"]) == ["cooldown"]
+
+
+def test_latest_pass_dry_run_rejection_and_forced_bypass(engine: Engine) -> None:
+    outcome = {
+        "decision": "kept (dry-run)",
+        "champion_version": "5",
+        "triggers": ["forced"],
+        "cooldown": "bypassed",
+    }
+    record_pass(engine, kind=db.EVENT_RETRAIN, triggered=False, outcome=outcome)
+    check = q.latest_check(q.monitoring_events(engine))
+    assert q.pass_headline(check) == (
+        "🟠 retrain forced · dry run: champion would be kept · cooldown bypassed"
+    )
+
+
 def test_latest_pass_clear_check_is_unchanged(engine: Engine) -> None:
     record_pass(engine, kind=db.EVENT_CHECK, triggered=False, outcome=None)
     check = q.latest_check(q.monitoring_events(engine))

@@ -12,6 +12,7 @@ from config.settings import get_settings
 from src.data import db
 from src.features.build_features import TARGET, WEATHER_COLUMNS, build_feature_frame
 from src.features.horizons import D_PLUS_1, DAY_AHEAD, select_features
+from src.models import evaluate
 from src.monitoring import drift as drift_mod
 from src.monitoring import metrics, retrain
 from src.monitoring import performance as perf
@@ -136,6 +137,48 @@ def fake_runner(drifted: set[str], *, score_ok: float = 0.02, score_bad: float =
         return out
 
     return _run
+
+
+def fake_cv(lightgbm_mae: float | None, **baseline_maes: float) -> evaluate.CVResult:
+    """A two-fold CV result with the given mean MAE per model (baselines first);
+    ``lightgbm_mae=None`` leaves the challenger's recipe out, as if it was never scored."""
+    models = [*baseline_maes.items()] + (
+        [] if lightgbm_mae is None else [("lightgbm", lightgbm_mae)]
+    )
+    rows = []
+    for fold in range(2):
+        for model, mae in models:
+            rows.append(
+                {
+                    "fold": fold,
+                    "model": model,
+                    "val_start": START,
+                    "val_end": START,
+                    "n_train": 1,
+                    "n_val": 1,
+                    "mae": mae,
+                    "rmse": mae,
+                    "mape": mae / 500,
+                }
+            )
+    return evaluate.CVResult("day_ahead", [], {}, pd.DataFrame(rows))
+
+
+def no_registry_writes(monkeypatch) -> dict[str, object]:
+    """Record what a promotion would write instead of touching MLflow."""
+    calls: dict[str, object] = {}
+    monkeypatch.setattr(
+        retrain.train, "log_training_run", lambda *a, **k: calls.setdefault("run", "run-new")
+    )
+    monkeypatch.setattr(
+        retrain.registry,
+        "register_run_model",
+        lambda run_id: calls.setdefault("mv", type("MV", (), {"version": "9"})()),
+    )
+    monkeypatch.setattr(
+        retrain.registry, "promote", lambda v, engine=None: calls.setdefault("promoted", v)
+    )
+    return calls
 
 
 def align(engine, **kwargs) -> pd.DataFrame:
@@ -779,23 +822,70 @@ def test_challenger_promoted_when_it_beats_champion_by_margin(engine, cfg, monke
     assert dry.holdout_start > train_end and dry.holdout_hours == 24 * 5
     assert dry.challenger_mae < dry.champion_mae and dry.improvement_pct >= cfg.min_improvement_pct
     assert dry.challenger_version is None and dry.triggers == ["x"]
+    # The dry run evaluates the CV gate too, so its verdict is the one a real run would give.
+    assert dry.cv_gate == "passed" and set(dry.cv_mae) == {
+        "seasonal_naive_24",
+        "seasonal_naive_168",
+        "lightgbm",
+    }
+    assert "CV gate passed" in dry.summary()
 
-    calls: dict[str, object] = {}
-    monkeypatch.setattr(
-        retrain.train, "log_training_run", lambda *a, **k: calls.setdefault("run", "run-new")
-    )
-    monkeypatch.setattr(
-        retrain.registry,
-        "register_run_model",
-        lambda run_id: calls.setdefault("mv", type("MV", (), {"version": "9"})()),
-    )
-    monkeypatch.setattr(
-        retrain.registry, "promote", lambda v, engine=None: calls.setdefault("promoted", v)
-    )
+    calls = no_registry_writes(monkeypatch)
     out = retrain.run_champion_challenger(engine, champ, cfg, frame=frame)
     assert out.decision == "promoted" and out.challenger_version == "9"
     assert out.training_run_id == "run-new" and calls["promoted"] == "9"
     assert "promoted challenger as v9" in out.summary()
+    assert out.reason.endswith("and its CV beats every baseline")
+
+
+def test_cv_gate_keeps_the_champion_when_the_cv_loses_to_a_baseline(
+    engine, cfg, monkeypatch
+) -> None:
+    """Beating the champion on the holdout is not enough: the recipe must beat the baselines."""
+    load = seed_db(engine, days=90, with_model=False)
+    frame = feature_frame(load)
+    champ = fake_loaded_model(  # a weak champion: the margin is passed easily
+        select_features(frame.columns, DAY_AHEAD),
+        bias=3_000,
+        train_end=frame.index.max() - pd.Timedelta(days=5),
+    )
+    losing = fake_cv(1_500.0, seasonal_naive_24=1_600.0, seasonal_naive_168=1_400.0)
+    monkeypatch.setattr(retrain.evaluate, "cross_validate", lambda *a, **k: losing)
+    calls = no_registry_writes(monkeypatch)
+    fits: list[int] = []
+    real_fit = retrain.train.fit_model
+
+    def spy_fit(df, horizon, params=None):
+        fits.append(len(df))
+        return real_fit(df, horizon, params)
+
+    monkeypatch.setattr(retrain.train, "fit_model", spy_fit)
+
+    out = retrain.run_champion_challenger(engine, champ, cfg, frame=frame)
+    assert out.improvement_pct >= cfg.min_improvement_pct  # the margin alone would promote
+    assert out.decision == "kept" and out.cv_gate == "failed"
+    assert out.cv_beats_all_baselines is False
+    assert "does not beat every baseline" in out.reason
+    assert "lightgbm 1,500 MW vs seasonal_naive_168 1,400 MW" in out.reason
+    assert "seasonal_naive_24" not in out.reason  # only the baselines it lost to
+    assert calls == {} and out.challenger_version is None  # nothing logged, registered, promoted
+    assert fits == [len(frame[frame.index < out.holdout_start])]  # no final refit either
+
+    dry = retrain.run_champion_challenger(engine, champ, cfg, frame=frame, dry_run=True)
+    assert dry.decision == "kept (dry-run)" and dry.cv_gate == "failed"
+
+
+def test_cv_gate_reason_when_the_recipe_or_the_baselines_were_not_scored() -> None:
+    """An empty comparison fails the gate; the reason must say which side is missing."""
+    unscored = fake_cv(None, seasonal_naive_24=1_600.0, seasonal_naive_168=1_400.0)
+    assert not unscored.beats_all_baselines()
+    assert (
+        retrain._cv_losses(unscored)
+        == "the challenger's recipe (lightgbm) was not scored by the CV"
+    )
+    alone = fake_cv(1_500.0)
+    assert not alone.beats_all_baselines()
+    assert retrain._cv_losses(alone) == "no baseline was scored"
 
 
 def test_challenger_kept_when_margin_not_met(engine, cfg) -> None:
@@ -822,6 +912,11 @@ def test_challenger_kept_when_margin_not_met(engine, cfg) -> None:
     out = retrain.run_champion_challenger(engine, champ, strict, frame=frame)
     assert out.decision == "kept" and "< required 50.0% margin" in out.reason
     assert out.challenger_version is None
+    assert out.cv_gate == "not run" and out.cv_mae == {}  # the margin failed first
+
+    # A dry run's rejection is marked, so it can never count as a real decision.
+    dry = retrain.run_champion_challenger(engine, champ, strict, frame=frame, dry_run=True)
+    assert dry.decision == "kept (dry-run)"
 
 
 def test_challenger_competes_on_the_champions_horizon(engine, cfg, monkeypatch) -> None:
@@ -879,11 +974,34 @@ def test_decisions_are_logged_to_mlflow_and_db(engine, cfg, tmp_path, monkeypatc
     run_id = retrain.log_decision(d, out, cfg, experiment="test-retrain")
     run = mlflow.MlflowClient().get_run(run_id)
     assert run.data.tags["decision"] == "kept" and run.data.tags["triggered"] == "True"
+    assert run.data.tags["cv_gate"] == "not run"
     assert run.data.metrics["check_error_fired"] == 1.0
     assert run.data.metrics["promoted"] == 0.0
     assert run.data.params["cfg_min_improvement_pct"] == "3.0"
     artifacts = {a.path for a in mlflow.MlflowClient().list_artifacts(run_id)}
     assert {"trigger_decision.json", "challenger_outcome.json"} <= artifacts
+
+    gated = retrain.ChallengerOutcome(
+        "kept",
+        "cv",
+        "1",
+        holdout_hours=100,
+        champion_mae=1.0,
+        challenger_mae=0.9,
+        champion_mape=1.0,
+        challenger_mape=0.9,
+        improvement_pct=10.0,
+        holdout_start=AS_OF,
+        holdout_end=AS_OF,
+        cv_beats_all_baselines=False,
+        cv_mae={"seasonal_naive_168": 1_400.0, "lightgbm": 1_500.0},
+    )
+    run = mlflow.MlflowClient().get_run(
+        retrain.log_decision(d, gated, cfg, experiment="test-retrain")
+    )
+    assert run.data.tags["cv_gate"] == "failed"
+    assert run.data.metrics["cv_beats_all_baselines"] == 0.0
+    assert run.data.metrics["cv_lightgbm_mae_mean"] == 1_500.0
 
     retrain.record_event(engine, d, out, cfg)
     retrain.record_event(engine, d, None, cfg)
@@ -907,6 +1025,9 @@ def test_cli_check_only_and_force_dry_run(engine, cfg, monkeypatch, capsys) -> N
     monkeypatch.setattr(retrain.registry, "load_champion", lambda engine: champ)
     monkeypatch.setattr(retrain, "build_features", lambda *a, **k: frame)
     monkeypatch.setattr(retrain.drift_mod, "run_evidently", fake_runner(set()))
+    # The CLI's CV needs a year of data; the gate's verdict is what matters here.
+    passing = fake_cv(1_000.0, seasonal_naive_24=1_600.0, seasonal_naive_168=1_400.0)
+    monkeypatch.setattr(retrain.evaluate, "cross_validate", lambda *a, **k: passing)
     url = str(engine.url)
 
     # --once-per-day only skips when a pass was already recorded today (none yet).

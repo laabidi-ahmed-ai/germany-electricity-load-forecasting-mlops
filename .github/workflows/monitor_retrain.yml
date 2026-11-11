@@ -2,7 +2,9 @@
 #
 # Scores yesterday's forecasts against the actuals and the official forecast, runs the
 # Evidently drift check, and - only if a trigger fires - trains a challenger and promotes
-# it if it beats the champion by the configured margin. Every decision is written to
+# it only if it beats the champion by the configured margin and its CV beats every
+# baseline. After a rejected challenger, a 7-day cooldown holds new ones (mode force
+# bypasses it; README §16.12). Every decision is written to
 # the monitoring_events table and to MLflow (backend store = the cloud Postgres, so the
 # lineage survives the ephemeral runner; the promoted model is exported to the DB).
 #
@@ -20,7 +22,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "auto = retrain only if triggered; check-only = never retrain; force = retrain now"
+        description: "auto = retrain only if triggered; check-only = never retrain; force = retrain now (bypasses the cooldown)"
         type: choice
         options: [auto, check-only, force]
         default: auto

@@ -13,11 +13,29 @@ Champion / challenger, fair by construction: the holdout is data that arrived af
 the champion's ``train_end`` (capped at ``holdout_days``); with fewer than
 ``min_holdout_hours`` the comparison is skipped, because a champion cannot be
 dethroned on data it was trained on. The candidate is a LightGBM trained on everything
-before the holdout with the same day-ahead features. It is promoted only if its
-holdout MAE is at least ``min_improvement_pct`` lower than the champion's (the
-anti-churn margin), in which case it is refitted on all data, logged with the standard
-CV report, registered and aliased. Rollback:
+before the holdout with the same day-ahead features. Two gates, in this order:
+
+1. the margin: its holdout MAE must be at least ``min_improvement_pct`` lower than the
+   champion's (the anti-churn margin);
+2. the CV gate: the expanding-window CV of the training recipe on all data must beat every
+   seasonal-naive baseline on mean MAE (``CVResult.beats_all_baselines``) - the bar the
+   first champion had to clear.
+
+Failing either keeps the champion (decision ``kept``). Passing both, the recipe is refitted
+on all data, logged with that CV report, registered and aliased. A dry run evaluates both
+gates and stops there: ``promoted (dry-run)`` or ``kept (dry-run)``. Rollback:
 ``python -m src.models.registry --promote <old version>``.
+
+What is evaluated is not exactly what is promoted. The holdout judges a candidate trained
+*before* the holdout; the promoted model is the same recipe refitted on everything, holdout
+included, so the holdout cannot judge it. The CV describes the recipe over the last year,
+not the promoted object either. Neither is an out-of-sample test of the model that serves:
+its first out-of-sample evidence is its own live record, and nothing checks that record yet.
+
+Cooldown (``src.monitoring.promotion``): after a real rejection, no new challenger for
+``cooldown_days`` UTC calendar days, as long as the same champion serves (any promotion ends
+it). A fired trigger in that time still scores and records the pass, with decision
+``cooldown``. ``--force`` bypasses it, logged.
 
 Every decision is logged to MLflow (tags ``stage=retrain``, ``decision``, ``reason``)
 and to the ``monitoring_events`` table.
@@ -26,7 +44,7 @@ CLI::
 
     python -m src.monitoring.retrain --check-only      # make monitor
     python -m src.monitoring.retrain                   # make retrain (acts only if triggered)
-    python -m src.monitoring.retrain --force [--dry-run]
+    python -m src.monitoring.retrain --force [--dry-run]   # also bypasses the cooldown
     python -m src.monitoring.retrain --once-per-day    # automatic runs: one pass per UTC day
 """
 
@@ -51,6 +69,7 @@ from src.models.registry import LoadedModel
 from src.models.tracking import DEFAULT_EXPERIMENT, setup_mlflow
 from src.monitoring import drift as drift_mod
 from src.monitoring import performance as perf_mod
+from src.monitoring import promotion
 from src.monitoring.metrics import WindowMetrics, compute_metrics, improvement_pct
 from src.observability import JobMetrics, job_metrics
 
@@ -82,6 +101,8 @@ class RetrainConfig:
     holdout_days: int = 14
     min_holdout_hours: int = 24 * 7
     min_improvement_pct: float = 3.0
+    # no new challenger for this many UTC calendar days after a real rejection (0 = off)
+    cooldown_days: int = promotion.DEFAULT_COOLDOWN_DAYS
     lgbm_params: dict[str, Any] | None = None
     cv_n_splits: int = evaluate.DEFAULT_N_SPLITS
     cv_val_hours: int = evaluate.DEFAULT_VAL_HOURS
@@ -282,26 +303,41 @@ class ChallengerOutcome:
     improvement_pct: float | None = None
     training_run_id: str | None = None
     triggers: list[str] = field(default_factory=list)
+    # CV gate: None = the CV did not run (skipped, or the margin already failed)
+    cv_beats_all_baselines: bool | None = None
+    cv_mae: dict[str, float] = field(default_factory=dict)  # mean CV MAE per model (MW)
+    # cooldown: "none" | "held" (nothing trained) | "bypassed" (--force while active)
+    cooldown: str = "none"
+    cooldown_until: pd.Timestamp | None = None
+
+    @property
+    def cv_gate(self) -> str:
+        """``passed`` | ``failed`` | ``not run``: the MLflow tag and the Datadog gauge."""
+        if self.cv_beats_all_baselines is None:
+            return "not run"
+        return "passed" if self.cv_beats_all_baselines else "failed"
 
     def summary(self) -> str:
-        head = f"Champion/challenger: {self.decision.upper()} - {self.reason}"
-        if self.champion_mae is None:
-            return head
-        return (
-            f"{head}\n  holdout {self.holdout_start:%Y-%m-%d} -> {self.holdout_end:%Y-%m-%d} "
-            f"({self.holdout_hours}h): champion v{self.champion_version} MAE {self.champion_mae:,.0f} "
-            f"({self.champion_mape:.2f}%) vs challenger MAE {self.challenger_mae:,.0f} "
-            f"({self.challenger_mape:.2f}%) -> improvement {self.improvement_pct:+.1f}%"
-            + (
-                f"\n  promoted challenger as v{self.challenger_version}"
-                if self.challenger_version
-                else ""
+        lines = [f"Champion/challenger: {self.decision.upper()} - {self.reason}"]
+        if self.champion_mae is not None:
+            lines.append(
+                f"  holdout {self.holdout_start:%Y-%m-%d} -> {self.holdout_end:%Y-%m-%d} "
+                f"({self.holdout_hours}h): champion v{self.champion_version} MAE {self.champion_mae:,.0f} "
+                f"({self.champion_mape:.2f}%) vs challenger MAE {self.challenger_mae:,.0f} "
+                f"({self.challenger_mape:.2f}%) -> improvement {self.improvement_pct:+.1f}%"
             )
-        )
+        if self.cv_mae:
+            maes = ", ".join(f"{m} {v:,.0f}" for m, v in self.cv_mae.items())
+            lines.append(f"  CV mean MAE (MW): {maes} -> CV gate {self.cv_gate}")
+        if self.challenger_version:
+            lines.append(f"  promoted challenger as v{self.challenger_version}")
+        if self.cooldown == "bypassed":
+            lines.append(f"  cooldown until {self.cooldown_until:%Y-%m-%d} bypassed by --force")
+        return "\n".join(lines)
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
-        for k in ("holdout_start", "holdout_end"):
+        for k in ("holdout_start", "holdout_end", "cooldown_until"):
             if d[k] is not None:
                 d[k] = d[k].isoformat()
         return d
@@ -352,7 +388,7 @@ def run_champion_challenger(
     improvement = improvement_pct(champ_m["mae"], cand_m["mae"])
 
     outcome = ChallengerOutcome(
-        decision="kept",
+        decision=db.DECISION_KEPT,
         reason="",
         champion_version=champion.version,
         holdout_start=holdout.index.min(),
@@ -365,18 +401,14 @@ def run_champion_challenger(
         improvement_pct=improvement,
         triggers=triggers or [],
     )
+    suffix = " (dry-run)" if dry_run else ""  # a dry run's decision never counts as a real one
     if improvement < cfg.min_improvement_pct:
+        outcome.decision = f"{db.DECISION_KEPT}{suffix}"
         outcome.reason = f"challenger improves MAE by {improvement:+.1f}% < required {cfg.min_improvement_pct}% margin"
         return outcome
+    margin = f"challenger beats champion by {improvement:+.1f}% (>= {cfg.min_improvement_pct}%)"
 
-    outcome.reason = (
-        f"challenger beats champion by {improvement:+.1f}% (>= {cfg.min_improvement_pct}%)"
-    )
-    if dry_run:
-        outcome.decision = "promoted (dry-run)"
-        return outcome
-
-    # Refit the winner on everything, log it exactly like `make train`, register, promote.
+    # The CV gate: the recipe that would be promoted must beat every baseline in the CV.
     cv = evaluate.cross_validate(
         frame,
         {**baseline_factories(horizon), train.MODEL_NAME: train.lightgbm_factory(cfg.lgbm_params)},
@@ -385,6 +417,19 @@ def run_champion_challenger(
         val_hours=cfg.cv_val_hours,
         min_train_hours=cfg.cv_min_train_hours,
     )
+    outcome.cv_mae = {str(m): cv.mean(str(m)) for m in cv.summary.index}
+    outcome.cv_beats_all_baselines = cv.beats_all_baselines()
+    if not outcome.cv_beats_all_baselines:
+        outcome.decision = f"{db.DECISION_KEPT}{suffix}"
+        outcome.reason = f"{margin}, but its CV does not beat every baseline: {_cv_losses(cv)}"
+        return outcome
+
+    outcome.reason = f"{margin} and its CV beats every baseline"
+    if dry_run:
+        outcome.decision = "promoted (dry-run)"
+        return outcome
+
+    # Refit the winner on everything, log it exactly like `make train`, register, promote.
     final, final_cols = train.fit_model(frame, horizon, cfg.lgbm_params)
     run_id = train.log_training_run(
         final, final_cols, cv, horizon, frame, run_name="retrain_challenger"
@@ -396,6 +441,31 @@ def run_champion_challenger(
     outcome.training_run_id = run_id
     log.info("promoted challenger v%s (rollback: --promote %s)", mv.version, champion.version)
     return outcome
+
+
+def _cv_losses(cv: evaluate.CVResult) -> str:
+    """The baselines the recipe does not beat, with both mean MAEs (for the decision reason)."""
+    model = train.MODEL_NAME
+    if model not in cv.summary.index:  # beats_baselines() is then empty too
+        return f"the challenger's recipe ({model}) was not scored by the CV"
+    lost = [b for b, v in cv.beats_baselines().items() if not v["beats"]]
+    if not lost:  # the recipe was scored, but no baseline was
+        return "no baseline was scored"
+    return "; ".join(f"{model} {cv.mean(model):,.0f} MW vs {b} {cv.mean(b):,.0f} MW" for b in lost)
+
+
+def held_by_cooldown(
+    cooldown: promotion.Cooldown, champion_version: str, triggers: list[str]
+) -> ChallengerOutcome:
+    """The outcome of a fired pass the cooldown holds: nothing trained, reason recorded."""
+    return ChallengerOutcome(
+        decision=db.DECISION_COOLDOWN,
+        reason=f"cooldown: {cooldown.detail()}",
+        champion_version=champion_version,
+        triggers=triggers,
+        cooldown="held",
+        cooldown_until=cooldown.until,
+    )
 
 
 # --- Logging of decisions ---
@@ -429,6 +499,8 @@ def log_decision(
                 "triggered": str(decision.triggered),
                 "decision": outcome.decision if outcome else "check-only",
                 "reason": (reason or "no trigger")[:250],
+                "cv_gate": outcome.cv_gate if outcome else "not run",
+                "cooldown": outcome.cooldown if outcome else "none",
             }
         )
         mlflow.log_params({f"cfg_{k}": v for k, v in asdict(cfg).items() if k != "lgbm_params"})
@@ -457,6 +529,9 @@ def log_decision(
                     "promoted": int(outcome.decision.startswith("promoted")),
                 }
             )
+        if outcome is not None and outcome.cv_beats_all_baselines is not None:
+            mlflow.log_metric("cv_beats_all_baselines", int(outcome.cv_beats_all_baselines))
+            mlflow.log_metrics({f"cv_{m}_mae_mean": v for m, v in outcome.cv_mae.items()})
         mlflow.log_dict(decision.to_dict(), "trigger_decision.json")
         if outcome is not None:
             mlflow.log_dict(outcome.to_dict(), "challenger_outcome.json")
@@ -508,8 +583,14 @@ def report_metrics(
     metrics.gauge("drift.unavailable", int(decision.drift is None), model_version=champion)
     for c in decision.checks:
         metrics.gauge("trigger.fired", int(c.fired), trigger=c.name, model_version=champion)
-    metrics.gauge("retrain.ran", int(outcome is not None), model_version=champion)
-    if outcome is not None:  # decision: promoted | promoted (dry-run) | kept | skipped
+    held = outcome is not None and outcome.decision == db.DECISION_COOLDOWN
+    # champion/challenger ran (0 when the cooldown held the pass: nothing was trained)
+    metrics.gauge("retrain.ran", int(outcome is not None and not held), model_version=champion)
+    # Sent on every pass as 0 or 1, so a monitor on them recovers on the next pass.
+    cv_failed = outcome is not None and outcome.cv_gate == "failed"
+    metrics.gauge("retrain.cv_gate_failed", int(cv_failed), model_version=champion)
+    metrics.gauge("retrain.cooldown", int(held), model_version=champion)
+    if outcome is not None:  # promoted | kept | skipped; promoted and kept may be " (dry-run)"
         decision_tag = outcome.decision.split(" ")[0]
         dry_run = str("dry-run" in outcome.decision).lower()
         metrics.gauge(
@@ -541,6 +622,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--drift-threshold", type=float, default=RetrainConfig.drift_column_threshold)
     p.add_argument("--holdout-days", type=int, default=RetrainConfig.holdout_days)
     p.add_argument("--min-improvement", type=float, default=RetrainConfig.min_improvement_pct)
+    p.add_argument(
+        "--cooldown-days",
+        type=int,
+        default=RetrainConfig.cooldown_days,
+        help="no new challenger for this many UTC days after a rejected one (0 = off)",
+    )
     p.add_argument("--no-mlflow", action="store_true")
     p.add_argument(
         "--once-per-day",
@@ -557,6 +644,7 @@ def main(argv: list[str] | None = None) -> int:
         drift_column_threshold=args.drift_threshold,
         holdout_days=args.holdout_days,
         min_improvement_pct=args.min_improvement,
+        cooldown_days=args.cooldown_days,
     )
     with job_metrics("monitor") as metrics:
         engine = db.get_engine(args.database_url)
@@ -582,15 +670,32 @@ def main(argv: list[str] | None = None) -> int:
 
         outcome: ChallengerOutcome | None = None
         if not args.check_only and (decision.triggered or args.force):
-            outcome = run_champion_challenger(
+            triggers = decision.reasons or (["forced"] if args.force else [])
+            record = registry.champion_record(engine)  # promoted_at: any promotion ends it
+            cooldown = promotion.cooldown_state(
                 engine,
-                champion,
-                cfg,
-                as_of=as_of,
-                frame=frame,
-                triggers=decision.reasons or (["forced"] if args.force else []),
-                dry_run=args.dry_run,
+                decision.as_of,
+                cfg.cooldown_days,
+                champion.version,
+                record["promoted_at"] if record else None,
             )
+            if cooldown.active and not args.force:
+                outcome = held_by_cooldown(cooldown, champion.version, triggers)
+            else:
+                if cooldown.active:
+                    log.warning("cooldown bypassed by --force: %s", cooldown.detail())
+                outcome = run_champion_challenger(
+                    engine,
+                    champion,
+                    cfg,
+                    as_of=as_of,
+                    frame=frame,
+                    triggers=triggers,
+                    dry_run=args.dry_run,
+                )
+                if cooldown.active:
+                    outcome.cooldown = "bypassed"
+                    outcome.cooldown_until = cooldown.until
             print()
             print(outcome.summary())
         elif not args.check_only:

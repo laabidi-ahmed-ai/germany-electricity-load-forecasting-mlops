@@ -261,8 +261,10 @@ def latest_check(events: pd.DataFrame) -> dict[str, Any] | None:
 
     Returns ``{"as_of", "created_at", "kind", "model_version" (champion the pass checked),
     "champion_version" (champion after the pass), "triggered", "forced", "outcome"
-    (promoted | kept | skipped | promoted (dry-run) | None), "checks": DataFrame,
-    "drift": dict | None, "drift_error": str | None, "drift_columns": DataFrame}`` or None.
+    (promoted | kept | skipped | cooldown | promoted (dry-run) | kept (dry-run) | None),
+    "cv_gate" (passed | failed | None when the CV did not run), "cooldown" (none | held |
+    bypassed), "checks": DataFrame, "drift": dict | None, "drift_error": str | None,
+    "drift_columns": DataFrame}`` or None.
     """
     passes = events[events["kind"].isin([db.EVENT_CHECK, db.EVENT_RETRAIN])]
     if passes.empty:
@@ -288,6 +290,7 @@ def latest_check(events: pd.DataFrame) -> dict[str, Any] | None:
         item = (drift or {}).get(extra)
         if item:
             columns = pd.concat([columns, pd.DataFrame([item])], ignore_index=True)
+    cv_beats = outcome.get("cv_beats_all_baselines") if is_retrain else None
     return {
         "as_of": row["as_of"],
         "created_at": row["created_at"],
@@ -297,6 +300,8 @@ def latest_check(events: pd.DataFrame) -> dict[str, Any] | None:
         "triggered": bool(row["triggered"]),
         "forced": forced,
         "outcome": (outcome.get("decision") or None) if is_retrain else None,
+        "cv_gate": None if cv_beats is None else ("passed" if cv_beats else "failed"),
+        "cooldown": (outcome.get("cooldown") or "none") if is_retrain else "none",
         "checks": checks,
         "drift": drift,
         "drift_error": decision.get("drift_error"),
@@ -307,7 +312,9 @@ def latest_check(events: pd.DataFrame) -> dict[str, Any] | None:
 OUTCOME_TEXT = {
     "kept": "champion kept",
     "skipped": "challenger skipped",
+    db.DECISION_COOLDOWN: "cooldown after a rejected challenger: nothing trained",
     "promoted (dry-run)": "dry run: challenger would be promoted",
+    "kept (dry-run)": "dry run: champion would be kept",
 }
 
 
@@ -323,6 +330,10 @@ def pass_headline(check: dict[str, Any]) -> str:
         result = f"challenger promoted → v{check['champion_version']}"
     else:
         result = OUTCOME_TEXT.get(outcome, outcome or "no outcome recorded")
+        if check.get("cv_gate") == "failed":
+            result += " (its CV did not beat every baseline)"
+    if check.get("cooldown") == "bypassed":
+        result += " · cooldown bypassed"
     return f"{state} · {result}"
 
 

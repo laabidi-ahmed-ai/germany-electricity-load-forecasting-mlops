@@ -30,7 +30,9 @@ and `runner:github` (or `runner:local` from a laptop — filter on `runner:githu
 | `drift.share` | monitor | share of monitored columns that drifted |
 | `drift.unavailable` | monitor | 1 if the drift check could not run (it never fails the job, so this is the only signal) |
 | `trigger.fired` (tag `trigger:error|official|drift`) | monitor | 1 if that retrain trigger fired |
-| `retrain.ran`, `retrain.promoted` | monitor | a challenger was trained / promoted |
+| `retrain.ran`, `retrain.promoted` | monitor | champion/challenger ran (0 when the cooldown held the pass) / a challenger was promoted |
+| `retrain.cv_gate_failed` | monitor | 1 if the challenger passed the holdout margin but its CV did not beat every baseline (README §16.12); 0 on every other pass |
+| `retrain.cooldown` | monitor | 1 if a trigger fired but the 7-day cooldown after a rejected challenger held the pass (nothing trained); 0 on every other pass |
 | `monitor.skipped` | monitor | a backup run found today's pass already recorded |
 
 ## Setup (once, ~15 minutes)
@@ -99,6 +101,11 @@ Why these six:
    (README §16.2).
 
 Use **Test Notifications** (bottom of the monitor page) once to check the e-mail arrives.
+
+The CV gate and the cooldown get no monitor: both are routine decisions of the retrain loop,
+and monitor 4 already tells a human when the error trigger fires. They are on the dashboard
+and in the events table. `retrain.cv_gate_failed` and `retrain.cooldown` are sent on every
+pass as 0 or 1, so a monitor added on them later recovers by itself.
 
 ## Dashboard
 
