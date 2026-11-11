@@ -75,7 +75,24 @@ Any service that can send a scheduled HTTP POST works; these steps use
   added next to the earlier one. If it is made before the deadline, it replaces the earlier
   one in the scores; after the deadline it is kept, but not scored.
 - **Rehearse a retrain without touching the champion.** Actions → *monitor-retrain* →
-  *Run workflow* → mode **force**, **dry_run** ticked.
+  *Run workflow* → mode **force**, **dry_run** ticked. The dry run evaluates both gates (the
+  holdout margin, then the CV against the baselines), so it takes a few minutes longer than
+  before. Its decision is `promoted (dry-run)` or `kept (dry-run)`; a dry-run rejection never
+  starts the cooldown.
+- **A fired trigger shows `cooldown`.** A challenger was rejected less than 7 UTC days ago,
+  against the champion that still serves (README §16.12), so this pass scored the champion
+  and recorded the triggers but trained nothing. Any promotion ends the cooldown: after a
+  `bootstrap` promotion or a `registry --promote`, the next fired pass trains again. The event's reason names the rejection and the first day a new challenger may be
+  trained. Nothing to do: the next pass after that day trains one if a trigger still fires.
+  To compare now anyway: Actions → *monitor-retrain* → *Run workflow* → mode **force** (with
+  **dry_run** if you only want to see the result). The log says `cooldown bypassed by
+  --force`, and so does the event.
+- **A challenger was kept by the CV gate.** The reason reads `..., but its CV does not beat
+  every baseline: lightgbm … MW vs seasonal_naive_… … MW`. The challenger beat the champion
+  on the holdout, but its recipe loses to a naive baseline over the last year: the champion
+  stays and the cooldown starts. If this repeats, look at the CV report of the latest
+  training run in MLflow before anything else - a recipe that loses to "same hour last week"
+  points at the data or the features, not at the model's age.
 - **Evaluate the calendar-day (D+1) forecast without touching production.** Actions →
   *bootstrap* → *Run workflow* → tick **skip_backfill**, horizon **d_plus_1**, untick
   **promote**. The log shows the cross-validation report (LightGBM vs the 48 h and 168 h

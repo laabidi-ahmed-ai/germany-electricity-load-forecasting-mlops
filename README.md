@@ -227,7 +227,9 @@ Automated retraining here means a disciplined, guarded pipeline — not online l
 - **Data drift detection** — compare recent data (and features) against the training distribution with **Evidently**. Thresholds are calibrated against historical regime shifts rather than left at library defaults, so ordinary year-to-year variation does not trigger false alarms.
 - **Trigger** — retraining fires when rolling error crosses a threshold and the official forecast did no better on the same hours (a week that is hard for both is not decay) or exceeds twice that threshold whatever the official forecast did (a backstop for a broken model), when the official forecast beats the model by too much, or when drift is detected.
 - **Champion / challenger** — a challenger is trained on the latest data and evaluated against the champion on data that arrived *after* the champion's training window (a true out-of-time holdout).
-- **Promotion or rollback** — the challenger is promoted **only if it beats the champion by a minimum margin**; the previous model is retained for one-step rollback. Every decision is logged to MLflow and a monitoring-events table.
+- **Promotion: two gates** — the challenger is promoted **only if it beats the champion on that holdout by a minimum margin** (3 % lower MAE) **and the cross-validation of its training recipe beats every seasonal-naive baseline**. Failing either keeps the champion. The model that is promoted is that recipe refit on all data, holdout included, so neither gate is an out-of-sample test of the exact model that serves; its first out-of-sample evidence is its live record (§16.12). The previous model is retained for one-step rollback.
+- **Cooldown** — after a rejected challenger, no new challenger is trained for 7 days while the same champion serves (any promotion ends it). The triggers are still evaluated, scored and recorded every day; only the comparison waits, because daily retries of nearly the same comparison would sooner or later pass the margin by luck (§16.12). A manual `force` run bypasses it, and says so.
+- **Every decision is logged** to MLflow and a monitoring-events table, and shown on the dashboard.
 
 This loop is why the system is designed to keep running (hourly ingestion, a daily check), because a retraining trigger is only meaningful once fresh data has had time to accumulate.
 
@@ -286,7 +288,7 @@ germany-electricity-load-forecasting-mlops/
 │   ├── features/                  # build_features, horizons (leakage-safe, horizon-aware)
 │   ├── models/                    # baselines, train, evaluate, registry, tracking
 │   ├── serving/                   # api (FastAPI), forecast, batch_forecast
-│   ├── monitoring/                # drift, performance, fair_backtest, retrain
+│   ├── monitoring/                # drift, performance, fair_backtest, retrain, promotion
 │   └── observability.py           # optional job metrics -> Datadog
 ├── dashboard/
 │   ├── app.py                     # Streamlit dashboard
@@ -478,6 +480,7 @@ The guarded retraining path ran for real in October:
 - **5–8 October:** the 7-day MAPE rose above the 3.5 % trigger (up to 3.94 %). **11 October:** half of the monitored columns drifted, which fired the drift trigger (this autumn it is mostly weather columns — wind speed, cloud cover, humidity — that move away from the reference period).
 - Each time a **challenger was trained** and compared with the champion on hours neither had trained on. It did not beat the champion by the required 3 % margin, so the **champion (v1) was kept** and the decision was logged to MLflow and the events table.
 - Both forecasts were worse in that period: the official forecast's 7-day MAPE reached 4.75 %, against 3.94 % for the model. A week that is hard for everyone, rather than a model that has gone stale, is exactly the case the anti-churn margin exists for: retraining on it would not have helped.
+- The same comparison was re-run every day (five "kept" between 5 and 11 October). That repetition is itself a risk; the cooldown of §16.12 now spaces it out.
 
 ### 16.4 Alerting: from "GitHub e-mails me on a crash" to monitors on what the jobs do
 
@@ -650,6 +653,27 @@ Three limits remain, each narrower than the old caveat:
 - **Run:** `bootstrap` run #7, evaluate-only (`skip_backfill`, horizon `d_plus_1`, `promote` off), from branch `fair-backtest` at commit `0f16526`, on 7 Nov 2026. The latest actual was 6 Nov 2026 21:00 UTC. https://github.com/laabidi-ahmed-ai/germany-electricity-load-forecasting-mlops/actions/runs/42314970853
 - **Where the numbers live:** only here, because Actions logs expire.
 - **To re-run it:** `docs/operations.md` (*Run the fair backtest*).
+
+### 16.12 The promotion policy: a CV gate, a cooldown, and what the holdout cannot judge
+
+**The problem.** Until November 2026 a fired trigger trained a challenger and promoted it if its MAE on the holdout (the data after the champion's training window, at most 14 days) was at least 3 % lower than the champion's. Three weaknesses:
+- the cross-validation of the challenger's recipe was computed and logged, but gated nothing: a recipe that loses to "same hour last week" over the last year could still be promoted on two good weeks;
+- a rejected challenger was retried every day while the trigger kept firing (§16.3: five "kept" in a week);
+- the promoted model is not the model that was evaluated (below).
+
+**Rule 1: the CV gate.** A challenger that passes the margin is promoted only if the expanding-window cross-validation of its training recipe, on all data, beats every seasonal-naive baseline on mean MAE (for D+1: "same hour 2 days ago" and "same hour last week"). It is the bar the first champion had to clear. If not, the decision is `kept`, and the reason names the baseline it lost to, with both MAEs. A dry run now evaluates this gate too, so "promoted (dry-run)" means what a real run would do; it takes a few minutes longer.
+
+**Rule 2: the cooldown.** After a real rejection (`kept`, by the margin or by the CV gate), no new challenger is trained for 7 UTC calendar days. A fired trigger in that time still scores the champion, runs the drift check and records the pass, with decision `cooldown` and the trigger reasons.
+- **Why.** Each daily retry compares an almost identical candidate with the same champion on a holdout that has moved by one day out of 14. That is not new evidence, only another draw of the same noise. With enough draws, one passes the 3 % margin by luck: the multiple-testing problem. The cooldown bounds the looks to about one a week, and each new look has at least 7 new days in its holdout.
+- **What it does not do.** It does not make the looks independent, and it does not give the margin a fixed false-promotion rate. It reduces how often the coin is tossed.
+- **Calendar days**, not 7 × 24 h: the daily pass starts at a slightly different time each day, and a pass a few minutes earlier than the rejecting one would otherwise be held a day longer.
+- **What starts it.** Only a real rejection. A `skipped` comparison compared nothing, and a dry run's decision (`kept (dry-run)`) never changes what later passes do.
+- **Only for the champion it was decided against.** A rejection says "this champion is not beaten by this recipe on this data", nothing about another champion. It counts only if it was decided against the version that serves now, and that version has not been promoted since. So any promotion — automatic, forced, or by hand through `bootstrap` or `registry --promote`, including a version promoted back — ends a running cooldown.
+- **`force`.** A manual run with mode `force` bypasses the cooldown: a human asked for the comparison. The bypass is logged, stored with the pass and shown on the dashboard.
+
+**What the holdout cannot judge.** The holdout judges a candidate trained *before* the holdout. If it wins, the same recipe is refit on everything, holdout included, and that refit is what serves. The holdout cannot judge it: the refit has seen those hours. The cross-validation describes the recipe over the last year, not the refit either. So neither gate is an out-of-sample test of the promoted model. Its first out-of-sample evidence is its own live record, and nothing checks that record automatically yet.
+
+**Where to see it.** The `monitoring_events` table and the dashboard's retraining timeline (`cooldown`, `kept`, `kept (dry-run)`), MLflow tags `cv_gate` and `cooldown` on each pass, and Datadog gauges `retrain.cv_gate_failed` and `retrain.cooldown`, sent on every pass as 0 or 1.
 
 ---
 
