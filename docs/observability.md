@@ -33,6 +33,9 @@ and `runner:github` (or `runner:local` from a laptop — filter on `runner:githu
 | `retrain.ran`, `retrain.promoted` | monitor | champion/challenger ran (0 when the cooldown held the pass) / a challenger was promoted |
 | `retrain.cv_gate_failed` | monitor | 1 if the challenger passed the holdout margin but its CV did not beat every baseline (README §16.12); 0 on every other pass |
 | `retrain.cooldown` | monitor | 1 if a trigger fired but the 7-day cooldown after a rejected challenger held the pass (nothing trained); 0 on every other pass |
+| `retrain.rolled_back` | monitor | 1 on the pass in which the post-promotion check rolled a new champion back (README §16.12); 0 on every other pass |
+| `post_promotion.pending` | monitor | 1 while a new champion waits for its 7 scored target days (no new challenger is trained meanwhile); 0 otherwise |
+| `post_promotion.improvement_pct` (tag `previous_version`) | monitor | the new champion's MAE against the previous one's, both replayed from the same inputs on the new champion's scored hours (+ = lower); only while a comparison exists |
 | `monitor.skipped` | monitor | a backup run found today's pass already recorded |
 
 ## Setup (once, ~15 minutes)
@@ -76,8 +79,9 @@ so the alert e-mails you. Create them in this order.
 | 4 | Model error trigger fired | `max(last_1d):max:germany_load.trigger.fired{trigger:error,runner:github} > 0.5` | above 0.5 | off |
 | 5 | A job failed | `max(last_1h):max:germany_load.job.failed{runner:github} by {job} > 0.5` | above 0.5 — choose **Multi Alert** (one alert per job) | off |
 | 6 | Drift check unavailable | `max(last_1d):max:germany_load.drift.unavailable{runner:github} > 0.5` | above 0.5 | off |
+| 7 | Champion rolled back | `max(last_1d):max:germany_load.retrain.rolled_back{runner:github} > 0.5` | above 0.5 | off |
 
-Why these six:
+Why these seven:
 1. **Ingest stopped** — the external scheduler or the token broke; nothing else notices.
    No metrics at all for 3 h is itself the alert (the "no data" option).
 2. **Stale data** — ingest runs but SMARD stopped publishing (or a step keeps failing).
@@ -99,13 +103,20 @@ Why these six:
    monitor job (so accuracy is still scored), which also means a broken drift check stays
    green on GitHub. This happened once: a new pandas major broke Evidently's import
    (README §16.2).
+7. **Champion rolled back** — the post-promotion check found a new champion clearly worse
+   than the one it replaced on its first live days and promoted the old one back (README
+   §16.12). The loop has already acted; this tells a human, who decides whether the
+   rollback stands (`docs/operations.md`, *A champion was rolled back*). The gauge is 1
+   only on the pass that rolled back and 0 on every other pass, so with *no data* off and
+   a one-day window the monitor returns to OK by itself a day later.
 
 Use **Test Notifications** (bottom of the monitor page) once to check the e-mail arrives.
 
-The CV gate and the cooldown get no monitor: both are routine decisions of the retrain loop,
-and monitor 4 already tells a human when the error trigger fires. They are on the dashboard
-and in the events table. `retrain.cv_gate_failed` and `retrain.cooldown` are sent on every
-pass as 0 or 1, so a monitor added on them later recovers by itself.
+The CV gate, the cooldown and a pending post-promotion check get no monitor: they are
+routine states of the retrain loop, and monitor 4 already tells a human when the error
+trigger fires. They are on the dashboard and in the events table. `retrain.cv_gate_failed`,
+`retrain.cooldown` and `post_promotion.pending` are sent on every pass as 0 or 1, so a
+monitor added on them later recovers by itself.
 
 ## Dashboard
 
@@ -124,7 +135,7 @@ widgets (*Add widgets* → type → paste the query in the code editor):
 | Rows ingested per step | Timeseries (bars) | `sum:germany_load.ingest.rows{runner:github} by {step}` |
 | Job duration (s) | Timeseries | `max:germany_load.job.duration_seconds{runner:github} by {job}` |
 | Failed jobs | Timeseries (bars) | `sum:germany_load.job.failed{runner:github} by {job}` |
-| Monitor status | Monitor Summary | the six monitors above |
+| Monitor status | Monitor Summary | the seven monitors above |
 
 ## Turning it off
 Delete the `DD_API_KEY` secret: the jobs keep working and simply stop sending metrics.

@@ -227,8 +227,9 @@ Automated retraining here means a disciplined, guarded pipeline — not online l
 - **Data drift detection** — compare recent data (and features) against the training distribution with **Evidently**. Thresholds are calibrated against historical regime shifts rather than left at library defaults, so ordinary year-to-year variation does not trigger false alarms.
 - **Trigger** — retraining fires when rolling error crosses a threshold and the official forecast did no better on the same hours (a week that is hard for both is not decay) or exceeds twice that threshold whatever the official forecast did (a backstop for a broken model), when the official forecast beats the model by too much, or when drift is detected.
 - **Champion / challenger** — a challenger is trained on the latest data and evaluated against the champion on data that arrived *after* the champion's training window (a true out-of-time holdout).
-- **Promotion: two gates** — the challenger is promoted **only if it beats the champion on that holdout by a minimum margin** (3 % lower MAE) **and the cross-validation of its training recipe beats every seasonal-naive baseline**. Failing either keeps the champion. The model that is promoted is that recipe refit on all data, holdout included, so neither gate is an out-of-sample test of the exact model that serves; its first out-of-sample evidence is its live record (§16.12). The previous model is retained for one-step rollback.
-- **Cooldown** — after a rejected challenger, no new challenger is trained for 7 days while the same champion serves (any promotion ends it). The triggers are still evaluated, scored and recorded every day; only the comparison waits, because daily retries of nearly the same comparison would sooner or later pass the margin by luck (§16.12). A manual `force` run bypasses it, and says so.
+- **Promotion: two gates** — the challenger is promoted **only if it beats the champion on that holdout by a minimum margin** (3 % lower MAE) **and the cross-validation of its training recipe beats every seasonal-naive baseline**. Failing either keeps the champion. The model that is promoted is that recipe refit on all data, holdout included, so neither gate is an out-of-sample test of the exact model that serves; its first out-of-sample evidence is its live record (§16.12).
+- **Post-promotion check and rollback** — once a newly promoted champion has 7 complete target days of scored live forecasts, it is compared with the champion it replaced on exactly those hours. Both champions' forecasts for them are replayed from the same inputs, rebuilt for each issue. If the new champion's MAE is more than 5 % higher, the previous one is promoted back automatically, once, and the cooldown starts. A champion promoted by hand is never checked, and a horizon change is never rolled back (§16.12).
+- **Cooldown** — after a rejected challenger or a rollback, no new challenger is trained for 7 days while the same champion serves (any promotion ends it). The triggers are still evaluated, scored and recorded every day; only the comparison waits, because daily retries of nearly the same comparison would sooner or later pass the margin by luck (§16.12). A manual `force` run bypasses it, and says so.
 - **Every decision is logged** to MLflow and a monitoring-events table, and shown on the dashboard.
 
 This loop is why the system is designed to keep running (hourly ingestion, a daily check), because a retraining trigger is only meaningful once fresh data has had time to accumulate.
@@ -288,7 +289,7 @@ germany-electricity-load-forecasting-mlops/
 │   ├── features/                  # build_features, horizons (leakage-safe, horizon-aware)
 │   ├── models/                    # baselines, train, evaluate, registry, tracking
 │   ├── serving/                   # api (FastAPI), forecast, batch_forecast
-│   ├── monitoring/                # drift, performance, fair_backtest, retrain, promotion
+│   ├── monitoring/                # drift, performance, fair_backtest, retrain, promotion, margin_replay
 │   └── observability.py           # optional job metrics -> Datadog
 ├── dashboard/
 │   ├── app.py                     # Streamlit dashboard
@@ -486,7 +487,7 @@ The guarded retraining path ran for real in October:
 
 The scheduler problem in §16.1 ran for four weeks and was found by reading the Actions history by hand: no job ever *failed*, so nothing alerted. The same blind spot covers a job that never starts, an ingest that runs but writes nothing, data that stops arriving, or a model that slowly degrades. Crash e-mails cannot see any of those.
 
-So each job now reports a few metrics to **Datadog** when it ends — rows written per step, data freshness, forecast age, job duration and outcome, live model and official MAPE, drift share, trigger states and retrain decisions (`src/observability.py`). There is no agent (runners are temporary); the job POSTs to Datadog's HTTP API, and a Datadog outage is logged but can never fail a job. Six monitors alert by e-mail:
+So each job now reports a few metrics to **Datadog** when it ends — rows written per step, data freshness, forecast age, job duration and outcome, live model and official MAPE, drift share, trigger states and retrain decisions (`src/observability.py`). There is no agent (runners are temporary); the job POSTs to Datadog's HTTP API, and a Datadog outage is logged but can never fail a job. Seven monitors alert by e-mail:
 
 | Monitor | Catches |
 |---|---|
@@ -496,6 +497,7 @@ So each job now reports a few metrics to **Datadog** when it ends — rows writt
 | Model error trigger fired (7-day MAPE over the champion's limit and the official forecast no better, or over twice the limit) | the model is degrading (the retrain loop reacts; this tells a human) |
 | A job failed | any failure, per job, in the same place as everything else |
 | Drift check unavailable | a drift check that errors but, by design, does not fail the monitor job |
+| Champion rolled back | the post-promotion check demoted a new champion (§16.12): the loop already acted, a human should know |
 
 Setup and the exact monitor queries: `docs/observability.md`. Without the `DD_API_KEY` secret nothing is sent, so local runs, tests and forks are unaffected.
 
@@ -654,12 +656,12 @@ Three limits remain, each narrower than the old caveat:
 - **Where the numbers live:** only here, because Actions logs expire.
 - **To re-run it:** `docs/operations.md` (*Run the fair backtest*).
 
-### 16.12 The promotion policy: a CV gate, a cooldown, and what the holdout cannot judge
+### 16.12 The promotion policy: a CV gate, a cooldown, and a check on the live record
 
 **The problem.** Until November 2026 a fired trigger trained a challenger and promoted it if its MAE on the holdout (the data after the champion's training window, at most 14 days) was at least 3 % lower than the champion's. Three weaknesses:
 - the cross-validation of the challenger's recipe was computed and logged, but gated nothing: a recipe that loses to "same hour last week" over the last year could still be promoted on two good weeks;
 - a rejected challenger was retried every day while the trigger kept firing (§16.3: five "kept" in a week);
-- the promoted model is not the model that was evaluated (below).
+- the promoted model is not the model that was evaluated (below), and nothing undid a promotion that turned out worse live.
 
 **Rule 1: the CV gate.** A challenger that passes the margin is promoted only if the expanding-window cross-validation of its training recipe, on all data, beats every seasonal-naive baseline on mean MAE (for D+1: "same hour 2 days ago" and "same hour last week"). It is the bar the first champion had to clear. If not, the decision is `kept`, and the reason names the baseline it lost to, with both MAEs. A dry run now evaluates this gate too, so "promoted (dry-run)" means what a real run would do; it takes a few minutes longer.
 
@@ -667,13 +669,86 @@ Three limits remain, each narrower than the old caveat:
 - **Why.** Each daily retry compares an almost identical candidate with the same champion on a holdout that has moved by one day out of 14. That is not new evidence, only another draw of the same noise. With enough draws, one passes the 3 % margin by luck: the multiple-testing problem. The cooldown bounds the looks to about one a week, and each new look has at least 7 new days in its holdout.
 - **What it does not do.** It does not make the looks independent, and it does not give the margin a fixed false-promotion rate. It reduces how often the coin is tossed.
 - **Calendar days**, not 7 × 24 h: the daily pass starts at a slightly different time each day, and a pass a few minutes earlier than the rejecting one would otherwise be held a day longer.
-- **What starts it.** Only a real rejection. A `skipped` comparison compared nothing, and a dry run's decision (`kept (dry-run)`) never changes what later passes do.
+- **What starts it.** A real rejection, or a rollback (rule 3). A `skipped` comparison compared nothing, and a dry run's decision (`kept (dry-run)`) never changes what later passes do.
 - **Only for the champion it was decided against.** A rejection says "this champion is not beaten by this recipe on this data", nothing about another champion. It counts only if it was decided against the version that serves now, and that version has not been promoted since. So any promotion — automatic, forced, or by hand through `bootstrap` or `registry --promote`, including a version promoted back — ends a running cooldown.
 - **`force`.** A manual run with mode `force` bypasses the cooldown: a human asked for the comparison. The bypass is logged, stored with the pass and shown on the dashboard.
 
-**What the holdout cannot judge.** The holdout judges a candidate trained *before* the holdout. If it wins, the same recipe is refit on everything, holdout included, and that refit is what serves. The holdout cannot judge it: the refit has seen those hours. The cross-validation describes the recipe over the last year, not the refit either. So neither gate is an out-of-sample test of the promoted model. Its first out-of-sample evidence is its own live record, and nothing checks that record automatically yet.
+**What the holdout cannot judge.** The holdout judges a candidate trained *before* the holdout. If it wins, the same recipe is refit on everything, holdout included, and that refit is what serves. The holdout cannot judge it: the refit has seen those hours. The cross-validation describes the recipe over the last year, not the refit either. So neither gate is an out-of-sample test of the promoted model. Its first out-of-sample evidence is its own live record. Rule 3 checks that record.
 
-**Where to see it.** The `monitoring_events` table and the dashboard's retraining timeline (`cooldown`, `kept`, `kept (dry-run)`), MLflow tags `cv_gate` and `cooldown` on each pass, and Datadog gauges `retrain.cv_gate_failed` and `retrain.cooldown`, sent on every pass as 0 or 1.
+**Rule 3: the post-promotion check, with one automatic rollback** (`src/monitoring/promotion.py`).
+- **Which promotions.** Only those made by the retrain loop, forced ones included, and each once. A champion promoted by hand (`bootstrap`, `registry --promote`) is never checked: it is a human decision made on more evidence than a week (the CV and the one-year fair backtest), it is how a horizon or the training code changes, and it is how a rollback is undone. The job must never fight the operator.
+- **Which hours.** The new champion's scored hours, by the rule of the live record (§16.9): the latest issue made by its deadline, with an actual and an official forecast. The check waits for its first 7 complete Berlin target days, so the verdict comes about 9 days after a promotion. A day is complete when it is over and at least 90 % of its 23, 24 or 25 hours are scored; a day with late or missing forecasts is skipped, not counted, so the verdict always rests on about 7 × 24 hours. Only issues made after the promotion count, and the wait is measured from it (the promotion time recorded with the model export).
+- **Both champions are replayed.** The previous champion issued no forecasts after it was demoted, so its forecasts must be replayed. It is loaded from the database export (MLflow's model files do not survive the runner). For each issue of the new champion, the features are rebuilt from what that issue read: the per-city weather stored with the issue (§16.9), the load stamped at or before the issue time, and the calendar. The new champion is replayed from the same rebuilt features, and the verdict compares the two replays. Both models see the same inputs on the same hours; only the model differs. The new champion's live forecasts are not what is judged (next point).
+- **No leakage.**
+  1. A feature the horizon allows uses load at least 48 h old (D+1), and the live issue exists only because the forecast job accepted it, so every lag it needs is at or before that issue's latest actual.
+  2. The replay cuts load at the issue time anyway. A lag that would need later load is missing, and the hour is dropped, never filled.
+  3. Weather comes only from the issue's own stored rows, never from `weather_hourly`, where the archive has since replaced the forecasts.
+  4. Both models' training windows must end before the first scored hour, or the comparison is refused.
+  5. The actuals of the scored hours are used for scoring only.
+- **Why the live forecasts are not compared, and parity is not a gate.** `load_actual` keeps one value per hour. The hourly re-ingest overwrites it in place, without keeping the old value, and stamps `ingested_at` again. SMARD revises recent values. So the replay reads today's value of each load lag, not the value the issue read, and the value the issue read cannot be recovered.
+  - **What the rehearsal found.** The first version of the check compared the new champion's *live* forecasts with the previous champion's replay. It required the new champion's replay to match its stored forecast within 1 MW ("parity"), and there was no verdict if more than 10 % of the hours did not match. On the Neon rehearsal (record below), comparing v3 with v2 over the 7 complete target days of the issues from 5 to 11 Nov 2026, only 103 of 168 hours matched. The largest difference was 2,278 MW, so the result was `inconclusive`. Hours that did not match, per issue: 5 Nov 4, 6 Nov 16 (largest 2,278 MW), 7 Nov 15 (2,242 MW), 8 Nov 6, 9 Nov 10, 10 Nov 13 (1,770 MW), 11 Nov 1 (6.8 MW). The two later issues, outside the 7 days, had 2 each (the 13 Nov issue had 15 of its hours scored so far). The mismatches were spread over the hours of the day, mostly 06–14 UTC. No hour lacked its stored weather or a load lag, and `load_actual` had no gaps. The lags, about 2 days old at each issue, had been revised after it. On the 103 matching hours, v3 had an MAE of 1,194 MW, v2 1,144 MW and the official forecast 2,814 MW (−4.4 % for v3).
+  - **So parity cannot be a gate.** Comparing live forecasts with a replay compares two models on different inputs. Dropping the hours that do not match left 61 % of them here, and the hours left are the ones SMARD happened not to revise.
+  - **What is compared instead.** Both champions are replayed from the same rebuilt inputs, on the new champion's scored hours, with the same selection of hours and the same 90 % full-day rule. Only hours that cannot be rebuilt are left out: no weather stored with the issue, or a load lag missing. If more than 10 % of the hours are left out, there is no verdict.
+  - **Why this is the right comparison.** It compares the models and nothing else. It is also how the margin replay below sized the 5 %: two models scored on the same stored inputs. A revision changes a value of an hour before the issue, never a scored hour, and both models read the revised value.
+  - **Parity stays in the report, as information.** The report gives the hours the new champion's replay matches its stored forecast within 1 MW, the largest difference, and the new champion's live MAE next to its replayed MAE on the same hours, so the effect of the revisions is visible.
+- **The rule.** If the new champion's replayed MAE is more than 5 % above the previous one's on those hours, the previous champion is promoted back through the usual registry path (MLflow alias first, database pointer last), inside the daily monitor-retrain job, which shares the `promotion` concurrency group with `bootstrap`. Otherwise the promotion is `confirmed`. Either way one `post_promotion` event closes the check.
+- **No flapping.** One verdict per promotion. A rollback starts the cooldown for the champion it restored, and the pass that rolls back trains no challenger, even when forced, and even if its verdict could not be written (the job then fails, and the next pass records the missing `rolled_back` verdict, marked as recovered and dated at the rollback, so the record and the cooldown are right). While a check is pending no new challenger is trained either (`force` bypasses that), so there is never more than one unverified champion. A rolled-back version promoted again by hand is left alone.
+- **On doubt, nothing moves.** The check closes as `inconclusive`, with the champion kept, when the two models have different horizons (a deliberate horizon change, like v1 → v2, is never rolled back), when the previous champion's export has been pruned or is corrupt, when more than 10 % of the hours cannot be rebuilt, or when 7 complete days have not accumulated within 21 days. Any other failure to load or replay the previous champion fails the job and is retried the next day; after 21 days it closes the check as `inconclusive` with the error as the reason, so a broken export cannot hold retraining for ever.
+- **Dry run and check-only** report the verdict and change nothing: no pointer, no alias, no event, no cooldown.
+
+**What 7 days and 5 % can and cannot claim.** Seven target days hold each weekday once, and they are the block the fair backtest treats as one unit, because daily errors are correlated (§16.11). One block gives no interval, so there is no significance test here and none is claimed. The margin is a practical threshold for "clearly worse". It is above the 3 % promotion margin because a false rollback throws away a model that passed two gates.
+
+It was sized with a replay (`python -m src.monitoring.margin_replay`): at 26 cut points, 14 days apart, from 18 Nov 2025 to 3 Nov 2026, a model trained up to the cut was compared with one trained 28 days less, on the 7 days after the cut, with the champion's D+1 training code.
+
+| Newer model's MAE vs the older one's, one week | |
+|---|---|
+| Median | −0.0 % |
+| Range | −12.3 % (better) to +4.9 % (worse) |
+| Standard deviation | 5.7 points |
+| Worse by more than 3 % | 5 of 26 weeks |
+| Worse by more than 5 % | 0 of 26 weeks |
+| Worse by more than 8 % | 0 of 26 weeks |
+
+So a 3 % margin would have rolled back about one honest retrain in five, and 5 % none. The reading has limits:
+- 5 % is outside what the replay saw, but only just: the worst week was +4.9 %, and four more lay between +3.8 and +4.7 %. Zero of 26 does not mean never.
+- The 26 cut points share training data, so they are not independent draws.
+- The newer model in the replay is not selected. A real promotion has also passed the holdout margin and the CV gate, which pushes the replay towards overstating how often a real one would be rolled back.
+- But the replay measures a quieter statistic than the live check. It scores full weeks of 168 consecutive UTC hours, with the stored weather (mostly measured). The live check scores Berlin target days with the weather forecast each issue read, and may leave out up to 10 % of the hours. Forecast weather and fewer hours both add noise the replay never saw. So the live false-rollback rate can be higher than the replay's 0 of 26, and the two effects do not cancel in any known proportion.
+- Run on a local copy of the data on 11 Nov 2026 (actuals to 10 Nov 07:00 UTC).
+
+The margin stays at 5 %. A false rollback is cheap: it keeps a champion that already served, and one command undoes it. It will be revisited after the first real verdicts, which the check records with the numbers behind them.
+
+**The rehearsal on a Neon branch (14 Nov 2026).** The check and the rollback were rehearsed on `rehearse-rollback`, a branch of production, before the change was merged. Runbook: `docs/operations.md` (*Rehearsal on a Neon branch*).
+- **The setup.** v3 was promoted by hand, so the check does not apply to it. On the branch only, a fabricated automatic promotion v2 → v3 was recorded at 2026-11-05 05:41:21Z, one minute before the first issue with stored weather (05:42:21Z), and v3's `promoted_at` was set to the same time.
+- **The rollback passes.** They ran with a margin of −100 %, so the write path runs whatever the numbers say.
+
+| Rehearsal (`rehearse-rollback`) | |
+|---|---|
+| Step 4, first run: v3's live forecasts vs v2's replay, parity as a gate | 7 of 7 days, 168 hours; parity 103 of 168 within 1 MW (largest difference 2,277.7 MW) → `inconclusive`. Cause: SMARD revisions overwrite `load_actual` in place. This led to the change above: both champions replayed |
+| Step 4 after that change (report only) | 7 of 7 days, 168 hours, none left out. v3 MAE 1,329 MW vs v2 1,194 MW, both replayed: −11.3 %, so `roll_back` at the 5 % margin. Official forecast: 3,011 MW. v3's live MAE 1,540 MW vs replayed 1,329 MW; parity 103 of 168 (information only) |
+| Step 6, first attempt | Two faults, both fixed before the run below. (1) The check crashed in MLflow's input-schema check: the NaN rows of issues without stored weather turned the integer calendar columns into float64; the replayed rows now keep the feature code's dtypes. (2) It reached days without stored weather, because it starts at `promoted_at`; runbook step 5 now moves v3's `promoted_at` |
+| Step 6: dry run, then the real pass | Dry run: `ROLLED_BACK (REPORT ONLY)`, champion unchanged. Real pass: `ROLLED_BACK`; alias `champion` → 2, v2 is the champion in `model_artifacts`, tag `post_promotion = rolled_back` on v3, exactly one `post_promotion` event |
+| Step 7: the real pass again | `NOT_APPLICABLE` (the verdict is already recorded); still v2 |
+| Step 8: `registry --promote 3`, then a check-only pass | v3 is the champion, alias 3; the check says `NOT_APPLICABLE` (the latest automatic promotion already has its verdict) |
+| Step 9: production (`main`) | Unchanged: v3 is the champion, `promoted_at` 2026-11-02 10:45:15.800182Z, alias 3, 0 `post_promotion` events, 0 rehearsal rows |
+
+**What the −11.3 % does and does not say.**
+- On this week, v3 replayed is 11.3 % worse than v2 replayed, beyond the margin replay's worst week (+4.9 %). Had v3 been promoted automatically, the check would have rolled it back.
+- But v2 → v3 is not what the margin replay models: the same recipe trained on 28 more days. v3 is v2's recipe with the refit of §16.7, and their training windows end 19 hours apart (CV MAPE 2.84 % for v3, 2.87 % for v2). So this week neither confirms nor refutes how the 5 % was sized.
+- It is also one week: one block, with no interval (above).
+- v3 was promoted by hand, so in production the check does not apply to it and nothing changes. Before anything is decided about v3, a longer read-only comparison over 21 days is planned: `python -m src.monitoring.promotion --version 3 --previous 2 --since "2026-11-05 05:41" --days 21`. It needs issues with stored weather, so it can run once 21 complete target days have accumulated since 5 Nov, in late November.
+
+**What is not covered.**
+- Between a promotion and its verdict, about 9 days, a clearly broken champion is not rolled back automatically. The error trigger and its Datadog monitor tell a human, and the manual rollback is one command (`docs/operations.md`).
+- The verdict judges the two models on today's values of the load lags. It does not judge the forecasts the new champion actually served. When SMARD revises those lags, the two can differ: by up to 2,278 MW in one hour in the rehearsal above. The report shows by how much.
+- **Only promotions whose window has stored weather.** Issues before 5 Nov 2026 stored no weather (revision `0003`, §16.9) and cannot be replayed. A promotion can be checked only if its whole check window, the issues after it, has stored weather. Every automatic promotion from 5 Nov 2026 on meets that. A window that reached earlier issues would lose each such issue's day and close as `inconclusive` once more than 10 % of the hours are left out. This is why the rehearsal moves v3's promotion time to 5 Nov (`docs/operations.md`, step 5).
+- **To do: store each issue's load inputs**, as each issue's weather is stored (§16.9), so that a later replay reads exactly what the issue read and the live forecasts can be judged directly. This needs a migration.
+
+**Where to see it.**
+- The `monitoring_events` table and the dashboard's retraining timeline: `cooldown`, `kept`, `kept (dry-run)` on a pass; `confirmed`, `rolled_back`, `inconclusive` as events of their own kind, `post_promotion`. The new kind and decisions are free text that fits the existing columns, so there was no schema change.
+- MLflow: tags `cv_gate`, `cooldown` and `post_promotion` on each pass, and a `post_promotion` tag on the model version that was judged.
+- Datadog: `retrain.cv_gate_failed`, `retrain.cooldown`, `retrain.rolled_back` and `post_promotion.pending`, sent on every pass as 0 or 1, so a monitor on any of them recovers on the next pass. One monitor was added, "Champion rolled back" (§16.4).
+- Any two exported versions of one horizon can be compared by hand, without writing anything: `python -m src.monitoring.promotion --version <new> --previous <old>`.
 
 ---
 

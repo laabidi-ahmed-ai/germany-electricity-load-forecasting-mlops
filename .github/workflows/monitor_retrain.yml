@@ -4,7 +4,9 @@
 # Evidently drift check, and - only if a trigger fires - trains a challenger and promotes
 # it only if it beats the champion by the configured margin and its CV beats every
 # baseline. After a rejected challenger, a 7-day cooldown holds new ones (mode force
-# bypasses it; README §16.12). Every decision is written to
+# bypasses it; README §16.12). A champion promoted by this job is checked on its first 7
+# live target days and rolled back, once, if clearly worse than the one it replaced; the
+# rollback runs here, inside the promotion concurrency group. Every decision is written to
 # the monitoring_events table and to MLflow (backend store = the cloud Postgres, so the
 # lineage survives the ephemeral runner; the promoted model is exported to the DB).
 #

@@ -123,6 +123,26 @@ def test_promoting_the_same_version_again_ends_the_cooldown(engine) -> None:
     again = REJECTED + pd.Timedelta(days=2)
     got = state(engine, REJECTED + pd.Timedelta(days=3), version="5", promoted_at=again)
     assert not got.active and "predates the promotion of v5 on 2026-10-07" in got.detail()
+    assert got.detail().startswith("latest rejection (2026-10-05)")
+
+
+def test_an_ended_rollback_cooldown_says_rollback_not_rejection(engine) -> None:
+    record(
+        engine,
+        REJECTED,
+        kind=db.EVENT_POST_PROMOTION,
+        decision=db.DECISION_ROLLED_BACK,
+        version="6",
+    )
+    with engine.begin() as conn:  # the verdict names the version it restored
+        from sqlalchemy import update
+
+        conn.execute(update(db.MonitoringEvent).values(details='{"previous_version": "5"}'))
+    held = state(engine, REJECTED + pd.Timedelta(days=1), version="5")
+    assert held.active and held.detail().startswith("v6 rolled back on 2026-10-05")
+    ended = state(engine, REJECTED + pd.Timedelta(days=1), version="7")
+    assert not ended.active
+    assert ended.detail() == "latest rollback (2026-10-05) was against v5; the champion is now v7"
 
 
 # --- The monitoring pass (CLI) ---

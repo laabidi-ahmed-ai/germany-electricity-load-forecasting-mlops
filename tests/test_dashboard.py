@@ -564,6 +564,72 @@ def test_latest_pass_dry_run_rejection_and_forced_bypass(engine: Engine) -> None
     )
 
 
+def post_report(label: str, reason: str = "r") -> dict:
+    return {"label": label, "reason": reason, "new_version": "6", "previous_version": "5"}
+
+
+def record_pass_with_post(engine: Engine, post: dict | None, *, version: str = "6") -> None:
+    db.insert_monitoring_event(
+        engine,
+        created_at=datetime(2024, 1, 2, 6, tzinfo=UTC),
+        as_of=datetime(2024, 1, 2, tzinfo=UTC),
+        kind=db.EVENT_CHECK,
+        triggered=False,
+        model_version=version,
+        details=json.dumps(
+            {"decision": {"checks": [], "drift": None}, "outcome": None, "post_promotion": post}
+        ),
+    )
+
+
+def test_latest_pass_that_rolled_the_champion_back(engine: Engine) -> None:
+    record_pass_with_post(engine, post_report("rolled_back"))
+    db.insert_monitoring_event(  # the verdict's own event, recorded just before the pass
+        engine,
+        created_at=datetime(2024, 1, 2, 5, 59, tzinfo=UTC),
+        as_of=datetime(2024, 1, 2, tzinfo=UTC),
+        kind=db.EVENT_POST_PROMOTION,
+        triggered=False,
+        decision=db.DECISION_ROLLED_BACK,
+        reason="v6 MAE 1,080 MW vs v5 1,000 MW",
+        model_version="6",
+    )
+    events = q.monitoring_events(engine)
+    check = q.latest_check(events)
+    assert check["kind"] == db.EVENT_CHECK  # a verdict is not a pass
+    assert check["model_version"] == "6" and check["champion_version"] == "5"  # after the pass
+    assert q.pass_headline(check) == "🟢 all triggers clear · ⏪ v6 rolled back to v5"
+    timeline = q.event_timeline(events)
+    assert list(timeline["kind"]) == [db.EVENT_CHECK, db.EVENT_POST_PROMOTION]
+    assert list(timeline["status"]) == ["ok", "rolled_back"]
+    assert timeline.loc[1, "reason"] == "v6 MAE 1,080 MW vs v5 1,000 MW"
+    # The hover names the role: a pass's champion, the version a verdict rolled back.
+    assert list(timeline["version_label"]) == ["champion v6", "rolled-back v6"]
+
+
+@pytest.mark.parametrize(
+    ("label", "note"),
+    [
+        ("pending", " · post-promotion check of v6 pending (3 of 7 complete target days scored)"),
+        ("confirmed", " · v6 confirmed against v5"),
+        ("inconclusive", " · post-promotion check of v6 closed without a verdict"),
+        ("rolled_back (report only)", " · post-promotion check of v6: rolled_back (report only)"),
+        ("not_applicable", ""),
+    ],
+)
+def test_latest_pass_post_promotion_notes(engine: Engine, label: str, note: str) -> None:
+    record_pass_with_post(engine, post_report(label, "3 of 7 complete target days scored"))
+    check = q.latest_check(q.monitoring_events(engine))
+    assert check["champion_version"] == "6"  # nothing moved
+    assert q.pass_headline(check) == "🟢 all triggers clear" + note
+
+
+def test_latest_pass_recorded_before_the_check_existed(engine: Engine) -> None:
+    record_pass(engine, kind=db.EVENT_CHECK, triggered=False, outcome=None)
+    check = q.latest_check(q.monitoring_events(engine))
+    assert check["post_promotion"] is None and q.post_promotion_note(check) == ""
+
+
 def test_latest_pass_clear_check_is_unchanged(engine: Engine) -> None:
     record_pass(engine, kind=db.EVENT_CHECK, triggered=False, outcome=None)
     check = q.latest_check(q.monitoring_events(engine))

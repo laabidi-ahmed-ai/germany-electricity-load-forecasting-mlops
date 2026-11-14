@@ -26,7 +26,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from config.settings import get_settings  # noqa: E402
 from dashboard import queries as q  # noqa: E402
-from src.data.db import EVENT_CHECK, EVENT_RETRAIN  # noqa: E402
+from src.data.db import EVENT_CHECK, EVENT_POST_PROMOTION, EVENT_RETRAIN  # noqa: E402
 
 CACHE_TTL_SECONDS = 10 * 60
 COLORS = {
@@ -476,7 +476,11 @@ def panel_monitoring(mon: dict[str, Any], tz: str) -> None:
         "cooldown": "#6b7280",
         "promoted (dry-run)": "#93c5fd",
         "kept (dry-run)": "#fcd34d",
+        "confirmed": COLORS["ok"],
+        "rolled_back": COLORS["bad"],
+        "inconclusive": "#6b7280",
     }
+    symbols = {"promoted": "diamond", "confirmed": "diamond", "rolled_back": "x"}
     fig = go.Figure()
     for status, g in timeline.groupby("status", sort=False):
         fig.add_trace(
@@ -488,10 +492,10 @@ def panel_monitoring(mon: dict[str, Any], tz: str) -> None:
                 marker={
                     "size": 13,
                     "color": palette.get(status, COLORS["actual"]),
-                    "symbol": "diamond" if status == "promoted" else "circle",
+                    "symbol": symbols.get(status, "circle"),
                 },
-                customdata=g[["model_version", "reason"]].fillna("").to_numpy(),
-                hovertemplate="%{x}<br>champion v%{customdata[0]}<br>%{customdata[1]}<extra>"
+                customdata=g[["version_label", "reason"]].fillna("").to_numpy(),
+                hovertemplate="%{x}<br>%{customdata[0]}<br>%{customdata[1]}<extra>"
                 + status
                 + "</extra>",
             )
@@ -501,7 +505,10 @@ def panel_monitoring(mon: dict[str, Any], tz: str) -> None:
         height=220,
         margin={"l": 10, "r": 10, "t": 10, "b": 10},
         xaxis_title=f"time ({tz})",
-        yaxis={"categoryorder": "array", "categoryarray": [EVENT_RETRAIN, EVENT_CHECK]},
+        yaxis={
+            "categoryorder": "array",
+            "categoryarray": [EVENT_POST_PROMOTION, EVENT_RETRAIN, EVENT_CHECK],
+        },
         legend={"orientation": "h", "y": 1.2, "x": 0},
     )
     st.plotly_chart(fig, width="stretch")

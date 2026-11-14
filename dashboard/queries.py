@@ -263,8 +263,14 @@ def latest_check(events: pd.DataFrame) -> dict[str, Any] | None:
     "champion_version" (champion after the pass), "triggered", "forced", "outcome"
     (promoted | kept | skipped | cooldown | promoted (dry-run) | kept (dry-run) | None),
     "cv_gate" (passed | failed | None when the CV did not run), "cooldown" (none | held |
-    bypassed), "checks": DataFrame, "drift": dict | None, "drift_error": str | None,
-    "drift_columns": DataFrame}`` or None.
+    bypassed), "post_promotion" (the pass's post-promotion report: ``label`` =
+    not_applicable | pending | confirmed | rolled_back | inconclusive, each of the last three
+    possibly " (report only)", plus ``reason``, ``new_version``, ``previous_version``; None for
+    passes recorded before the check existed), "checks": DataFrame, "drift": dict | None,
+    "drift_error": str | None, "drift_columns": DataFrame}`` or None.
+
+    Post-promotion verdicts are events of their own (``EVENT_POST_PROMOTION``); they are not
+    passes, so the newest pass still wins here.
     """
     passes = events[events["kind"].isin([db.EVENT_CHECK, db.EVENT_RETRAIN])]
     if passes.empty:
@@ -278,6 +284,9 @@ def latest_check(events: pd.DataFrame) -> dict[str, Any] | None:
     # A forced run is the only retrain that no trigger fired.
     forced = is_retrain and (outcome.get("triggers") == ["forced"] or not bool(row["triggered"]))
     champion_after = (promoted and outcome.get("challenger_version")) or row["model_version"]
+    post = details.get("post_promotion") or None
+    if post and post.get("label") == db.DECISION_ROLLED_BACK:  # this pass rolled it back
+        champion_after = post.get("previous_version") or champion_after
     checks = pd.DataFrame(
         decision.get("checks") or [], columns=["name", "fired", "value", "threshold", "detail"]
     )
@@ -302,6 +311,7 @@ def latest_check(events: pd.DataFrame) -> dict[str, Any] | None:
         "outcome": (outcome.get("decision") or None) if is_retrain else None,
         "cv_gate": None if cv_beats is None else ("passed" if cv_beats else "failed"),
         "cooldown": (outcome.get("cooldown") or "none") if is_retrain else "none",
+        "post_promotion": post,
         "checks": checks,
         "drift": drift,
         "drift_error": decision.get("drift_error"),
@@ -318,8 +328,30 @@ OUTCOME_TEXT = {
 }
 
 
+def post_promotion_note(check: dict[str, Any]) -> str:
+    """What the pass's post-promotion check said, if it said anything worth a line."""
+    post = check.get("post_promotion") or {}
+    label, new, previous = post.get("label"), post.get("new_version"), post.get("previous_version")
+    if label == db.DECISION_ROLLED_BACK:
+        return f" · ⏪ v{new} rolled back to v{previous}"
+    if label == "pending":
+        return f" · post-promotion check of v{new} pending ({post.get('reason')})"
+    if label == db.DECISION_CONFIRMED:
+        return f" · v{new} confirmed against v{previous}"
+    if label == db.DECISION_INCONCLUSIVE:
+        return f" · post-promotion check of v{new} closed without a verdict"
+    if label and label.endswith("(report only)"):
+        return f" · post-promotion check of v{new}: {label}"
+    return ""
+
+
 def pass_headline(check: dict[str, Any]) -> str:
-    """One status line for the latest pass: what fired and what the retrain did."""
+    """One status line for the latest pass: what fired, what the retrain did, and what the
+    post-promotion check said."""
+    return _retrain_headline(check) + post_promotion_note(check)
+
+
+def _retrain_headline(check: dict[str, Any]) -> str:
     if check["kind"] != db.EVENT_RETRAIN:  # e.g. --check-only: no champion/challenger ran
         if check["triggered"]:
             return "🔴 triggers fired (check only, no retrain)"
@@ -345,6 +377,7 @@ def event_timeline(events: pd.DataFrame) -> pd.DataFrame:
         "kind",
         "status",
         "model_version",
+        "version_label",
         "reason",
         "model_mape_7d",
         "official_mape_7d",
@@ -354,13 +387,24 @@ def event_timeline(events: pd.DataFrame) -> pd.DataFrame:
     if events.empty:
         return pd.DataFrame(columns=cols)
 
+    def version_label(row: pd.Series) -> str:
+        """Whose version the event names: a pass's champion, or the version a verdict judged."""
+        version = row["model_version"]
+        if version is None or (isinstance(version, float) and pd.isna(version)):
+            return ""
+        if row["kind"] == db.EVENT_POST_PROMOTION:
+            role = "rolled-back" if row["decision"] == db.DECISION_ROLLED_BACK else "checked"
+            return f"{role} v{version}"
+        return f"champion v{version}"
+
     def status(row: pd.Series) -> str:
-        if row["kind"] == db.EVENT_RETRAIN:
-            return str(row["decision"] or db.EVENT_RETRAIN)
+        if row["kind"] in (db.EVENT_RETRAIN, db.EVENT_POST_PROMOTION):
+            return str(row["decision"] or row["kind"])
         return "triggered" if row["triggered"] else "ok"
 
     out = events.assign(
         status=events.apply(status, axis=1),
+        version_label=events.apply(version_label, axis=1),
         on_time_pct_7d=events["details_parsed"].map(_on_time_pct_7d),
     )
     return out[cols].sort_values("created_at", ascending=False).reset_index(drop=True)

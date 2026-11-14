@@ -1012,6 +1012,43 @@ def test_decisions_are_logged_to_mlflow_and_db(engine, cfg, tmp_path, monkeypatc
     assert retrain_row["decision"] == "kept" and bool(retrain_row["triggered"])
     assert events["model_mape_7d"].notna().all()
     get_settings.cache_clear()
+    assert run.data.tags["post_promotion"] == "not run"
+
+    from src.monitoring import promotion
+
+    post = promotion.PostPromotionReport(
+        promotion.ROLL_BACK,
+        "worse",
+        "6",
+        5.0,
+        7,
+        previous_version="5",
+        comparison=promotion.Comparison(
+            "6",
+            "5",
+            7,
+            n_days=7,
+            n_hours=168,
+            n_compared=160,
+            n_parity=120,
+            new_mae=1_100.0,
+            new_live_mae=1_120.0,
+            previous_mae=1_000.0,
+            official_mae=2_000.0,
+            improvement_pct=-10.0,
+        ),
+    )
+    run = mlflow.MlflowClient().get_run(
+        retrain.log_decision(d, None, cfg, experiment="test-retrain", post=post)
+    )
+    assert run.data.tags["post_promotion"] == "rolled_back (report only)"
+    assert run.data.metrics["post_promotion_improvement_pct"] == -10.0
+    assert run.data.metrics["post_promotion_hours_compared"] == 160
+    assert run.data.metrics["post_promotion_parity_hours"] == 120
+    assert run.data.metrics["post_promotion_new_live_mae"] == 1_120.0
+    assert "post_promotion.json" in {
+        a.path for a in mlflow.MlflowClient().list_artifacts(run.info.run_id)
+    }
 
 
 def test_cli_check_only_and_force_dry_run(engine, cfg, monkeypatch, capsys) -> None:

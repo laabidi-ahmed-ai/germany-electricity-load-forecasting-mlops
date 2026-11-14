@@ -105,6 +105,21 @@ def _with_deadlines(model: pd.DataFrame) -> pd.DataFrame:
     return model.assign(deadline=deadline, on_time=model["issued_at"] <= deadline)
 
 
+def latest_on_time_issues(issues: pd.DataFrame, model_version: str | None = None) -> pd.DataFrame:
+    """Per hour, the row of the latest issue made by its deadline - the one that is scored.
+
+    ``issues`` comes from ``model_issues``; the result keeps its columns (``issued_at``
+    included), one row per ``timestamp_utc``. With ``model_version`` only that version's
+    issues compete. A late issue never wins, whatever else exists.
+    """
+    scored = issues[issues["on_time"]]
+    if model_version:
+        scored = scored[scored["model_version"] == str(model_version)]
+    return scored.sort_values(["timestamp_utc", "issued_at"]).drop_duplicates(
+        "timestamp_utc", keep="last"
+    )
+
+
 def with_model_forecast(
     engine: Engine,
     base: pd.DataFrame,
@@ -122,16 +137,12 @@ def with_model_forecast(
     if base.empty:
         return pd.DataFrame(columns=ALIGNED_COLUMNS)
     issues = model_issues(engine, base) if issues is None else issues
-    model = issues[issues["on_time"]]
-    if model_version:
-        model = model[model["model_version"] == str(model_version)]
+    model = latest_on_time_issues(issues, model_version)
     if model.empty:
         return pd.DataFrame(columns=ALIGNED_COLUMNS)
-    model = (
-        model.sort_values(["timestamp_utc", "issued_at"])
-        .drop_duplicates("timestamp_utc", keep="last")
-        .rename(columns={"forecast_mw": "model_mw"})[["timestamp_utc", "model_mw", "model_version"]]
-    )
+    model = model.rename(columns={"forecast_mw": "model_mw"})[
+        ["timestamp_utc", "model_mw", "model_version"]
+    ]
     out = base.merge(model, on="timestamp_utc")
     return out.sort_values("timestamp_utc").reset_index(drop=True)[ALIGNED_COLUMNS]
 
