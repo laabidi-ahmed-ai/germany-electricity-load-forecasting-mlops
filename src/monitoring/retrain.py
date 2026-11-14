@@ -30,15 +30,21 @@ What is evaluated is not exactly what is promoted. The holdout judges a candidat
 *before* the holdout; the promoted model is the same recipe refitted on everything, holdout
 included, so the holdout cannot judge it. The CV describes the recipe over the last year,
 not the promoted object either. Neither is an out-of-sample test of the model that serves:
-its first out-of-sample evidence is its own live record, and nothing checks that record yet.
+its first out-of-sample evidence is its own live record. The post-promotion check
+(``src.monitoring.promotion``) is that test: on every pass, once the new champion has
+``post_check_days`` complete target days of scored forecasts, it is compared with the
+previous champion on the same hours and rolled back if its MAE is more than
+``rollback_margin_pct`` higher. One verdict per automatic promotion; while it is pending no
+new challenger is trained, and a pass that rolls back trains none either.
 
 Cooldown (``src.monitoring.promotion``): after a real rejection, no new challenger for
 ``cooldown_days`` UTC calendar days, as long as the same champion serves (any promotion ends
-it). A fired trigger in that time still scores and records the pass, with decision
-``cooldown``. ``--force`` bypasses it, logged.
+it). A rollback starts one too. A fired trigger in that time still scores and records the
+pass, with decision ``cooldown``. ``--force`` bypasses it, logged.
 
 Every decision is logged to MLflow (tags ``stage=retrain``, ``decision``, ``reason``)
-and to the ``monitoring_events`` table.
+and to the ``monitoring_events`` table. ``--check-only`` and ``--dry-run`` report the
+post-promotion verdict without acting on it.
 
 CLI::
 
@@ -103,6 +109,11 @@ class RetrainConfig:
     min_improvement_pct: float = 3.0
     # no new challenger for this many UTC calendar days after a real rejection (0 = off)
     cooldown_days: int = promotion.DEFAULT_COOLDOWN_DAYS
+    # post-promotion check: complete target days needed, the MAE margin (%) beyond which the
+    # new champion is rolled back, and the days after which an unresolved check is closed
+    post_check_days: int = promotion.DEFAULT_POST_CHECK_DAYS
+    rollback_margin_pct: float = promotion.DEFAULT_ROLLBACK_MARGIN_PCT
+    post_check_max_wait_days: int = promotion.DEFAULT_MAX_WAIT_DAYS
     lgbm_params: dict[str, Any] | None = None
     cv_n_splits: int = evaluate.DEFAULT_N_SPLITS
     cv_val_hours: int = evaluate.DEFAULT_VAL_HOURS
@@ -436,7 +447,7 @@ def run_champion_challenger(
     )
     mv = registry.register_run_model(run_id)
     registry.promote(mv.version, engine=engine)
-    outcome.decision = "promoted"
+    outcome.decision = db.DECISION_PROMOTED
     outcome.challenger_version = str(mv.version)
     outcome.training_run_id = run_id
     log.info("promoted challenger v%s (rollback: --promote %s)", mv.version, champion.version)
@@ -468,6 +479,34 @@ def held_by_cooldown(
     )
 
 
+def post_promotion_hold(
+    post: promotion.PostPromotionReport | None, post_error: Exception | None, *, force: bool
+) -> str | None:
+    """Why this pass must not train a challenger because of the post-promotion check, or None.
+
+    A pass that rolled back never trains (one champion change per pass, even with
+    ``--force``), whether or not its verdict could be recorded: the champion loaded at the
+    start of the pass is no longer the champion. A pending or failed check holds new
+    challengers until it is resolved, so there is at most one unverified champion;
+    ``--force`` bypasses that.
+    """
+    if post is not None and post.rolled_back:
+        return (
+            f"v{post.new_version} was rolled back to v{post.previous_version} in this pass: "
+            "no challenger in the same pass"
+        )
+    if force:
+        return None
+    if post_error is not None:
+        return f"the post-promotion check failed ({post_error}): no new challenger until it runs"
+    if post is not None and post.pending:
+        return (
+            f"post-promotion check of v{post.new_version} is pending ({post.reason}): "
+            "no new challenger until it is resolved"
+        )
+    return None
+
+
 # --- Logging of decisions ---
 def _kind_and_reason(
     decision: TriggerDecision, outcome: ChallengerOutcome | None
@@ -484,6 +523,7 @@ def log_decision(
     cfg: RetrainConfig,
     *,
     experiment: str = DEFAULT_EXPERIMENT,
+    post: promotion.PostPromotionReport | None = None,
 ) -> str:
     """One MLflow run per monitoring pass: triggers, metrics, decision and reason."""
     import mlflow
@@ -501,6 +541,7 @@ def log_decision(
                 "reason": (reason or "no trigger")[:250],
                 "cv_gate": outcome.cv_gate if outcome else "not run",
                 "cooldown": outcome.cooldown if outcome else "none",
+                "post_promotion": post.label if post else "not run",
             }
         )
         mlflow.log_params({f"cfg_{k}": v for k, v in asdict(cfg).items() if k != "lgbm_params"})
@@ -532,6 +573,23 @@ def log_decision(
         if outcome is not None and outcome.cv_beats_all_baselines is not None:
             mlflow.log_metric("cv_beats_all_baselines", int(outcome.cv_beats_all_baselines))
             mlflow.log_metrics({f"cv_{m}_mae_mean": v for m, v in outcome.cv_mae.items()})
+        if post is not None and post.comparison is not None:
+            c = post.comparison
+            mlflow.log_metrics(
+                {"post_promotion_days": c.n_days, "post_promotion_hours_compared": c.n_compared}
+            )
+            if c.improvement_pct is not None:
+                mlflow.log_metrics(
+                    {
+                        "post_promotion_new_mae": c.new_mae,  # replayed, as the verdict uses
+                        "post_promotion_previous_mae": c.previous_mae,
+                        "post_promotion_improvement_pct": c.improvement_pct,
+                        "post_promotion_new_live_mae": c.new_live_mae,  # information
+                        "post_promotion_parity_hours": c.n_parity,
+                    }
+                )
+        if post is not None:
+            mlflow.log_dict(post.to_dict(), "post_promotion.json")
         mlflow.log_dict(decision.to_dict(), "trigger_decision.json")
         if outcome is not None:
             mlflow.log_dict(outcome.to_dict(), "challenger_outcome.json")
@@ -543,6 +601,7 @@ def record_event(
     decision: TriggerDecision,
     outcome: ChallengerOutcome | None,
     cfg: RetrainConfig = DEFAULT_CONFIG,
+    post: promotion.PostPromotionReport | None = None,
 ) -> int:
     w7 = decision.performance.window(cfg.error_window_days) if decision.performance else None
     kind, reason = _kind_and_reason(decision, outcome)
@@ -558,17 +617,24 @@ def record_event(
         official_mape_7d=None if w7 is None else w7.official_mape,
         drift_share=None if decision.drift is None else decision.drift.share_drifted,
         details=json.dumps(
-            {"decision": decision.to_dict(), "outcome": outcome.to_dict() if outcome else None},
+            {
+                "decision": decision.to_dict(),
+                "outcome": outcome.to_dict() if outcome else None,
+                "post_promotion": post.to_dict() if post else None,
+            },
             default=str,
         ),
     )
 
 
 def report_metrics(
-    metrics: JobMetrics, decision: TriggerDecision, outcome: ChallengerOutcome | None
+    metrics: JobMetrics,
+    decision: TriggerDecision,
+    outcome: ChallengerOutcome | None,
+    post: promotion.PostPromotionReport | None = None,
 ) -> None:
-    """Live accuracy and punctuality, drift, trigger states and the retrain decision, tagged by
-    champion."""
+    """Live accuracy and punctuality, drift, trigger states, the retrain decision and the
+    post-promotion check, tagged by champion."""
     champion = f"v{decision.champion_version}"
     if decision.performance is not None:
         for w in decision.performance.windows:
@@ -590,6 +656,19 @@ def report_metrics(
     cv_failed = outcome is not None and outcome.cv_gate == "failed"
     metrics.gauge("retrain.cv_gate_failed", int(cv_failed), model_version=champion)
     metrics.gauge("retrain.cooldown", int(held), model_version=champion)
+    rolled_back = post is not None and post.rolled_back
+    metrics.gauge("retrain.rolled_back", int(rolled_back), model_version=champion)
+    pending = post is not None and post.pending
+    metrics.gauge("post_promotion.pending", int(pending), model_version=champion)
+    if post is not None and post.comparison is not None:
+        gain = post.comparison.improvement_pct
+        if gain is not None:  # new champion vs the previous one on the same hours
+            metrics.gauge(
+                "post_promotion.improvement_pct",
+                gain,
+                model_version=champion,
+                previous_version=f"v{post.previous_version}",
+            )
     if outcome is not None:  # promoted | kept | skipped; promoted and kept may be " (dry-run)"
         decision_tag = outcome.decision.split(" ")[0]
         dry_run = str("dry-run" in outcome.decision).lower()
@@ -628,6 +707,18 @@ def main(argv: list[str] | None = None) -> int:
         default=RetrainConfig.cooldown_days,
         help="no new challenger for this many UTC days after a rejected one (0 = off)",
     )
+    p.add_argument(
+        "--post-check-days",
+        type=int,
+        default=RetrainConfig.post_check_days,
+        help="complete target days a new champion is scored on before its verdict",
+    )
+    p.add_argument(
+        "--rollback-margin",
+        type=float,
+        default=RetrainConfig.rollback_margin_pct,
+        help="roll a new champion back if its MAE is more than this %% above the previous one's",
+    )
     p.add_argument("--no-mlflow", action="store_true")
     p.add_argument(
         "--once-per-day",
@@ -645,6 +736,8 @@ def main(argv: list[str] | None = None) -> int:
         holdout_days=args.holdout_days,
         min_improvement_pct=args.min_improvement,
         cooldown_days=args.cooldown_days,
+        post_check_days=args.post_check_days,
+        rollback_margin_pct=args.rollback_margin,
     )
     with job_metrics("monitor") as metrics:
         engine = db.get_engine(args.database_url)
@@ -668,18 +761,44 @@ def main(argv: list[str] | None = None) -> int:
         print()
         print(decision.summary())
 
+        # The champion's own promotion first: its verdict decides what else this pass may do.
+        record = registry.champion_record(engine)
+        promoted_at = record["promoted_at"] if record else None
+        post: promotion.PostPromotionReport | None = None
+        post_error: Exception | None = None
+        try:
+            post = promotion.post_promotion_check(
+                engine,
+                champion,
+                decision.as_of,
+                days=cfg.post_check_days,
+                margin_pct=cfg.rollback_margin_pct,
+                max_wait_days=cfg.post_check_max_wait_days,
+                champion_promoted_at=promoted_at,
+                act=not (args.check_only or args.dry_run),
+            )
+            print()
+            print(post.summary())
+        except promotion.VerdictNotRecordedError as err:  # rolled back, but no event written
+            post, post_error = err.report, err
+            log.exception("post-promotion verdict could not be recorded")
+            print()
+            print(post.summary())
+        except Exception as err:  # score and record the pass first; the job fails at the end
+            post_error = err
+            log.exception("post-promotion check failed")
+
         outcome: ChallengerOutcome | None = None
         if not args.check_only and (decision.triggered or args.force):
             triggers = decision.reasons or (["forced"] if args.force else [])
-            record = registry.champion_record(engine)  # promoted_at: any promotion ends it
+            hold = post_promotion_hold(post, post_error, force=args.force)
+            # promoted_at: any promotion ends a cooldown (read before a rollback moved it)
             cooldown = promotion.cooldown_state(
-                engine,
-                decision.as_of,
-                cfg.cooldown_days,
-                champion.version,
-                record["promoted_at"] if record else None,
+                engine, decision.as_of, cfg.cooldown_days, champion.version, promoted_at
             )
-            if cooldown.active and not args.force:
+            if hold is not None:
+                outcome = ChallengerOutcome("skipped", hold, champion.version, triggers=triggers)
+            elif cooldown.active and not args.force:
                 outcome = held_by_cooldown(cooldown, champion.version, triggers)
             else:
                 if cooldown.active:
@@ -701,10 +820,12 @@ def main(argv: list[str] | None = None) -> int:
         elif not args.check_only:
             print("\nNo trigger fired - champion kept, nothing retrained.")
 
-        record_event(engine, decision, outcome, cfg)
-        report_metrics(metrics, decision, outcome)
+        record_event(engine, decision, outcome, cfg, post)
+        report_metrics(metrics, decision, outcome, post)
         if not args.no_mlflow:
-            print(f"\nMLflow run: {log_decision(decision, outcome, cfg)}")
+            print(f"\nMLflow run: {log_decision(decision, outcome, cfg, post=post)}")
+        if post_error is not None:  # everything else is recorded: now fail the job
+            raise RuntimeError(f"post-promotion check failed: {post_error}") from post_error
     return 0
 
 

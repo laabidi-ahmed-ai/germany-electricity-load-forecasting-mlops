@@ -69,10 +69,19 @@ SOURCE_SMARD = "smard"
 # champion/challenger (triggered or forced) is a retrain. Here so the dashboard can share them.
 EVENT_CHECK = "check"
 EVENT_RETRAIN = "retrain"
+# The verdict of a post-promotion check (``src.monitoring.promotion``): written once per
+# automatic promotion, when the check is resolved - never by a pass, a dry run or a check-only.
+EVENT_POST_PROMOTION = "post_promotion"
 # ``decision`` of a retrain event that the promotion policy reads back: a real rejection
-# starts the cooldown; a pass the cooldown held trained nothing.
+# starts the cooldown; a pass the cooldown held trained nothing; a promotion opens a
+# post-promotion check.
 DECISION_KEPT = "kept"
 DECISION_COOLDOWN = "cooldown"
+DECISION_PROMOTED = "promoted"
+# ``decision`` of a post-promotion event.
+DECISION_CONFIRMED = "confirmed"
+DECISION_ROLLED_BACK = "rolled_back"
+DECISION_INCONCLUSIVE = "inconclusive"
 
 
 # --- UTC handling ---
@@ -235,7 +244,10 @@ class MonitoringEvent(Base):
     """One row per monitoring / retraining decision (the dashboard's event timeline).
 
     ``kind`` = ``EVENT_CHECK`` (performance + drift evaluation) | ``EVENT_RETRAIN`` (the same
-    plus the champion/challenger outcome). ``details`` holds the full JSON summary.
+    plus the champion/challenger outcome) | ``EVENT_POST_PROMOTION`` (the verdict on a new
+    champion's first live days). ``details`` holds the full JSON summary. ``kind`` and
+    ``decision`` are free text of 16 and 32 characters: a new value needs no migration, but
+    must fit (tests/test_post_promotion.py pins the lengths).
     """
 
     __tablename__ = "monitoring_events"
