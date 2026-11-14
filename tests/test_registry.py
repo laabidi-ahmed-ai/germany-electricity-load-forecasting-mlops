@@ -146,6 +146,67 @@ def test_loading_uses_the_cache_and_detects_corruption(env) -> None:
         )
 
 
+def test_load_version_loads_a_non_champion_export(env, tmp_path) -> None:
+    """The previous champion stays loadable from the database after it is demoted."""
+    engine = env["engine"]
+    old = registry.champion_record(engine)["version"]
+    mv = registry.register_run_model(env["run_id"])
+    registry.promote(mv.version, engine=engine)
+
+    previous = registry.load_version(engine, old, cache_dir=tmp_path)
+    assert previous.version == old and previous.alias is None
+    assert previous.horizon == DAY_AHEAD and previous.train_end is not None
+    df = env["frame"]
+    np.testing.assert_allclose(
+        previous.predict(df.head(20)), env["model"].predict(df.head(20)), rtol=1e-6
+    )
+    champion = registry.load_version(engine, mv.version, cache_dir=tmp_path)
+    assert champion.alias == registry.CHAMPION_ALIAS
+    assert registry.load_champion(engine, cache_dir=tmp_path).version == champion.version
+
+    with pytest.raises(LookupError, match="not exported in the database"):
+        registry.load_version(engine, "9999", cache_dir=tmp_path)
+
+    from sqlalchemy import update
+
+    where = (db.ModelArtifact.name == previous.name, db.ModelArtifact.version == old)
+    good = db.get_model_artifact(engine, previous.name, old)["bundle_sha256"]
+    with engine.begin() as conn:
+        conn.execute(update(db.ModelArtifact).where(*where).values(bundle_sha256="0" * 64))
+    with pytest.raises(registry.CorruptBundleError, match="corrupt"):
+        registry.load_version(engine, old, cache_dir=tmp_path)
+    with engine.begin() as conn:  # restore
+        conn.execute(update(db.ModelArtifact).where(*where).values(bundle_sha256=good))
+
+
+def test_the_cache_never_serves_another_registrys_version(env, tmp_path) -> None:
+    """Version numbers repeat across databases; the cached folder must match the bundle."""
+    engine = env["engine"]
+    row = registry.champion_record(engine)
+    folder = tmp_path / row["name"] / f"v{row['version']}"
+
+    # A folder left by another database's version of the same number: no marker, junk inside.
+    folder.mkdir(parents=True)
+    (folder / "MLmodel").write_text("not this model", encoding="utf-8")
+    (folder / "stale.txt").write_text("x", encoding="utf-8")
+    champ = registry.load_champion(engine, cache_dir=tmp_path)
+    assert not (folder / "stale.txt").exists()  # rebuilt from the database's bundle
+    assert (folder / registry.CACHE_MARKER).read_text(encoding="utf-8") == row["bundle_sha256"]
+    df = env["frame"]
+    np.testing.assert_allclose(
+        champ.predict(df.head(5)), env["model"].predict(df.head(5)), rtol=1e-6
+    )
+
+    # A marker naming another bundle: rebuilt as well. The right marker: reused as is.
+    (folder / registry.CACHE_MARKER).write_text("f" * 64, encoding="utf-8")
+    (folder / "stale.txt").write_text("x", encoding="utf-8")
+    registry.load_champion(engine, cache_dir=tmp_path)
+    assert not (folder / "stale.txt").exists()
+    (folder / "kept.txt").write_text("x", encoding="utf-8")
+    registry.load_champion(engine, cache_dir=tmp_path)
+    assert (folder / "kept.txt").exists()  # cache hit: nothing unpacked again
+
+
 def test_version_tags_carry_cv_metrics(env) -> None:
     import mlflow
 

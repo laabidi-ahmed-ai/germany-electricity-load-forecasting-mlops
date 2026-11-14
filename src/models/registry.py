@@ -6,6 +6,13 @@ trained them, so ``promote(version)`` also zips the pyfunc bundle into the
 ``model_artifacts`` table and flags it ``is_champion``. ``load_champion(engine)`` reads
 only that table, which is why the forecast job, the API and the monitor need nothing
 but ``DATABASE_URL`` (see docs/cloud-setup.md). Rollback is ``promote(<old version>)``.
+``load_version(engine, version)`` loads any version still exported there (the last
+``KEEP_EXPORTED_VERSIONS``), e.g. the previous champion for the post-promotion check.
+
+Loaded bundles are unpacked into a local cache, one folder per version. Version numbers
+are only unique within one registry, so each folder records the SHA-256 of the bundle it
+holds and is rebuilt when the database's bundle differs (a laptop that has loaded "v2"
+from a local SQLite store must not reuse it for production's v2).
 
 CLI (``make register``)::
 
@@ -22,6 +29,7 @@ import hashlib
 import io
 import json
 import logging
+import shutil
 import sys
 import zipfile
 from dataclasses import dataclass
@@ -44,6 +52,7 @@ REGISTERED_MODEL_NAME = "germany-load-day-ahead"
 CHAMPION_ALIAS = "champion"
 KEEP_EXPORTED_VERSIONS = 5
 MODEL_CACHE_DIR = PROJECT_ROOT / "data" / "models"
+CACHE_MARKER = ".bundle_sha256"  # in each cached version folder: the bundle it was unpacked from
 
 _METRIC_KEYS = (
     "lightgbm_mae_mean",
@@ -54,6 +63,10 @@ _METRIC_KEYS = (
     "seasonal_naive_48_mae_mean",
     "beats_all_baselines",
 )
+
+
+class CorruptBundleError(ValueError):
+    """An exported bundle does not match its recorded SHA-256: it will not load, ever."""
 
 
 @dataclass
@@ -230,8 +243,6 @@ def load_champion(
     cache_dir: Path = MODEL_CACHE_DIR,
 ) -> LoadedModel:
     """Load the champion from the database export (works on any machine with DATABASE_URL)."""
-    import mlflow
-
     engine = engine or db.get_engine()
     row = champion_record(engine, name=name)
     if row is None:
@@ -239,26 +250,61 @@ def load_champion(
             f"no champion exported for {name!r} - "
             "run `python -m src.models.registry --promote-latest` first"
         )
+    return _load_export(row, cache_dir)
+
+
+def load_version(
+    engine: Engine,
+    version: str | int,
+    *,
+    name: str = REGISTERED_MODEL_NAME,
+    cache_dir: Path = MODEL_CACHE_DIR,
+) -> LoadedModel:
+    """Load any exported version from the database, champion or not.
+
+    Raises ``LookupError`` when the version has no export (never promoted, or pruned: only
+    the last ``KEEP_EXPORTED_VERSIONS`` are kept).
+    """
+    row = db.get_model_artifact(engine, name, str(version))
+    if row is None:
+        raise LookupError(
+            f"{name} v{version} is not exported in the database (never promoted, or pruned: "
+            f"the last {KEEP_EXPORTED_VERSIONS} exports are kept)"
+        )
+    return _load_export(row, cache_dir)
+
+
+def _load_export(row: dict[str, Any], cache_dir: Path) -> LoadedModel:
+    """A ``model_artifacts`` row -> a model ready to predict, unpacked into ``cache_dir``."""
+    import mlflow
+
+    name = row["name"]
     if hashlib.sha256(row["bundle"]).hexdigest() != row["bundle_sha256"]:
-        raise ValueError(f"corrupt model bundle for {name} v{row['version']}")
+        raise CorruptBundleError(f"corrupt model bundle for {name} v{row['version']}")
 
     target = Path(cache_dir) / name / f"v{row['version']}"
-    if not (target / "MLmodel").exists():
-        target.mkdir(parents=True, exist_ok=True)
+    marker = target / CACHE_MARKER
+    cached = marker.read_text(encoding="utf-8").strip() if marker.exists() else None
+    if cached != row["bundle_sha256"] or not (target / "MLmodel").exists():
+        if target.exists():  # another registry's version with this number, or an old cache
+            shutil.rmtree(target)
+        target.mkdir(parents=True)
         with zipfile.ZipFile(io.BytesIO(row["bundle"])) as zf:
             zf.extractall(target)
+        marker.write_text(row["bundle_sha256"], encoding="utf-8")
     pyfunc = mlflow.pyfunc.load_model(str(target))
     features = json.loads(row["features"])
     log.info(
-        "loaded champion %s v%s from the database (%d features)",
+        "loaded %s v%s%s from the database (%d features)",
         name,
         row["version"],
+        " (champion)" if row["is_champion"] else "",
         len(features),
     )
     return LoadedModel(
         name=name,
         version=str(row["version"]),
-        alias=CHAMPION_ALIAS,
+        alias=CHAMPION_ALIAS if row["is_champion"] else None,
         run_id=row["run_id"],
         features=features,
         horizon=HORIZONS.get(row["horizon"], DAY_AHEAD),
