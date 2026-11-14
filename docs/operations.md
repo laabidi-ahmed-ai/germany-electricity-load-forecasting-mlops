@@ -80,13 +80,14 @@ Any service that can send a scheduled HTTP POST works; these steps use
   before. Its decision is `promoted (dry-run)` or `kept (dry-run)`; a dry-run rejection never
   starts the cooldown.
 - **A fired trigger shows `cooldown`.** A challenger was rejected less than 7 UTC days ago,
-  against the champion that still serves (README §16.12), so this pass scored the champion
-  and recorded the triggers but trained nothing. Any promotion ends the cooldown: after a
-  `bootstrap` promotion or a `registry --promote`, the next fired pass trains again. The event's reason names the rejection and the first day a new challenger may be
+  or a new champion was rolled back, and the same champion still serves (README §16.12). So
+  this pass scored the champion and recorded the triggers but trained nothing. The event's
+  reason names the rejection or the rollback, and the first day a new challenger may be
   trained. Nothing to do: the next pass after that day trains one if a trigger still fires.
-  To compare now anyway: Actions → *monitor-retrain* → *Run workflow* → mode **force** (with
-  **dry_run** if you only want to see the result). The log says `cooldown bypassed by
-  --force`, and so does the event.
+  Any promotion ends the cooldown: after a `bootstrap` promotion or a `registry --promote`,
+  the next fired pass trains again. To compare now anyway: Actions → *monitor-retrain* →
+  *Run workflow* → mode **force** (with **dry_run** if you only want to see the result). The
+  log says `cooldown bypassed by --force`, and so does the event.
 - **A challenger was kept by the CV gate.** The reason reads `..., but its CV does not beat
   every baseline: lightgbm … MW vs seasonal_naive_… … MW`. The challenger beat the champion
   on the holdout, but its recipe loses to a naive baseline over the last year: the champion
@@ -136,7 +137,9 @@ Any service that can send a scheduled HTTP POST works; these steps use
   (the same store the workflows use: the `MLFLOW_TRACKING_URI` secret if set, else the
   `DATABASE_URL` value - the local default `sqlite:///mlruns/mlflow.db` is the wrong
   registry): `python -m src.models.registry --promote <previous version>`. The MLflow alias
-  moves first; if it fails, the champion serving reads is left unchanged.
+  moves first; if it fails, the champion serving reads is left unchanged. A promotion made
+  by hand is never checked or undone by the monitor, and it ends a running cooldown. The
+  monitor rolls back by itself in one case only: *Promotion policy*, below.
 - **A bootstrap or monitor-retrain run shows as cancelled.** Both workflows share the
   `promotion` concurrency group, and GitHub keeps only one pending run per group, so a newer
   queued run cancels the waiting one - either a bootstrap or that day's monitor-retrain
@@ -152,6 +155,287 @@ Any service that can send a scheduled HTTP POST works; these steps use
   activity for 60 days; push at least once every two months.
 - **Renew the scheduler token** before it expires (step 1 above, then update the
   `Authorization` header in both cron jobs).
+
+## Promotion policy: the post-promotion check and rollback
+
+Why each rule exists: README §16.12. This section is what you see and what you do.
+
+**What happens after an automatic promotion.** Every daily pass prints one block:
+
+```
+Post-promotion check: PENDING - 3 of 7 complete target days scored
+  v6 vs v5, both replayed from each issue's stored inputs on v6's scored hours: 3 of 7 complete target days, 72 scored hours
+  hours left out (cannot be rebuilt): none
+  2026-12-02 23:00Z -> 2026-12-05 22:00Z, 72 hours: v6 MAE 1,480 MW, v5 MAE 1,455 MW (both replayed), official 2,010 MW -> new champion -1.7 % (+ = lower MAE than the previous one)
+  replay parity (information, not a gate): 51 of 72 hours reproduce v6's stored forecast within 1 MW (largest difference 1,912.000 MW); v6 MAE live 1,503 MW vs replayed 1,480 MW
+```
+
+The verdict compares the two replays. The parity line is for information: hours where v6's
+replay differs from what v6 actually served read a load lag that SMARD revised after the
+issue (`load_actual` keeps only the latest value, README §16.12). Many such hours are normal.
+
+- **`PENDING`** until the new champion has 7 complete Berlin target days of scored forecasts,
+  about 9 days after the promotion. A day counts only when at least 90 % of its hours were
+  forecast on time; a day with a late or missing forecast is skipped (the line says how
+  many), so a late morning delays the verdict by a day. Meanwhile a fired trigger trains no
+  challenger: the pass records `skipped`, with "post-promotion check of v6 is pending". Mode
+  **force** bypasses that.
+- **`CONFIRMED`**: not worse than the previous champion by more than 5 % on the same hours.
+  One `post_promotion` event; the check is closed for good.
+- **`ROLLED_BACK`**: see below.
+- **`INCONCLUSIVE`**: no verdict and nothing moved. The reason says why: a different horizon,
+  the previous champion's export pruned or corrupt, more than 10 % of the hours that cannot be
+  rebuilt (no weather stored with the issue, or a load lag missing; issues before 5 Nov 2026
+  stored no weather, so only a promotion from then on can be checked), no 7 complete days within 21 days, or an error loading or replaying the
+  previous champion that lasted 21 days. The check is closed; judge the champion yourself
+  with the report-only command below.
+- **monitor-retrain is red with `post-promotion check failed`**: loading or replaying the
+  previous champion raised an error. The pass was still scored and recorded, but no
+  challenger was trained. The next pass retries; after 21 days the check closes itself as
+  `INCONCLUSIVE`. The log has the traceback. Run the report-only command below to see it
+  outside the job.
+- **`NOT_APPLICABLE`**: the champion was promoted by hand, or its promotion already has its
+  verdict. This is the normal line on most days.
+- **`... (REPORT ONLY)`**: a dry run or a check-only pass computed the verdict and changed
+  nothing.
+
+**A champion was rolled back.** What it looks like:
+- Datadog: the "Champion rolled back" monitor alerts (`retrain.rolled_back` = 1 on that pass).
+- The job log: `Post-promotion check: ROLLED_BACK - v6 MAE … MW vs v5 … MW, both replayed, on
+  the same 168 hours (-7.2 %): worse by more than the 5 % margin`, then the comparison block, and the
+  warning `rolled back: v5 is champion again, v6 demoted (undo: registry --promote 6)`. The
+  step *Champion after this run* prints v5.
+- The dashboard: the latest-pass line ends with "⏪ v6 rolled back to v5", and the retraining
+  timeline has a red ✕ on the `post_promotion` row.
+- `monitoring_events`: one row of kind `post_promotion`, decision `rolled_back`,
+  `model_version` 6, and the numbers in `reason` and `details`.
+- MLflow: the tag `post_promotion = rolled_back` on model version 6.
+- The forecast already issued that morning was v6's and stays; from the next morning the
+  forecasts are v5's.
+- For 7 UTC days no new challenger is trained against v5 (the cooldown). v6 stays exported
+  in the database.
+- **If the job is red with `post-promotion verdict not recorded`** and the log says
+  `ROLLED_BACK (NOT RECORDED)`: the rollback happened (v5 serves) but its event could not
+  be written. That pass trained no challenger. The next pass records the verdict itself:
+  `ROLLED_BACK - recovered: v5 has served again since …`, dated at the rollback, and the
+  cooldown runs from then. Nothing to do. The same line appears if someone promotes the
+  previous version back by hand before the verdict; the monitor cannot tell the two apart.
+
+Nothing needs doing if you agree. Read the comparison first: how many hours were left out,
+whether one unusual day carries the difference, and the parity line: if v6's live MAE is far
+from its replayed MAE, revisions moved the inputs, and the verdict judged both models on the
+revised values, not on what v6 served.
+
+**Undo a rollback by hand** (you judge that v6 should serve after all). PowerShell, from the
+repository root; the connection string lives only in this session, and MLflow must point at
+the same store as the workflows (the `MLFLOW_TRACKING_URI` secret if you set one, else the
+`DATABASE_URL` value):
+
+```powershell
+$env:DATABASE_URL = "<main: owner role, non-pooled>"
+$env:MLFLOW_TRACKING_URI = $env:DATABASE_URL
+.venv\Scripts\python -m src.models.registry --show         # v5
+.venv\Scripts\python -m src.models.registry --promote 6
+.venv\Scripts\python -m src.models.registry --show         # v6
+Remove-Item Env:DATABASE_URL, Env:MLFLOW_TRACKING_URI
+```
+
+Do it outside 05:30–07:00 and 08:30 UTC, when the forecast and monitor-retrain run. The
+monitor will not roll v6 back again: its promotion has its verdict, and a promotion made by
+hand is never checked. The promotion also ends the cooldown.
+
+**Compare two versions yourself** (reads the database, writes nothing; any two exported
+versions of the same horizon; a read-only role is enough):
+
+```powershell
+$env:DATABASE_URL = "<connection string>"
+.venv\Scripts\python -m src.monitoring.promotion --version 6 --previous 5
+Remove-Item Env:DATABASE_URL
+```
+
+`--since <UTC time>` counts only issues made after that time, `--days` sets how many complete
+target days (default 7), `--margin` the margin the last line judges by. Only the last five
+exported versions can be loaded.
+
+**Re-run the margin replay** (README §16.12; reads the database, trains about 28 models,
+roughly 25 minutes on a laptop):
+
+```powershell
+.venv\Scripts\python -m src.monitoring.margin_replay
+```
+
+Without `DATABASE_URL` it runs on the local SQLite file. Its last lines say how often a newer
+model was worse than an older one by more than 3, 5 and 8 % over one week. If 5 % stops being
+outside that spread, raise `DEFAULT_ROLLBACK_MARGIN_PCT` in `src/monitoring/promotion.py`.
+
+### Rehearsal on a Neon branch (replay fidelity and the rollback write path)
+
+Run once before the change is merged, and again after any change to the replay. It checks two
+things on real data that the offline tests cannot: that both versions can be replayed on
+production's scored hours (and how far SMARD's revisions have moved the replay from the
+stored forecasts), and that a real rollback moves the alias and the pointer and can be undone.
+
+**The MLflow alias stays out of production.** Production keeps MLflow's tables in the same
+Postgres database as the data (`docs/cloud-setup.md`), so a Neon branch has its own copy of
+the model registry, alias included. The rehearsal sets `MLFLOW_TRACKING_URI` to the branch,
+so the alias moves only in the branch's `registered_model_aliases` table. Three safeguards:
+1. step 3 prints whether MLflow and the data resolve to the same database, before any write;
+2. every pass runs with `--no-mlflow`: the experiment's artifact folder belongs to the GitHub
+   runner, and the alias and the version tag go through the registry regardless;
+3. step 9 reads the alias and the champion on `main`: unchanged.
+
+If you ever set a separate `MLFLOW_TRACKING_URI` secret, the branch has no registry: the
+second query of step 2 fails or returns nothing. Stop there.
+
+v3 was promoted by hand, so the check does not apply to it. The rehearsal inserts one
+fabricated promotion event **on the branch** to open a check of v3 against v2 (both
+`d_plus_1`). It is dated just before the first issue that has stored weather, because
+earlier issues (before revision `0003`) cannot be replayed. The check starts at the
+champion's `promoted_at` in `model_artifacts`, not at the event (the real promotion time,
+README §16.12), so step 5 also moves v3's `promoted_at` to the event's time, on the branch
+only.
+
+1. Neon → *Branches* → *Create branch* `rehearse-rollback` from `main` (current data), after
+   the day's monitor-retrain has finished.
+2. On the branch (Neon SQL editor), record:
+
+   ```sql
+   SELECT version, horizon, is_champion, promoted_at, train_end FROM model_artifacts ORDER BY created_at;
+   SELECT name, alias, version FROM registered_model_aliases;
+   SELECT min(issued_at) AS first_issue_with_weather, count(DISTINCT issued_at) AS issues
+   FROM load_forecast_model_weather;
+   SELECT id, created_at, as_of, kind, decision, model_version FROM monitoring_events
+   ORDER BY id DESC LIMIT 5;
+   ```
+
+   Expected: v3 is the champion, v2 is exported with horizon `d_plus_1`, the alias `champion`
+   points at 3. Note `first_issue_with_weather`.
+3. PowerShell, from the repository root. Both variables point at the branch, for this session
+   only:
+
+   ```powershell
+   $env:DATABASE_URL = "<rehearse-rollback: owner role, non-pooled>"
+   $env:MLFLOW_TRACKING_URI = $env:DATABASE_URL
+   .venv\Scripts\python -c "from config.settings import get_settings as g; s = g(); print('MLflow store is the data store:', s.mlflow_tracking_uri == s.database_url, '| Postgres:', s.database_url.startswith('postgres'))"
+   .venv\Scripts\python -m src.models.registry --show
+   ```
+
+   The first line must read `MLflow store is the data store: True | Postgres: True`. If not,
+   a value from `.env` won: stop. `--show` prints v3.
+4. **(a) Replay fidelity**, read-only. Use the time from step 2:
+
+   ```powershell
+   .venv\Scripts\python -m src.monitoring.promotion --version 3 --previous 2 --since "<first_issue_with_weather, minus one minute>"
+   ```
+
+   What to expect:
+   - `hours left out (cannot be rebuilt): none`, or very few. Hours left out for "no weather
+     stored with the issue" or "a load lag is missing" are a finding: more than 10 % gives
+     `INCONCLUSIVE`.
+   - One line with the MAE of v3 and v2, both replayed, on the same hours, and the official
+     forecast's. The last line says what the automatic check would decide.
+   - `replay parity (information, not a gate): N of M hours reproduce v3's stored forecast
+     within 1 MW`. N well below M is expected: SMARD revises the load lags after the issue,
+     and `load_actual` keeps only the latest value. The first rehearsal found 103 of 168,
+     largest difference 2,278 MW, mostly 06–14 UTC (README §16.12). A large gap between v3's
+     live and replayed MAE shows how much the revisions moved the inputs. It does not change
+     the verdict.
+
+   Fewer than 7 complete target days since the cut: add `--days <complete days>`.
+5. **(b) Open a check on the branch.** In the SQL editor, on `rehearse-rollback` only:
+
+   ```sql
+   INSERT INTO monitoring_events (created_at, as_of, kind, triggered, decision, reason, model_version, details)
+   SELECT min(issued_at) - interval '1 minute', min(issued_at) - interval '1 minute',
+          'retrain', false, 'promoted', 'rehearsal: fabricated promotion v2 -> v3', '2',
+          '{"outcome": {"decision": "promoted", "challenger_version": "3"}}'
+   FROM load_forecast_model_weather;
+
+   UPDATE model_artifacts
+   SET promoted_at = (SELECT created_at FROM monitoring_events WHERE reason LIKE 'rehearsal:%')
+   WHERE version = '3';
+
+   SELECT version, is_champion, promoted_at FROM model_artifacts WHERE version = '3';
+   SELECT created_at FROM monitoring_events WHERE reason LIKE 'rehearsal:%';
+   ```
+
+   Why the `UPDATE`: the check counts only issues made after the champion's `promoted_at`,
+   and measures the wait from it. That is the real promotion time: `registry.promote` sets it
+   a few minutes before the promoting pass records its event. v3's real `promoted_at` (2 Nov
+   2026) is before the first issue with stored weather. Left as it is, the check reaches the
+   target days of 3–5 Nov, whose issues have no stored weather (72 of 168 hours left out in
+   the first rehearsal), and closes `INCONCLUSIVE`. Both queries must show the same time. A
+   `promoted_at` equal to the event's time is still the automatic promotion; a later one
+   would read as "promoted again by hand" and the check would not apply. Step 8 sets
+   `promoted_at` again when v3 is promoted back.
+
+6. **Dry run, then the real rollback.** A margin of −100 makes any result count as "worse",
+   so the write path runs although v3 is fine. Before 13 Nov add `--post-check-days <complete
+   days>` to all three commands.
+
+   ```powershell
+   .venv\Scripts\python -m src.monitoring.retrain --dry-run --no-mlflow --rollback-margin=-100
+   .venv\Scripts\python -m src.models.registry --show         # still v3
+   .venv\Scripts\python -m src.monitoring.retrain --no-mlflow --rollback-margin=-100
+   .venv\Scripts\python -m src.models.registry --show         # v2
+   ```
+
+   The dry run prints `Post-promotion check: ROLLED_BACK (REPORT ONLY)`; the real pass prints
+   `Post-promotion check: ROLLED_BACK` and the warning `rolled back: v2 is champion again`.
+   Then, on the branch:
+
+   ```sql
+   SELECT version, is_champion, promoted_at FROM model_artifacts ORDER BY created_at;
+   SELECT name, alias, version FROM registered_model_aliases;
+   SELECT name, version, key, value FROM model_version_tags WHERE key = 'post_promotion';
+   SELECT id, created_at, as_of, kind, decision, model_version, reason FROM monitoring_events
+   ORDER BY id DESC LIMIT 4;
+   ```
+
+   Expected: v2 is the champion; the alias points at 2; version 3 carries
+   `post_promotion = rolled_back`; the newest events are the real pass, the `post_promotion`
+   / `rolled_back` verdict (`model_version` 3) and the dry-run pass, and no second verdict.
+7. **No second rollback.** The same real command again:
+
+   ```powershell
+   .venv\Scripts\python -m src.monitoring.retrain --no-mlflow --rollback-margin=-100
+   .venv\Scripts\python -m src.models.registry --show         # still v2
+   ```
+
+   It prints `Post-promotion check: NOT_APPLICABLE - the latest automatic promotion (v3)
+   already has its verdict: rolled_back`. If a trigger fires, the pass says `COOLDOWN` with
+   "v3 rolled back" and trains nothing.
+8. **Undo by hand**, then check that v3 is left alone:
+
+   ```powershell
+   .venv\Scripts\python -m src.models.registry --promote 3
+   .venv\Scripts\python -m src.monitoring.retrain --check-only --no-mlflow --rollback-margin=-100
+   .venv\Scripts\python -m src.models.registry --show         # v3
+   ```
+
+   The check-only pass prints `NOT_APPLICABLE` again. Run the first two queries of step 6:
+   v3 is the champion and the alias points at 3.
+9. **Production is untouched.** Switch the SQL editor to `main` and run:
+
+   ```sql
+   SELECT version, is_champion, promoted_at FROM model_artifacts ORDER BY created_at;
+   SELECT name, alias, version FROM registered_model_aliases;
+   SELECT count(*) FROM monitoring_events WHERE kind = 'post_promotion';
+   ```
+
+   Same champion, same `promoted_at` and same alias as before the rehearsal; the count is 0.
+10. Clean up, then delete the `rehearse-rollback` branch:
+
+    ```powershell
+    Remove-Item Env:DATABASE_URL, Env:MLFLOW_TRACKING_URI
+    ```
+
+Notes:
+- The passes read the whole history and run the drift check: a few minutes each.
+- If `.env` holds a `DD_API_KEY`, the passes send metrics tagged `runner:local`; every
+  monitor filters on `runner:github`.
+- The models are unpacked under `data/models/`. Each folder records which bundle it holds,
+  so a "v2" cached from a local database is never used for production's v2.
 
 ## Run the fair backtest (D+1)
 
