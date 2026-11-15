@@ -8,7 +8,11 @@ Two endpoints feed the system:
   next days' forecast (``past_days`` / ``forecast_days``). Used for incremental
   updates and for building the day-ahead feature rows.
 
-Both are requested with ``timezone=UTC`` so timestamps are DST-unambiguous.
+Both are requested with ``timezone=UTC`` so timestamps are DST-unambiguous, and with
+every city in one request: comma-separated ``latitude`` / ``longitude``, answered by a JSON
+list in the same order (a single location is answered by one object). Each request uses
+``OPEN_METEO_RETRY``: Open-Meteo answers in about a second, but a few times a day a request
+stalls without a byte, so the client stops waiting after 20 s and tries again.
 Rows are returned in long format, one row per ``(timestamp_utc, city)``, tagged
 with ``source`` = ``"archive"`` or ``"forecast"`` so the storage layer can let
 archive values supersede forecast values for the same hour.
@@ -31,7 +35,7 @@ import pandas as pd
 import requests
 
 from config.settings import get_settings
-from src.data._http import get_json, make_session
+from src.data._http import RetryPolicy, get_json, make_session
 from src.data.db import DateLike
 
 log = logging.getLogger(__name__)
@@ -68,6 +72,12 @@ NATIONAL_COLUMNS: tuple[str, ...] = tuple(f"{var}_de_avg" for var in WEATHER_VAR
 
 SOURCE_ARCHIVE = "archive"
 SOURCE_FORECAST = "forecast"
+
+# Short read timeout, more attempts, capped waits: waits 3, 9, 27, 30, 30 s, and a request
+# that always stalls gives up after about 4.7 min (``worst_case_seconds``), well inside the
+# 30 min of the ingest and forecast jobs. A healthy answer, even the full five-city
+# backfill, starts in under a second; a 60 s read timeout only made a stall cost minutes.
+OPEN_METEO_RETRY = RetryPolicy(retries=6, backoff=3.0, max_wait=30.0, timeout=(10.0, 20.0))
 
 # Previous Runs: lead offsets in whole days, and the long-format columns of a fetch.
 PREVIOUS_RUN_OFFSETS: tuple[int, ...] = (1, 2)
@@ -131,6 +141,30 @@ class WeatherClient:
         self.forecast_url += "/forecast"
         self.previous_runs_url = previous_runs_url or settings.open_meteo_previous_runs_url
 
+    def _get_all_cities(self, url: str, params: dict) -> list[dict]:
+        """One request for every city; the answers in the order of ``self.cities``.
+
+        Open-Meteo returns a list in request order for several locations, each item but the
+        first carrying its 0-based ``location_id``, and a single object for one location.
+        """
+        params = {
+            "latitude": ",".join(str(c.latitude) for c in self.cities),
+            "longitude": ",".join(str(c.longitude) for c in self.cities),
+            **params,
+        }
+        payload = get_json(self.session, url, params, policy=OPEN_METEO_RETRY)
+        items = payload if isinstance(payload, list) else [payload]
+        if len(items) != len(self.cities):
+            raise ValueError(
+                f"Open-Meteo returned {len(items)} locations for {len(self.cities)} cities"
+            )
+        for position, item in enumerate(items):
+            if item.get("location_id", 0) != position:
+                raise ValueError(
+                    f"Open-Meteo answer {position} is location_id {item.get('location_id')}"
+                )
+        return items
+
     # -------------------------------------------------------------- history
     def fetch_historical(self, start: DateLike, end: DateLike | None = None) -> pd.DataFrame:
         """Hourly reanalysis weather for ``[start, end]`` (dates, inclusive) per city."""
@@ -139,47 +173,49 @@ class WeatherClient:
         if end_d < start_d:
             raise ValueError(f"end ({end_d}) is before start ({start_d})")
 
-        frames = []
-        for city in self.cities:
-            log.info("Open-Meteo archive: %s %s -> %s", city.name, start_d, end_d)
-            params = {
-                "latitude": city.latitude,
-                "longitude": city.longitude,
-                "start_date": start_d.isoformat(),
-                "end_date": end_d.isoformat(),
-                "hourly": ",".join(WEATHER_VARS),
-                "timezone": "UTC",
-            }
-            payload = get_json(self.session, self.archive_url, params)
-            frames.append(_hourly_payload_to_frame(payload, city, SOURCE_ARCHIVE))
-
-        df = _finalise(frames)
+        if not self.cities:
+            return empty_weather_frame()
+        log.info("Open-Meteo archive: %d cities %s -> %s", len(self.cities), start_d, end_d)
+        params = {
+            "start_date": start_d.isoformat(),
+            "end_date": end_d.isoformat(),
+            "hourly": ",".join(WEATHER_VARS),
+            "timezone": "UTC",
+        }
+        payloads = self._get_all_cities(self.archive_url, params)
+        df = _finalise(
+            [
+                _hourly_payload_to_frame(payload, city, SOURCE_ARCHIVE)
+                for city, payload in zip(self.cities, payloads, strict=True)
+            ]
+        )
         log.info("Open-Meteo archive: %d rows for %d cities", len(df), len(self.cities))
         return df
 
     # ------------------------------------------------------------- forecast
     def fetch_forecast(self, *, past_days: int = 2, forecast_days: int = 3) -> pd.DataFrame:
         """Recent observations (``past_days``) plus the next ``forecast_days`` per city."""
-        frames = []
-        for city in self.cities:
-            log.info(
-                "Open-Meteo forecast: %s (past_days=%d, forecast_days=%d)",
-                city.name,
-                past_days,
-                forecast_days,
-            )
-            params = {
-                "latitude": city.latitude,
-                "longitude": city.longitude,
-                "hourly": ",".join(WEATHER_VARS),
-                "past_days": past_days,
-                "forecast_days": forecast_days,
-                "timezone": "UTC",
-            }
-            payload = get_json(self.session, self.forecast_url, params)
-            frames.append(_hourly_payload_to_frame(payload, city, SOURCE_FORECAST))
-
-        df = _finalise(frames)
+        if not self.cities:
+            return empty_weather_frame()
+        log.info(
+            "Open-Meteo forecast: %d cities (past_days=%d, forecast_days=%d)",
+            len(self.cities),
+            past_days,
+            forecast_days,
+        )
+        params = {
+            "hourly": ",".join(WEATHER_VARS),
+            "past_days": past_days,
+            "forecast_days": forecast_days,
+            "timezone": "UTC",
+        }
+        payloads = self._get_all_cities(self.forecast_url, params)
+        df = _finalise(
+            [
+                _hourly_payload_to_frame(payload, city, SOURCE_FORECAST)
+                for city, payload in zip(self.cities, payloads, strict=True)
+            ]
+        )
         log.info("Open-Meteo forecast: %d rows for %d cities", len(df), len(self.cities))
         return df
 

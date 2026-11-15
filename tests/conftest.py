@@ -164,12 +164,21 @@ def open_meteo_payload(start: str, end: str, *, lat: float = 0.0) -> dict:
     }
 
 
-def open_meteo_route(start: str, end: str) -> Callable[[str, dict[str, Any] | None], dict]:
-    """Route that ignores the query string and returns a payload for [start, end]."""
+def open_meteo_route(
+    start: str, end: str
+) -> Callable[[str, dict[str, Any] | None], dict | list[dict]]:
+    """Route that returns a payload for [start, end] per requested location, as Open-Meteo
+    does: one object for a single location, else a list in request order, each item but
+    the first tagged with its ``location_id``."""
 
-    def _route(url: str, params: dict[str, Any] | None) -> dict:
-        lat = float(params["latitude"]) if params else 0.0
-        return open_meteo_payload(start, end, lat=lat)
+    def _route(url: str, params: dict[str, Any] | None) -> dict | list[dict]:
+        lats = str(params["latitude"]).split(",") if params else ["0.0"]
+        payloads = [open_meteo_payload(start, end, lat=float(lat)) for lat in lats]
+        if len(payloads) == 1:
+            return payloads[0]
+        for location_id, payload in enumerate(payloads[1:], start=1):
+            payload["location_id"] = location_id
+        return payloads
 
     return _route
 
