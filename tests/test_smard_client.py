@@ -7,7 +7,7 @@ from typing import ClassVar
 import pandas as pd
 import pytest
 
-from src.data._http import get_json
+from src.data._http import RetryPolicy, get_json
 from src.data.db import to_utc
 from src.data.smard_client import SmardClient
 from tests.conftest import (
@@ -99,7 +99,9 @@ def test_get_json_retries_then_succeeds() -> None:
     url = f"{BASE}/x.json"
     session = FakeSession(routes={url: [FakeResponse({}, status_code=503), {"ok": True}]})
     sleeps: list[float] = []
-    assert get_json(session, url, retries=3, sleep=sleeps.append) == {"ok": True}
+    assert get_json(session, url, policy=RetryPolicy(retries=3), sleep=sleeps.append) == {
+        "ok": True
+    }
     assert len(session.calls) == 2
     assert len(sleeps) == 1
 
@@ -108,7 +110,7 @@ def test_get_json_gives_up_after_retries() -> None:
     url = f"{BASE}/x.json"
     session = FakeSession(routes={url: [FakeResponse({}, status_code=500)] * 3})
     with pytest.raises(RuntimeError, match="giving up"):
-        get_json(session, url, retries=3, sleep=lambda _: None)
+        get_json(session, url, policy=RetryPolicy(retries=3), sleep=lambda _: None)
     assert len(session.calls) == 3
 
 
@@ -116,7 +118,7 @@ def test_get_json_does_not_retry_client_errors() -> None:
     url = f"{BASE}/missing.json"
     session = FakeSession(routes={url: [FakeResponse({}, status_code=404)] * 3})
     with pytest.raises(RuntimeError, match="HTTP 404"):
-        get_json(session, url, retries=3, sleep=lambda _: None)
+        get_json(session, url, policy=RetryPolicy(retries=3), sleep=lambda _: None)
     assert len(session.calls) == 1
 
 
@@ -135,7 +137,7 @@ def test_get_json_retries_rate_limits_with_growing_waits() -> None:
         routes={url: [FakeResponse({}, status_code=429), FakeResponse({}, status_code=503), {}]}
     )
     sleeps: list[float] = []
-    assert get_json(session, url, retries=3, sleep=sleeps.append) == {}
+    assert get_json(session, url, policy=RetryPolicy(retries=3), sleep=sleeps.append) == {}
     assert sleeps == [3.0, 9.0]  # default backoff rides out a short provider hiccup
 
 
@@ -153,5 +155,5 @@ def test_get_json_names_what_came_back_when_the_body_is_not_json() -> None:
     url = f"{BASE}/x.json"
     session = FakeSession(routes={url: [HtmlResponse(None)] * 2})
     with pytest.raises(RuntimeError, match=r"non-JSON response \(HTTP 200, text/html, body") as e:
-        get_json(session, url, retries=2, sleep=lambda _: None)
+        get_json(session, url, policy=RetryPolicy(retries=2), sleep=lambda _: None)
     assert "502 Bad Gateway" in str(e.value)
