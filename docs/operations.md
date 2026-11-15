@@ -70,6 +70,8 @@ Any service that can send a scheduled HTTP POST works; these steps use
   tab (all green), and the dashboard's *Data coverage* (latest actual) and *last model
   forecast* timestamps. `python -m src.models.registry --show` prints the champion.
 - **`forecast` is red but the forecast step ran.** The refresh (ingest) failed, e.g. Open-Meteo down, and the job forecast from the stored data anyway; it stays red so the failure is seen. Check the refresh step's log; the next hourly `ingest` catches up.
+- **`monitor-retrain` is red but the pass ran.** Same as above: a failed refresh no longer skips the daily pass; it runs on the data already stored (kept current by the hourly `ingest`), and the job stays red so the failure is seen. The pass counts for the day (`--once-per-day`), so the backup run does not repeat it.
+- **`ingest` is red with "Read timed out" from Open-Meteo** (`giving up on https://api.open-meteo.com/v1/forecast after 6 attempts: … Read timed out`, or the same for `archive-api`). The provider stalled: it sent nothing for 20 s on each of six attempts, about 5 minutes in all. A stall that clears in time shows only as `request succeeded on attempt N/6` in the log, and the job stays green. Harmless for the data: every run fetches the weather of the last 2 days and the next 3 again (the archive, the last 7 days), so the next hourly run fills it in. Nothing to do unless every run fails for hours.
 - **Forecast again today on purpose.** Actions → *forecast* → *Run workflow* → tick
   **force**. (Without it, the run exits because today's forecast exists.) The new issue is
   added next to the earlier one. If it is made before the deadline, it replaces the earlier
@@ -232,7 +234,7 @@ the same store as the workflows (the `MLFLOW_TRACKING_URI` secret if you set one
 `DATABASE_URL` value):
 
 ```powershell
-$env:DATABASE_URL = "<main: owner role, non-pooled>"
+$env:DATABASE_URL = "<production: owner role, non-pooled>"
 $env:MLFLOW_TRACKING_URI = $env:DATABASE_URL
 .venv\Scripts\python -m src.models.registry --show         # v5
 .venv\Scripts\python -m src.models.registry --promote 6
@@ -282,7 +284,9 @@ so the alias moves only in the branch's `registered_model_aliases` table. Three 
 1. step 3 prints whether MLflow and the data resolve to the same database, before any write;
 2. every pass runs with `--no-mlflow`: the experiment's artifact folder belongs to the GitHub
    runner, and the alias and the version tag go through the registry regardless;
-3. step 9 reads the alias and the champion on `main`: unchanged.
+3. step 9 reads the alias and the champion on `production`: unchanged.
+
+In this Neon project the production branch is named `production`, not `main`.
 
 If you ever set a separate `MLFLOW_TRACKING_URI` secret, the branch has no registry: the
 second query of step 2 fails or returns nothing. Stop there.
@@ -295,7 +299,7 @@ champion's `promoted_at` in `model_artifacts`, not at the event (the real promot
 README §16.12), so step 5 also moves v3's `promoted_at` to the event's time, on the branch
 only.
 
-1. Neon → *Branches* → *Create branch* `rehearse-rollback` from `main` (current data), after
+1. Neon → *Branches* → *Create branch* `rehearse-rollback` from `production` (current data), after
    the day's monitor-retrain has finished.
 2. On the branch (Neon SQL editor), record:
 
@@ -415,7 +419,7 @@ only.
 
    The check-only pass prints `NOT_APPLICABLE` again. Run the first two queries of step 6:
    v3 is the champion and the alias points at 3.
-9. **Production is untouched.** Switch the SQL editor to `main` and run:
+9. **Production is untouched.** Switch the SQL editor to `production` and run:
 
    ```sql
    SELECT version, is_champion, promoted_at FROM model_artifacts ORDER BY created_at;
