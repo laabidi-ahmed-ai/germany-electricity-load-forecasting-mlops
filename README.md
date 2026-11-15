@@ -730,7 +730,7 @@ The margin stays at 5 %. A false rollback is cheap: it keeps a champion that alr
 | Step 6: dry run, then the real pass | Dry run: `ROLLED_BACK (REPORT ONLY)`, champion unchanged. Real pass: `ROLLED_BACK`; alias `champion` → 2, v2 is the champion in `model_artifacts`, tag `post_promotion = rolled_back` on v3, exactly one `post_promotion` event |
 | Step 7: the real pass again | `NOT_APPLICABLE` (the verdict is already recorded); still v2 |
 | Step 8: `registry --promote 3`, then a check-only pass | v3 is the champion, alias 3; the check says `NOT_APPLICABLE` (the latest automatic promotion already has its verdict) |
-| Step 9: production (`main`) | Unchanged: v3 is the champion, `promoted_at` 2026-11-02 10:45:15.800182Z, alias 3, 0 `post_promotion` events, 0 rehearsal rows |
+| Step 9: production (branch `production`) | Unchanged: v3 is the champion, `promoted_at` 2026-11-02 10:45:15.800182Z, alias 3, 0 `post_promotion` events, 0 rehearsal rows |
 
 **What the −11.3 % does and does not say.**
 - On this week, v3 replayed is 11.3 % worse than v2 replayed, beyond the margin replay's worst week (+4.9 %). Had v3 been promoted automatically, the check would have rolled it back.
