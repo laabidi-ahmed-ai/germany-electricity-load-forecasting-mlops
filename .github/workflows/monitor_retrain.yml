@@ -13,6 +13,9 @@
 # Chained: starts when the forecast workflow completes (whatever its result - scoring
 # and drift matter most when the forecast failed). The cron is a backup; automatic runs
 # pass --once-per-day, so at most one monitoring pass is recorded per UTC day.
+#
+# A failed refresh (e.g. an Open-Meteo stall) does not skip the pass: it runs on the data
+# already stored (the hourly ingest keeps it current) and the job still ends red.
 name: monitor-retrain
 
 on:
@@ -62,9 +65,12 @@ jobs:
         uses: ./.github/actions/setup
 
       - name: Refresh actuals + official forecast + weather
+        id: refresh
         run: python -m src.data.ingest
 
       - name: Monitor / retrain
+        # not always(): a cancelled run, or a failed setup before the refresh, must not run it
+        if: ${{ success() || steps.refresh.outcome == 'failure' }}
         run: |
           FLAGS=""
           case "${{ inputs.mode || 'auto' }}" in
