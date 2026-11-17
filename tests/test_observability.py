@@ -136,13 +136,19 @@ def test_ingest_metrics_rows_failed_steps_and_freshness_of_data_and_forecast(eng
         ),
     )
     m, rec = enabled("ingest")
-    results = [IngestResult("smard", rows=3), IngestResult("weather_forecast", status="failed")]
+    results = [
+        IngestResult("smard", rows=3),
+        IngestResult("weather_archive", status="failed"),
+        IngestResult("weather_forecast", rows=240, gauges={"weather.forecast_fallback": 1}),
+    ]
     ingest_metrics(m, engine, results)
     m.flush()
 
     got = rec.metrics()
     assert value(got, "ingest.rows", step="smard") == 3
-    assert value(got, "ingest.step_failed", step="weather_forecast") == 1
+    assert value(got, "weather.forecast_fallback") == 1
+    assert len(got["weather.forecast_fallback"]) == 1
+    assert value(got, "ingest.step_failed", step="weather_archive") == 1
     assert 2 <= value(got, "data.freshness_hours") < 3.1
     assert value(got, "forecast.age_hours") == pytest.approx(5, abs=0.1)
     assert m.status == "failed"  # one failed step marks the run

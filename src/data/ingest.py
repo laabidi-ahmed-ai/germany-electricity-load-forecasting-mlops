@@ -9,7 +9,8 @@ Sources: ``smard`` (actual load and the official day-ahead load forecast) and
 and runs independently, so one failing source never blocks the others. Every value the
 official forecast has had is kept (``db.store_official_forecast``). With
 ``DD_API_KEY`` set, each run also reports rows per step, failed steps and the age of
-the newest actual load and model forecast to Datadog (``src.observability``).
+the newest actual load and model forecast to Datadog (``src.observability``), and
+whether the weather forecast came from Open-Meteo's fallback host.
 
 Examples::
 
@@ -58,6 +59,7 @@ class IngestResult:
     end: pd.Timestamp | None = None
     status: str = "ok"  # ok | skipped | failed
     message: str = ""
+    gauges: dict[str, float] = field(default_factory=dict)  # extra metrics of this step
 
     @property
     def failed(self) -> bool:
@@ -146,7 +148,7 @@ def ingest_weather_forecast(
     engine: Engine, client: WeatherClient, *, past_days: int = 2, forecast_days: int = 3
 ) -> IngestResult:
     df = client.fetch_forecast(past_days=past_days, forecast_days=forecast_days)
-    return _store(
+    result = _store(
         engine,
         "weather_forecast",
         df,
@@ -154,6 +156,9 @@ def ingest_weather_forecast(
         validate=validate_weather,
         update_where=db.weather_update_where,
     )
+    if client.forecast_fallback_used is not None:
+        result.gauges["weather.forecast_fallback"] = int(client.forecast_fallback_used)
+    return result
 
 
 # --- Modes ---
@@ -315,7 +320,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def report_metrics(metrics: JobMetrics, engine: Engine, results: Sequence[IngestResult]) -> None:
-    """Rows per step, failed steps, and how old the newest actual load and forecast are.
+    """Rows per step, failed steps, each step's extra gauges, and how old the newest
+    actual load and forecast are.
 
     The hourly ingest doubles as a watchdog for the daily forecast: alerting on the
     forecast's age catches a forecast job that never started, which the job itself
@@ -324,6 +330,8 @@ def report_metrics(metrics: JobMetrics, engine: Engine, results: Sequence[Ingest
     for r in results:
         metrics.gauge("ingest.rows", r.rows, step=r.source)
         metrics.gauge("ingest.step_failed", int(r.failed), step=r.source)
+        for name, value in r.gauges.items():
+            metrics.gauge(name, value)
     if any(r.failed for r in results):
         metrics.fail()
     latest = db.latest_timestamp(engine, db.LoadActual, source=SOURCE_SMARD)
