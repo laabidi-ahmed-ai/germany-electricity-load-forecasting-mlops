@@ -31,7 +31,9 @@ permissions:
 jobs:
   forecast:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # A normal run takes ~1.5 min. 40 min leaves half the time free even if every
+    # Open-Meteo call stalls until it gives up (899 s; test_weather_client).
+    timeout-minutes: 40
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
       # Optional job metrics -> Datadog (docs/observability.md); unset = nothing is sent.
