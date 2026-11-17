@@ -18,6 +18,7 @@ from tests.conftest import (
 SMARD_BASE = "https://smard.test/app/chart_data"
 ARCHIVE = "https://archive.test/v1/archive"
 FORECAST_BASE = "https://forecast.test/v1"
+FALLBACK = "https://previous-runs.test/v1/forecast"
 CITIES = (City("A", 50.0, 8.0), City("B", 52.0, 13.0))
 
 
@@ -34,7 +35,11 @@ def make_clients(
     clients = ingest.Clients(
         smard=SmardClient(session=session, base_url=SMARD_BASE, region="DE"),
         weather=WeatherClient(
-            session=session, cities=CITIES, archive_url=ARCHIVE, forecast_base_url=FORECAST_BASE
+            session=session,
+            cities=CITIES,
+            archive_url=ARCHIVE,
+            forecast_base_url=FORECAST_BASE,
+            previous_runs_url=FALLBACK,
         ),
     )
     return clients, session
@@ -172,6 +177,20 @@ def test_incremental_weather_forecast_does_not_overwrite_archive(engine) -> None
     assert (overlap["source"] == "archive").all()
     future = w[w["timestamp_utc"] > pd.Timestamp("2021-04-04T21:00Z")]
     assert (future["source"] == "forecast").all() and len(future) > 0
+
+
+def test_weather_forecast_reports_whether_the_fallback_host_served(engine) -> None:
+    clients, session = make_clients()
+    now = pd.Timestamp("2021-04-05T00:00Z")
+    first = by_source(ingest.run_incremental(engine, clients, sources=("weather",), now=now))
+    assert first["weather_forecast"].gauges == {"weather.forecast_fallback": 0}
+
+    # api.open-meteo.com refuses (HTTP 404 is final), the previous-runs host answers.
+    session.routes[FALLBACK] = session.routes.pop(f"{FORECAST_BASE}/forecast")
+    second = by_source(ingest.run_incremental(engine, clients, sources=("weather",), now=now))
+    assert second["weather_forecast"].status == "ok"
+    assert second["weather_forecast"].rows == first["weather_forecast"].rows
+    assert second["weather_forecast"].gauges == {"weather.forecast_fallback": 1}
 
 
 # --- official forecast revisions ---

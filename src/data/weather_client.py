@@ -6,30 +6,38 @@ Two endpoints feed the system:
   available from 1940 up to a few days ago. Used for the backfill.
 * forecast (``api.open-meteo.com/v1/forecast``) - recent observations plus the
   next days' forecast (``past_days`` / ``forecast_days``). Used for incremental
-  updates and for building the day-ahead feature rows.
+  updates and for building the day-ahead feature rows. Tried twice with short timeouts
+  (``OPEN_METEO_PRIMARY_RETRY``); if that fails, the same query goes to the ``/forecast``
+  endpoint of the previous-runs host (below), which answered with identical values when
+  compared on 17 Nov 2026 (a comparison, not a documented guarantee). From 16 Nov 2026
+  GitHub runners at times could not complete a handshake with api.open-meteo.com at all,
+  while the archive host, the same server as previous-runs, answered.
 
 Both are requested with ``timezone=UTC`` so timestamps are DST-unambiguous, and with
 every city in one request: comma-separated ``latitude`` / ``longitude``, answered by a JSON
 list in the same order (a single location is answered by one object). Each request uses
-``OPEN_METEO_RETRY``: Open-Meteo answers in about a second, but a few times a day a request
+``OPEN_METEO_RETRY`` (the first try of the forecast, a shorter policy): Open-Meteo answers in about a second, but a few times a day a request
 stalls without a byte, so the client stops waiting after 20 s and tries again.
 Rows are returned in long format, one row per ``(timestamp_utc, city)``, tagged
 with ``source`` = ``"archive"`` or ``"forecast"`` so the storage layer can let
 archive values supersede forecast values for the same hour.
 
-A third endpoint is read only by the fair backtest (``src.monitoring.fair_backtest``),
-never by ingestion or serving, and nothing from it is stored:
+A third endpoint serves two purposes:
 
 * previous runs (``previous-runs-api.open-meteo.com/v1/forecast``) - archived forecasts at
   fixed lead offsets: ``<var>_previous_day<N>`` at hour t is the value of the newest model
   run initialised at least N x 24 h before t. Requested without ``models=``, i.e. the same
-  default model mix (best_match) as the live forecast.
+  default model mix (best_match) as the live forecast. Read by the fair backtest
+  (``src.monitoring.fair_backtest``), and nothing from that is stored.
+* the same endpoint with the plain variable names and ``past_days`` / ``forecast_days`` is
+  the fallback of ``fetch_forecast``; those rows are stored as ``source="forecast"``.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 import pandas as pd
 import requests
@@ -75,9 +83,22 @@ SOURCE_FORECAST = "forecast"
 
 # Short read timeout, more attempts, capped waits: waits 3, 9, 27, 30, 30 s, and a request
 # that always stalls gives up after about 4.7 min (``worst_case_seconds``), well inside the
-# 30 min of the ingest and forecast jobs. A healthy answer, even the full five-city
+# 30 min of the ingest job and the 40 min of the forecast job. A healthy answer, even the full five-city
 # backfill, starts in under a second; a 60 s read timeout only made a stall cost minutes.
 OPEN_METEO_RETRY = RetryPolicy(retries=6, backoff=3.0, max_wait=30.0, timeout=(10.0, 20.0))
+
+# api.open-meteo.com before the fallback: two quick tries, 1 s apart. The handshake takes
+# well under a second when the host is reachable; when a runner cannot reach it, retrying in
+# the same run does not help (ingest #1071, 17 Nov 2026), so the fallback should start soon.
+# Worst case 2 x (5 + 10) + 1 = 31 s; with the fallback's 279 s, the forecast job's three
+# Open-Meteo calls take at most 899 s, inside half its 40 minutes (1200 s; test_weather_client).
+OPEN_METEO_PRIMARY_RETRY = RetryPolicy(retries=2, backoff=1.0, timeout=(5.0, 10.0))
+
+
+def forecast_worst_case_seconds() -> float:
+    """``fetch_forecast`` when both hosts stall on every attempt."""
+    return OPEN_METEO_PRIMARY_RETRY.worst_case_seconds() + OPEN_METEO_RETRY.worst_case_seconds()
+
 
 # Previous Runs: lead offsets in whole days, and the long-format columns of a fetch.
 PREVIOUS_RUN_OFFSETS: tuple[int, ...] = (1, 2)
@@ -140,8 +161,14 @@ class WeatherClient:
         self.forecast_url = (forecast_base_url or settings.open_meteo_base_url).rstrip("/")
         self.forecast_url += "/forecast"
         self.previous_runs_url = previous_runs_url or settings.open_meteo_previous_runs_url
+        # The setting already names the previous-runs host's /forecast endpoint.
+        self.forecast_fallback_url = self.previous_runs_url
+        # Set by each fetch_forecast that returns data: True if the fallback host served it.
+        self.forecast_fallback_used: bool | None = None
 
-    def _get_all_cities(self, url: str, params: dict) -> list[dict]:
+    def _get_all_cities(
+        self, url: str, params: dict, *, policy: RetryPolicy = OPEN_METEO_RETRY
+    ) -> list[dict]:
         """One request for every city; the answers in the order of ``self.cities``.
 
         Open-Meteo returns a list in request order for several locations, each item but the
@@ -152,7 +179,7 @@ class WeatherClient:
             "longitude": ",".join(str(c.longitude) for c in self.cities),
             **params,
         }
-        payload = get_json(self.session, url, params, policy=OPEN_METEO_RETRY)
+        payload = get_json(self.session, url, params, policy=policy)
         items = payload if isinstance(payload, list) else [payload]
         if len(items) != len(self.cities):
             raise ValueError(
@@ -194,7 +221,14 @@ class WeatherClient:
 
     # ------------------------------------------------------------- forecast
     def fetch_forecast(self, *, past_days: int = 2, forecast_days: int = 3) -> pd.DataFrame:
-        """Recent observations (``past_days``) plus the next ``forecast_days`` per city."""
+        """Recent observations (``past_days``) plus the next ``forecast_days`` per city.
+
+        Asks api.open-meteo.com (``OPEN_METEO_PRIMARY_RETRY``), then, if that fails for any
+        reason, the previous-runs host (``OPEN_METEO_RETRY``), whose answer is checked the
+        same way. ``forecast_fallback_used`` records which one served; if both fail, the
+        fallback's error is raised.
+        """
+        self.forecast_fallback_used = None
         if not self.cities:
             return empty_weather_frame()
         log.info(
@@ -209,14 +243,34 @@ class WeatherClient:
             "forecast_days": forecast_days,
             "timezone": "UTC",
         }
-        payloads = self._get_all_cities(self.forecast_url, params)
+        try:
+            url = self.forecast_url
+            payloads = self._get_all_cities(url, params, policy=OPEN_METEO_PRIMARY_RETRY)
+            fallback = False
+        except Exception as err:
+            url = self.forecast_fallback_url
+            log.warning(
+                "Open-Meteo forecast: %s failed (%s) - asking %s instead",
+                _host(self.forecast_url),
+                err,
+                _host(url),
+            )
+            payloads = self._get_all_cities(url, params)
+            fallback = True
         df = _finalise(
             [
                 _hourly_payload_to_frame(payload, city, SOURCE_FORECAST)
                 for city, payload in zip(self.cities, payloads, strict=True)
             ]
         )
-        log.info("Open-Meteo forecast: %d rows for %d cities", len(df), len(self.cities))
+        self.forecast_fallback_used = fallback
+        log.info(
+            "Open-Meteo forecast: %d rows for %d cities, served by %s%s",
+            len(df),
+            len(self.cities),
+            _host(url),
+            " (fallback)" if fallback else "",
+        )
         return df
 
     # -------------------------------------------------------- previous runs
@@ -280,6 +334,10 @@ class WeatherClient:
             len(offsets),
         )
         return out.loc[:, PREVIOUS_RUN_COLUMNS]
+
+
+def _host(url: str) -> str:
+    return urlsplit(url).netloc or url
 
 
 def national_average(df: pd.DataFrame) -> pd.DataFrame:

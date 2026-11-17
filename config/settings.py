@@ -48,7 +48,10 @@ class Settings(BaseSettings):
     )
     open_meteo_previous_runs_url: str = Field(
         default="https://previous-runs-api.open-meteo.com/v1/forecast",
-        description="Open-Meteo Previous Runs endpoint (archived forecasts; fair backtest only).",
+        description=(
+            "Open-Meteo Previous Runs endpoint: archived forecasts for the fair backtest, "
+            "and the fallback host of the live forecast fetch."
+        ),
     )
     smard_base_url: str = Field(
         default="https://www.smard.de/app/chart_data",

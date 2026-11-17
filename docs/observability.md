@@ -20,6 +20,7 @@ and `runner:github` (or `runner:local` from a laptop — filter on `runner:githu
 | `job.duration_seconds` | every job | run time |
 | `ingest.rows` (tag `step`) | ingest | rows written per step (`smard`, `smard_forecast`, `weather_archive`, `weather_forecast`) |
 | `ingest.step_failed` (tag `step`) | ingest | 1 if that step failed |
+| `weather.forecast_fallback` | ingest | 1 if the weather forecast came from the fallback host (previous-runs-api.open-meteo.com), 0 if from api.open-meteo.com; sent only when the forecast fetch succeeded (`docs/operations.md`) |
 | `data.freshness_hours` | ingest | hours since the newest actual load hour |
 | `forecast.age_hours` | ingest | hours since the latest model forecast was issued (a watchdog for the forecast job) |
 | `forecast.issued`, `forecast.hours`, `forecast.data_age_hours` | forecast | a forecast was stored; how many hours; how old the newest actual was at issue time |
