@@ -3,20 +3,24 @@ with its weather inputs, the deadline margin, API."""
 
 from __future__ import annotations
 
-from dataclasses import replace
+import json
+import logging
+import threading
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 
 import numpy as np
 import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import event
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from src.data import db
 from src.data.weather_client import WEATHER_VARS, City
 from src.features.build_features import TARGET, build_features
-from src.features.horizons import D_PLUS_1, DAY_AHEAD, NOWCAST, select_features
-from src.models.registry import LoadedModel
+from src.features.horizons import D_PLUS_1, DAY_AHEAD, HORIZONS, NOWCAST, select_features
+from src.models.registry import CorruptBundleError, LoadedModel
 from src.serving import api, batch_forecast
 from src.serving.forecast import (
     NoDataError,
@@ -458,25 +462,139 @@ def test_batch_once_per_day_skips_when_today_is_already_issued(
 
 
 # --- API ---
-@pytest.fixture
-def client(seeded, day_ahead_features):
-    def loader() -> api.AppState:
+NOW = LAST_ACTUAL + pd.Timedelta(hours=2)  # the API's wall clock in these tests
+SHA7 = "7" * 64
+
+
+class FakeClock:
+    """Monotonic clock for the status TTL and reload retries; advanced by hand."""
+
+    def __init__(self) -> None:
+        self.t = 1000.0
+
+    def __call__(self) -> float:
+        return self.t
+
+    def advance(self, seconds: float) -> None:
+        self.t += seconds
+
+
+class FakeChampionLoader:
+    """``registry.load_champion`` without MLflow: builds the model from the DB champion row.
+
+    ``error`` makes the next loads raise; ``gate`` (an Event) makes a load wait for it.
+    """
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.error: Exception | None = None
+        self.gate: threading.Event | None = None
+
+    def __call__(self, engine) -> LoadedModel:
+        self.calls += 1
+        if self.gate is not None:
+            assert self.gate.wait(timeout=10)
+        if self.error is not None:
+            raise self.error
+        row = db.get_model_artifact(engine, "germany-load-day-ahead", champion=True)
+        model = fake_loaded_model(
+            json.loads(row["features"]),
+            version=row["version"],
+            bias=100.0,
+            horizon=HORIZONS[row["horizon"]],
+        )
+        return replace(model, bundle_sha256=row["bundle_sha256"])
+
+
+def export(
+    engine, version: str, features: list[str], *, sha: str, horizon: str = "day_ahead"
+) -> None:
+    """A ``model_artifacts`` row as ``registry.export_model_version`` writes it (fake bundle)."""
+    db.store_model_artifact(
+        engine,
+        name="germany-load-day-ahead",
+        version=version,
+        run_id=f"run-{version}",
+        horizon=horizon,
+        features=json.dumps(features),
+        bundle=b"zip",
+        bundle_sha256=sha,
+        bundle_bytes=3,
+    )
+
+
+def promote(engine, version: str, features: list[str], **kwargs) -> None:
+    export(engine, version, features, **kwargs)
+    db.set_champion(engine, "germany-load-day-ahead", version)
+
+
+def issue_forecast(engine, features: list[str], issued_at: pd.Timestamp, version="7"):
+    """Store one batch issue made by ``version`` at ``issued_at``."""
+    model = fake_loaded_model(features, version=version, bias=100.0)
+    result = make_day_ahead_forecast(engine, model, weather_client=FakeWeatherClient(LAST_ACTUAL))
+    result = replace(result, issued_at=issued_at)
+    store_forecast(engine, result)
+    return result
+
+
+@dataclass
+class Api:
+    client: TestClient
+    clock: FakeClock
+    loader: FakeChampionLoader
+    wall: list[pd.Timestamp]  # [now]; replace the item to move the wall clock
+
+    @property
+    def state(self) -> api.AppState:
+        return self.client.app.state.ctx
+
+    def get(self, path: str, **kwargs):
+        return self.client.get(path, **kwargs)
+
+    def after_ttl(self) -> None:
+        self.clock.advance(api.STATUS_TTL_SECONDS + 1)
+
+
+def make_api(engine, features: list[str], *, background_reload: bool = False):
+    """A client serving v7 (exported and DB champion), with a fake clock and loader."""
+    promote(engine, "7", features, sha=SHA7)
+    clock, loader, wall = FakeClock(), FakeChampionLoader(), [NOW]
+    initial = replace(fake_model(features), bundle_sha256=SHA7)
+
+    def state_loader() -> api.AppState:
         return api.AppState(
-            engine=seeded,
-            model=fake_model(day_ahead_features),
+            engine=engine,
+            model=initial,
             weather_client=FakeWeatherClient(LAST_ACTUAL),
             started_at=datetime.now(UTC),
+            model_loader=loader,
         )
 
-    with TestClient(api.create_app(loader)) as c:
-        yield c
+    config = api.ServingConfig(
+        background_reload=background_reload, now=lambda: wall[0], monotonic=clock
+    )
+    return TestClient(api.create_app(state_loader, config=config)), clock, loader, wall
 
 
-def test_health(client, day_ahead_features) -> None:
-    r = client.get("/health")
+@pytest.fixture
+def served(seeded, day_ahead_features):
+    client, clock, loader, wall = make_api(seeded, day_ahead_features)
+    with client:
+        yield Api(client, clock, loader, wall)
+
+
+@pytest.fixture
+def client(served):
+    return served.client
+
+
+def test_health_ok_when_data_is_fresh(served, seeded, day_ahead_features) -> None:
+    issue_forecast(seeded, day_ahead_features, NOW - pd.Timedelta(hours=1))
+    served.after_ttl()
+    r = served.get("/health")
     assert r.status_code == 200
     body = r.json()
-    assert body["status"] == "ok"
+    assert body["status"] == "ok" and body["reasons"] == []
     assert body["database"] == "sqlite"
     assert body["model"] == {
         "name": "germany-load-day-ahead",
@@ -486,8 +604,192 @@ def test_health(client, day_ahead_features) -> None:
         "n_features": len(day_ahead_features),
         "features": day_ahead_features,
     }
+    assert body["champion_db_version"] == "7"
     assert body["last_actual_utc"].startswith("2024-01-30T23:00:00")
-    assert body["last_forecast_issued_utc"] is None
+    assert body["last_actual_age_hours"] == 2.0
+    assert body["last_forecast_age_hours"] == 1.0
+
+
+@pytest.mark.parametrize(
+    ("actual_age", "forecast_age", "reasons"),
+    [
+        (6.0, 25.0, []),  # at the thresholds: still ok
+        (6.05, 25.0, ["latest actual older than 6 h"]),
+        (6.0, 25.05, ["latest forecast older than 25 h"]),
+        (30.0, 48.0, ["latest actual older than 6 h", "latest forecast older than 25 h"]),
+    ],
+)
+def test_health_degraded_when_data_is_stale(
+    served, seeded, day_ahead_features, actual_age, forecast_age, reasons
+) -> None:
+    now = LAST_ACTUAL + pd.Timedelta(hours=actual_age)
+    issue_forecast(seeded, day_ahead_features, now - pd.Timedelta(hours=forecast_age))
+    served.wall[0] = now
+    served.after_ttl()
+    r = served.get("/health")
+    assert r.status_code == 200  # degraded is not dead
+    assert r.json()["reasons"] == reasons
+    assert r.json()["status"] == ("degraded" if reasons else "ok")
+
+
+def test_health_degraded_without_forecast_or_champion(served, seeded) -> None:
+    body = served.get("/health").json()
+    assert body["reasons"] == ["no forecast issued yet"]
+    with seeded.begin() as conn:
+        conn.execute(db.ModelArtifact.__table__.update().values(is_champion=False))
+    served.after_ttl()
+    body = served.get("/health").json()
+    assert body["reasons"] == ["no forecast issued yet", "no champion in database"]
+    assert body["champion_db_version"] is None
+    assert body["model"]["version"] == "7"  # still serving what it has
+
+
+def test_health_status_is_cached_for_the_ttl(served, seeded, day_ahead_features) -> None:
+    assert served.get("/health").json()["last_forecast_issued_utc"] is None
+    issue_forecast(seeded, day_ahead_features, NOW - pd.Timedelta(hours=1))
+    assert served.get("/health").json()["last_forecast_issued_utc"] is None  # cached
+    served.after_ttl()
+    assert served.get("/health").json()["last_forecast_issued_utc"] is not None
+
+
+def test_status_is_read_in_one_round_trip(seeded, day_ahead_features) -> None:
+    promote(seeded, "7", day_ahead_features, sha=SHA7)
+    issue_forecast(seeded, day_ahead_features, NOW - pd.Timedelta(hours=1))
+    statements: list[str] = []
+
+    def count(conn, cursor, statement, *args) -> None:
+        statements.append(statement)
+
+    event.listen(seeded, "before_cursor_execute", count)
+    try:
+        status = db.serving_status(seeded, "germany-load-day-ahead")
+    finally:
+        event.remove(seeded, "before_cursor_execute", count)
+    assert len(statements) == 1
+    assert status == db.ServingStatus(
+        last_actual=LAST_ACTUAL,
+        last_issued=NOW - pd.Timedelta(hours=1),
+        champion_version="7",
+        champion_sha256=SHA7,
+    )
+    assert db.serving_status(seeded, "another-model").champion_version is None
+
+
+def test_unreachable_database_gives_a_label_not_the_error(served, monkeypatch, caplog) -> None:
+    secret = "connection to server at ep-secret-host.neon.tech failed: password hunter2"
+
+    def boom(engine, name):
+        raise OperationalError("SELECT 1", {}, Exception(secret))
+
+    monkeypatch.setattr(api.db, "serving_status", boom)
+    served.after_ttl()
+    with caplog.at_level(logging.ERROR, logger="src.serving.api"):
+        r = served.get("/health")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "degraded"
+    assert body["reasons"] == ["database unreachable"]
+    assert body["database"] == "unreachable"
+    assert "ep-secret-host" not in r.text and "hunter2" not in r.text
+    assert "ep-secret-host" in caplog.text  # the full error goes to the log only
+
+
+def test_api_engine_has_a_short_connect_timeout(monkeypatch) -> None:
+    captured: dict = {}
+    monkeypatch.setattr(db, "create_engine", lambda url, **kw: captured.update(kw))
+    db.get_engine("postgresql://u:p@h/d", connect_timeout=api.DB_CONNECT_TIMEOUT_SECONDS)
+    assert captured["connect_args"] == {"connect_timeout": api.DB_CONNECT_TIMEOUT_SECONDS}
+    assert api.DB_CONNECT_TIMEOUT_SECONDS < 5  # inside the Docker healthcheck's timeout
+    captured.clear()
+    db.get_engine("sqlite:///:memory:", connect_timeout=3)  # Postgres only
+    assert "connect_args" not in captured
+
+
+def test_api_follows_a_new_champion_after_the_ttl(served, seeded, day_ahead_features) -> None:
+    promote(seeded, "8", day_ahead_features, sha="8" * 64)
+    assert served.get("/forecast").json()["model"]["version"] == "7"  # within the TTL
+    assert served.loader.calls == 0
+    served.after_ttl()
+    assert served.get("/forecast").json()["model"]["version"] == "8"
+    body = served.get("/health").json()
+    assert body["model"]["version"] == "8" and body["champion_db_version"] == "8"
+    assert "champion" not in " ".join(body["reasons"])
+    served.after_ttl()
+    served.get("/forecast")
+    assert served.loader.calls == 1  # no reload while the pointer is unchanged
+
+    # a rollback is the same move back
+    db.set_champion(seeded, "germany-load-day-ahead", "7")
+    served.after_ttl()
+    assert served.get("/forecast").json()["model"]["version"] == "7"
+
+
+def test_a_new_bundle_under_the_same_version_reloads(served, seeded, day_ahead_features) -> None:
+    export(seeded, "7", day_ahead_features, sha="e" * 64)  # re-export keeps the champion flag
+    served.after_ttl()
+    served.get("/health")
+    assert served.loader.calls == 1
+    assert served.state.served.model.bundle_sha256 == "e" * 64
+
+
+def test_corrupt_champion_keeps_the_old_model_and_is_not_retried(
+    served, seeded, day_ahead_features
+) -> None:
+    served.loader.error = CorruptBundleError("corrupt model bundle at /secret/path")
+    promote(seeded, "8", day_ahead_features, sha="8" * 64)
+    served.after_ttl()
+    assert served.get("/forecast").json()["model"]["version"] == "7"
+    r = served.get("/health")
+    assert r.json()["status"] == "degraded"
+    assert "champion reload failed (CorruptBundleError)" in r.json()["reasons"]
+    assert "/secret/path" not in r.text
+    served.clock.advance(api.RELOAD_RETRY_SECONDS * 10)
+    served.get("/forecast")
+    assert served.loader.calls == 1  # the same bundle will never load
+    # a new export (another SHA) is tried again
+    served.loader.error = None
+    promote(seeded, "9", day_ahead_features, sha="9" * 64)
+    served.after_ttl()
+    assert served.get("/forecast").json()["model"]["version"] == "9"
+    assert served.get("/health").json()["reasons"] == ["no forecast issued yet"]
+
+
+def test_a_transient_reload_failure_is_retried_after_the_wait(
+    served, seeded, day_ahead_features
+) -> None:
+    served.loader.error = RuntimeError("timeout talking to host-x")
+    promote(seeded, "8", day_ahead_features, sha="8" * 64)
+    served.after_ttl()
+    assert "champion reload failed (RuntimeError)" in served.get("/health").json()["reasons"]
+    served.after_ttl()
+    served.get("/forecast")
+    assert served.loader.calls == 1  # not every TTL: each try downloads the bundle
+    served.loader.error = None
+    served.clock.advance(api.RELOAD_RETRY_SECONDS)
+    assert served.get("/forecast").json()["model"]["version"] == "8"
+    assert served.loader.calls == 2
+
+
+def test_reload_in_background_never_blocks_requests(seeded, day_ahead_features) -> None:
+    client, clock, loader, _ = make_api(seeded, day_ahead_features, background_reload=True)
+    with client:
+        state: api.AppState = client.app.state.ctx
+        loader.gate = threading.Event()
+        promote(seeded, "8", day_ahead_features, sha="8" * 64)
+        clock.advance(api.STATUS_TTL_SECONDS + 1)
+        before = state.served
+        assert client.get("/forecast").json()["model"]["version"] == "7"  # served meanwhile
+        assert "champion reload in progress" in client.get("/health").json()["reasons"]
+        clock.advance(api.STATUS_TTL_SECONDS + 1)
+        assert client.get("/forecast").json()["model"]["version"] == "7"
+        assert loader.calls == 1  # the lock is held: no second reload started
+        assert state.served is before  # nothing half-swapped
+        loader.gate.set()
+        state.reload_thread.join(timeout=10)
+        after = state.served
+        assert after is not before
+        assert after.pointer == ("8", "8" * 64)  # model, version and SHA swapped together
+        assert client.get("/forecast").json()["model"]["version"] == "8"
 
 
 def test_forecast_endpoint_returns_24_hours(client) -> None:
@@ -512,20 +814,46 @@ def test_forecast_endpoint_hours_param(client) -> None:
     assert client.get("/forecast", params={"hours": 0}).status_code == 422
 
 
-def test_forecast_latest_404_then_serves_batch_output(client, seeded, day_ahead_features) -> None:
-    assert client.get("/forecast/latest").status_code == 404
+def test_forecast_latest_404_then_serves_batch_output(served, seeded, day_ahead_features) -> None:
+    assert served.get("/forecast/latest").status_code == 404
 
-    result = make_day_ahead_forecast(
-        seeded, fake_model(day_ahead_features), weather_client=FakeWeatherClient(LAST_ACTUAL)
-    )
-    store_forecast(seeded, result)
-    r = client.get("/forecast/latest")
+    result = issue_forecast(seeded, day_ahead_features, NOW - pd.Timedelta(hours=1))
+    r = served.get("/forecast/latest")
     assert r.status_code == 200
     body = r.json()
     assert len(body["forecast"]) == 24
-    assert body["model"]["version"] == "7"
+    assert body["model"]["version"] == "7" and body["model"]["alias"] == "champion"
     assert pd.Timestamp(body["issued_at"]) == result.issued_at.floor("us")
-    assert client.get("/health").json()["last_forecast_issued_utc"] is not None
+
+
+def test_forecast_latest_describes_the_model_that_issued_it(
+    served, seeded, day_ahead_features
+) -> None:
+    issue_forecast(seeded, day_ahead_features, NOW - pd.Timedelta(hours=1))
+    d1_features = select_features(day_ahead_features, D_PLUS_1)
+    assert d1_features != day_ahead_features
+    promote(seeded, "8", d1_features, sha="8" * 64, horizon="d_plus_1")
+    served.after_ttl()
+    served.get("/health")
+    assert served.state.served.model.horizon.name == "d_plus_1"  # the new champion is loaded
+
+    body = served.get("/forecast/latest").json()
+    assert body["horizon"] == "day_ahead"  # the stored issue's, not the loaded model's
+    assert body["model"] == {
+        "name": "germany-load-day-ahead",
+        "version": "7",
+        "alias": None,  # no longer the champion
+        "horizon": "day_ahead",
+        "n_features": len(day_ahead_features),
+        "features": day_ahead_features,
+    }
+
+    # v7's export pruned: its features are unknown, not borrowed from the loaded model
+    with seeded.begin() as conn:
+        conn.execute(db.ModelArtifact.__table__.delete().where(db.ModelArtifact.version == "7"))
+    body = served.get("/forecast/latest").json()
+    assert body["model"]["features"] is None and body["model"]["n_features"] is None
+    assert body["model"]["horizon"] == "day_ahead"
 
 
 def test_forecast_endpoint_503_without_data(tmp_path, day_ahead_features) -> None:
@@ -542,8 +870,14 @@ def test_forecast_endpoint_503_without_data(tmp_path, day_ahead_features) -> Non
 
     with TestClient(api.create_app(loader)) as c:
         r = c.get("/forecast")
+        health = c.get("/health").json()
     assert r.status_code == 503
     assert "no actual load" in r.json()["detail"]
+    assert health["reasons"] == [
+        "no actual load stored",
+        "no forecast issued yet",
+        "no champion in database",
+    ]
 
 
 def test_openapi_lists_the_endpoints() -> None:
