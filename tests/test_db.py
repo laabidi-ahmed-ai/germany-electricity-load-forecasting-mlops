@@ -291,3 +291,21 @@ def test_model_artifacts_store_champion_pointer_and_prune(engine) -> None:
     remaining = set(db.list_model_artifacts(engine, "m")["version"])
     assert "3" in remaining and len(remaining) == 2
     assert db.prune_model_artifacts(engine, "m", keep=5) == 0
+
+
+def test_model_artifact_metadata_without_the_bundle(engine) -> None:
+    db.store_model_artifact(
+        engine,
+        name="m",
+        version="1",
+        horizon="d_plus_1",
+        features='["a"]',
+        bundle=b"zip",
+        bundle_sha256="x" * 64,
+        bundle_bytes=3,
+    )
+    meta = db.get_model_artifact(engine, "m", "1", with_bundle=False)
+    assert "bundle" not in meta
+    assert meta["features"] == '["a"]' and meta["horizon"] == "d_plus_1"
+    assert meta["is_champion"] is False
+    assert db.get_model_artifact(engine, "m", "2", with_bundle=False) is None

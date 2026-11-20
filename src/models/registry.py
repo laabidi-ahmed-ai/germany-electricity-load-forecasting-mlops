@@ -83,6 +83,7 @@ class LoadedModel:
     train_start: pd.Timestamp | None = None
     train_end: pd.Timestamp | None = None
     metrics: dict[str, float] | None = None
+    bundle_sha256: str | None = None  # of the export it was loaded from (serving compares it)
 
     @property
     def version_label(self) -> str:
@@ -312,6 +313,7 @@ def _load_export(row: dict[str, Any], cache_dir: Path) -> LoadedModel:
         train_start=_utc_or_none(row["train_start"]),
         train_end=_utc_or_none(row["train_end"]),
         metrics=json.loads(row["metrics"]) if row["metrics"] else None,
+        bundle_sha256=row["bundle_sha256"],
     )
 
 
