@@ -752,6 +752,34 @@ The margin stays at 5 %. A false rollback is cheap: it keeps a champion that alr
 - Datadog: `retrain.cv_gate_failed`, `retrain.cooldown`, `retrain.rolled_back` and `post_promotion.pending`, sent on every pass as 0 or 1, so a monitor on any of them recovers on the next pass. One monitor was added, "Champion rolled back" (§16.4).
 - Any two exported versions of one horizon can be compared by hand, without writing anything: `python -m src.monitoring.promotion --version <new> --previous <old>`.
 
+### 16.13 The API follows champion changes
+
+**The problem.** The API loaded the champion once, at startup. After a promotion or a rollback it kept serving the old model until someone restarted it. `/forecast/latest` described the stored forecast with the loaded model's horizon and features, even when an older model had issued it. `/health` always said `ok`, even when the data had stopped arriving.
+
+**What was built** (`src/serving/api.py`).
+- **The API follows the champion pointer.** At most once every 60 s, a request reads the data ages and the champion pointer (version and bundle SHA-256) in one query, `db.serving_status`. If the pointer has moved, a background thread loads the new champion. A promotion, a rollback and a re-export under the same version number are all handled the same way. Meanwhile every request keeps serving the old model. The reload lock never blocks a request. The new model is swapped in as one immutable object, so no request mixes one model's version with another's predictions.
+- **A failed reload keeps the old model**, and `/health` shows it. A corrupt bundle is never retried: the same bytes will never load. Any other failure is retried after 10 min, because each try downloads the bundle.
+- **`/forecast/latest` describes the model that issued the forecast.** Name, version and horizon come from the stored rows. The features come from that version's export. They are `null` once the export has been pruned (the last 5 are kept), rather than borrowed from the loaded model. `alias` is `champion` only if that version is the champion now.
+- **`/health` reports `ok` or `degraded`, with short reasons:**
+
+  | Reason | When |
+  |---|---|
+  | `latest actual older than 6 h` / `no actual load stored` | Ingest runs hourly and SMARD publishes about 1–2 h late, so a normal age is under 3 h |
+  | `latest forecast older than 25 h` / `no forecast issued yet` | The same threshold as the Datadog monitor "No forecast today" (§16.4), so "stale" means the same everywhere |
+  | `no champion in database` | The pointer is gone; the API keeps serving what it has |
+  | `champion reload failed (<error class>)` / `champion reload in progress` | The loaded model is not the database champion |
+  | `serving an older champion` | The loaded model is not the database champion and no reload is running, for example because the champion moved again during a reload. The next status check starts one |
+  | `status check in progress` | No status has been read yet: right after startup, another request is still running the first query |
+  | `database unreachable` | The status query failed. The connection timeout is 3 s, so a slow database wake-up answers within the Docker healthcheck's 5 s |
+
+  The reasons are fixed labels. `/health` is public, and database errors can carry host and connection details, so the full error goes only to the log. The status is cached with the same 60 s TTL, so a Docker probe every 30 s costs at most one query a minute.
+- **`degraded` still returns HTTP 200.** Stale data is not a dead process. The image's healthcheck runs `curl -f`, so an error status would mark a working container unhealthy, and anything that restarts unhealthy containers would restart it. A restart does not bring fresh data. Read `status` and `reasons` instead.
+
+**What is not covered.**
+- A new champion is served up to 60 s after the promotion, plus the time it takes to load.
+- `/forecast` and `/forecast/latest` still fail with an error when the database is down. Only `/health` turns that into a label.
+- The 3 s timeout covers opening a connection, not a slow query on a connection that is already open.
+
 ---
 
 ## 17. Roadmap
