@@ -146,7 +146,28 @@ Any service that can send a scheduled HTTP POST works; these steps use
   registry): `python -m src.models.registry --promote <previous version>`. The MLflow alias
   moves first; if it fails, the champion serving reads is left unchanged. A promotion made
   by hand is never checked or undone by the monitor, and it ends a running cooldown. The
-  monitor rolls back by itself in one case only: *Promotion policy*, below.
+  monitor rolls back by itself in one case only: *Promotion policy*, below. A running API
+  needs no restart: it serves the new champion within about a minute (next entry).
+- **Read the API's `/health`.** It always answers HTTP 200: stale data is not a dead
+  process, and the image's `curl -f` healthcheck would otherwise mark a working container
+  unhealthy (and get it restarted by anything that restarts unhealthy containers). Read
+  `status` (`ok` | `degraded`) and `reasons` instead. `model` is what is loaded,
+  `champion_db_version` is what the database points at, and both are re-read at most every
+  60 s (`checked_at`). The reasons are fixed labels:
+  - `latest actual older than 6 h`: ingest stopped, or SMARD is late. Check the ingest runs.
+  - `latest forecast older than 25 h`: today's forecast is missing. This is the same
+    threshold as the Datadog monitor "No forecast today".
+  - `champion reload in progress`: normal for a few seconds after a promotion.
+  - `serving an older champion`: the loaded model is not the database champion and no reload
+    is running (for example, the champion moved again during a reload). The next status
+    check, within 60 s, starts one.
+  - `status check in progress`: no status read yet. Right after startup, another request is
+    still running the first query. Ask again in a moment.
+  - `champion reload failed (<error class>)`: the API keeps serving the old model. The full
+    error is in the API log. `CorruptBundleError` is never retried for the same export:
+    re-export or promote another version. Any other error is retried every 10 min.
+  - `database unreachable`: the status query failed or took longer than the 3 s connect
+    timeout (for example a slow wake-up). The cause is in the log, never in the response.
 - **A bootstrap or monitor-retrain run shows as cancelled.** Both workflows share the
   `promotion` concurrency group, and GitHub keeps only one pending run per group, so a newer
   queued run cancels the waiting one - either a bootstrap or that day's monitor-retrain

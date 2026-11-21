@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
@@ -291,10 +292,15 @@ class ModelArtifact(Base):
 
 
 # --- Engine / schema ---
-def get_engine(database_url: str | None = None, **kwargs: Any) -> Engine:
+def get_engine(
+    database_url: str | None = None, *, connect_timeout: int | None = None, **kwargs: Any
+) -> Engine:
     """Create an engine for ``database_url`` (default: ``settings.database_url``).
 
     For SQLite the parent directory is created so a fresh clone "just works".
+    ``connect_timeout`` (seconds, Postgres only; libpq counts at least 2 and applies it to each
+    address it tries) bounds how long opening a connection may take - the API sets it so a
+    slow wake-up answers ``/health`` as degraded instead of hanging past the probe's timeout.
     """
     url = normalize_database_url(database_url or get_settings().database_url)
     if url.startswith("sqlite:///") and not url.endswith(":memory:"):
@@ -302,6 +308,10 @@ def get_engine(database_url: str | None = None, **kwargs: Any) -> Engine:
     elif url.startswith("postgresql"):
         # Cloud Postgres (Neon / Supabase) closes idle connections; re-check before use.
         kwargs.setdefault("pool_pre_ping", True)
+        if connect_timeout is not None:
+            connect_args = dict(kwargs.pop("connect_args", {}))
+            connect_args.setdefault("connect_timeout", connect_timeout)
+            kwargs["connect_args"] = connect_args
     return create_engine(url, future=True, **kwargs)
 
 
@@ -725,10 +735,19 @@ def set_champion(engine: Engine, name: str, version: str) -> None:
 
 
 def get_model_artifact(
-    engine: Engine, name: str, version: str | None = None, *, champion: bool = False
+    engine: Engine,
+    name: str,
+    version: str | None = None,
+    *,
+    champion: bool = False,
+    with_bundle: bool = True,
 ) -> dict[str, Any] | None:
-    """One exported version (by ``version`` or the champion) as a dict, or None."""
-    stmt = select(ModelArtifact.__table__).where(ModelArtifact.name == name)
+    """One exported version (by ``version`` or the champion) as a dict, or None.
+
+    ``with_bundle=False`` leaves out the zipped model (several MB): metadata only.
+    """
+    cols = [c for c in ModelArtifact.__table__.columns if with_bundle or c.name != "bundle"]
+    stmt = select(*cols).where(ModelArtifact.name == name)
     if champion:
         stmt = stmt.where(ModelArtifact.is_champion.is_(True))
     elif version is not None:
@@ -742,6 +761,38 @@ def get_model_artifact(
     out = dict(row)
     out["is_champion"] = bool(out["is_champion"])
     return out
+
+
+@dataclass(frozen=True)
+class ServingStatus:
+    """What the API's ``/health`` needs from the database, read in one round trip."""
+
+    last_actual: pd.Timestamp | None  # latest SMARD hour stored
+    last_issued: pd.Timestamp | None  # latest model forecast issue (any version)
+    champion_version: str | None  # the champion pointer serving should follow
+    champion_sha256: str | None
+
+
+def serving_status(engine: Engine, name: str) -> ServingStatus:
+    """Freshness of the data and the champion pointer, as one query (four scalar subqueries)."""
+    art = ModelArtifact
+    champion = (art.name == name) & art.is_champion.is_(True)
+    stmt = select(
+        select(func.max(LoadActual.timestamp_utc))
+        .where(LoadActual.source == SOURCE_SMARD)
+        .scalar_subquery(),
+        select(func.max(LoadForecastModel.issued_at)).scalar_subquery(),
+        select(art.version).where(champion).limit(1).scalar_subquery(),
+        select(art.bundle_sha256).where(champion).limit(1).scalar_subquery(),
+    )
+    with engine.connect() as conn:
+        last_actual, last_issued, version, sha = conn.execute(stmt).one()
+    return ServingStatus(
+        last_actual=None if last_actual is None else to_utc(last_actual),
+        last_issued=None if last_issued is None else to_utc(last_issued),
+        champion_version=None if version is None else str(version),
+        champion_sha256=sha,
+    )
 
 
 def list_model_artifacts(engine: Engine, name: str) -> pd.DataFrame:
