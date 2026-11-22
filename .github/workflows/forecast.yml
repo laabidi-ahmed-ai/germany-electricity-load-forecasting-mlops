@@ -50,7 +50,8 @@ jobs:
 
       # A failed refresh (e.g. Open-Meteo down) still forecasts from what is stored, and
       # the job still ends red. batch_forecast refuses stale or gappy load and fetches
-      # missing target-day weather itself, failing if it cannot (README §16.2, 2 Nov).
+      # missing target-day weather itself; if that fetch fails or is invalid, it forecasts
+      # with the stored weather (NaN where missing) - weather never stops it (README §16.14).
       - name: Refresh actuals + weather (incremental ingest)
         id: refresh
         run: python -m src.data.ingest

@@ -20,8 +20,10 @@ and `runner:github` (or `runner:local` from a laptop — filter on `runner:githu
 | `job.duration_seconds` | every job | run time |
 | `ingest.rows` (tag `step`) | ingest | rows written per step (`smard`, `smard_forecast`, `weather_archive`, `weather_forecast`) |
 | `ingest.step_failed` (tag `step`) | ingest | 1 if that step failed |
-| `weather.forecast_fallback` | ingest | 1 if the weather forecast came from the fallback host (previous-runs-api.open-meteo.com), 0 if from api.open-meteo.com; sent only when the forecast fetch succeeded (`docs/operations.md`) |
+| `weather.forecast_fallback` (tag `step:weather_forecast`) | ingest | 1 if the weather forecast came from the fallback host (previous-runs-api.open-meteo.com), 0 if from api.open-meteo.com; sent only when the forecast fetch succeeded (`docs/operations.md`) |
+| `ingest.gap_hours` (tag `step:smard_gaps|smard_forecast_gaps|weather_archive_gaps`) | ingest | missing hours older than the overlap window that the daily gap scan found, before re-fetching them; sent only by the scanning run (02:00 UTC hour). 0 is normal; the same non-zero value every day is a hole the provider cannot fill (`docs/operations.md`) |
 | `data.freshness_hours` | ingest | hours since the newest actual load hour |
+| `weather.archive_age_hours` | ingest | hours since the newest stored weather-archive hour; normally −23 to +1 (archive-api returns rows up to 23:00 UTC of the current day). A failed archive fetch is only a warning up to 24, so this is what shows a real archive outage |
 | `forecast.age_hours` | ingest | hours since the latest model forecast was issued (a watchdog for the forecast job) |
 | `forecast.issued`, `forecast.hours`, `forecast.data_age_hours` | forecast | a forecast was stored; how many hours; how old the newest actual was at issue time |
 | `forecast.deadline_margin_hours` | forecast | hours from the issue to its deadline (D+1: 12:00 Berlin the day before); about +5 in winter, negative = too late to be scored |
@@ -81,8 +83,9 @@ so the alert e-mails you. Create them in this order.
 | 5 | A job failed | `max(last_1h):max:germany_load.job.failed{runner:github} by {job} > 0.5` | above 0.5 — choose **Multi Alert** (one alert per job) | off |
 | 6 | Drift check unavailable | `max(last_1d):max:germany_load.drift.unavailable{runner:github} > 0.5` | above 0.5 | off |
 | 7 | Champion rolled back | `max(last_1d):max:germany_load.retrain.rolled_back{runner:github} > 0.5` | above 0.5 | off |
+| 8 | Weather archive is behind (optional) | `min(last_2h):max:germany_load.weather.archive_age_hours{runner:github} > 24` | above 24 (warning 12) | off |
 
-Why these seven:
+Why these eight:
 1. **Ingest stopped** — the external scheduler or the token broke; nothing else notices.
    No metrics at all for 3 h is itself the alert (the "no data" option).
 2. **Stale data** — ingest runs but SMARD stopped publishing (or a step keeps failing).
@@ -110,6 +113,11 @@ Why these seven:
    rollback stands (`docs/operations.md`, *A champion was rolled back*). The gauge is 1
    only on the pass that rolled back and 0 on every other pass, so with *no data* off and
    a one-day window the monitor returns to OK by itself a day later.
+8. **Weather archive is behind** (optional) — a failed archive fetch is only a warning
+   while the stored archive is at most 24 h old (README §16.14), so single provider errors
+   (a 500, a 429 from the shared GitHub runner IPs) no longer turn `ingest` red. Above 24 h
+   the step fails again and monitor 5 fires anyway; this monitor names the cause, and its
+   warning at 12 h comes earlier. Normal values are −23 to +1 h.
 
 Use **Test Notifications** (bottom of the monitor page) once to check the e-mail arrives.
 
@@ -129,6 +137,8 @@ widgets (*Add widgets* → type → paste the query in the code editor):
 | Model vs official MAPE (7 d) | Timeseries | `max:germany_load.model.mape{window:7d}` and `max:germany_load.official.mape{window:7d}` |
 | Model vs official MAPE (30 d) | Timeseries | same with `window:30d` |
 | Data freshness (h) | Query Value | `max:germany_load.data.freshness_hours{runner:github}` |
+| Weather archive age (h) | Query Value | `max:germany_load.weather.archive_age_hours{runner:github}` |
+| Gap-scan missing hours | Timeseries (bars) | `max:germany_load.ingest.gap_hours{runner:github} by {step}` |
 | Forecast age (h) | Query Value | `max:germany_load.forecast.age_hours{runner:github}` |
 | Forecast deadline margin (h) | Timeseries | `min:germany_load.forecast.deadline_margin_hours{runner:github}` |
 | On-time forecasts (%) | Timeseries | `min:germany_load.forecast.on_time_pct{runner:github} by {window}` |
@@ -136,7 +146,7 @@ widgets (*Add widgets* → type → paste the query in the code editor):
 | Rows ingested per step | Timeseries (bars) | `sum:germany_load.ingest.rows{runner:github} by {step}` |
 | Job duration (s) | Timeseries | `max:germany_load.job.duration_seconds{runner:github} by {job}` |
 | Failed jobs | Timeseries (bars) | `sum:germany_load.job.failed{runner:github} by {job}` |
-| Monitor status | Monitor Summary | the seven monitors above |
+| Monitor status | Monitor Summary | the monitors above |
 
 ## Turning it off
 Delete the `DD_API_KEY` secret: the jobs keep working and simply stop sending metrics.

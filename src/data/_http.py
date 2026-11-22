@@ -24,6 +24,12 @@ RETRYABLE_4XX = {408, 429}  # request timeout, rate limited: worth another try
 Timeout = float | tuple[float, float]  # seconds; a pair is (connect, read), as in requests
 
 
+class FetchError(RuntimeError):
+    """The request itself failed: a final HTTP error, or the retries gave up (timeouts,
+    connection errors, 5xx / 429, a non-JSON body). Not raised for an answer that arrived
+    but has an unexpected shape - callers treat only this as a transient provider problem."""
+
+
 @dataclass(frozen=True)
 class RetryPolicy:
     """How one call waits for an answer and how often it tries again.
@@ -77,7 +83,7 @@ def get_json(
     Transient failures (5xx, 408/429, timeouts, connection errors, a non-JSON body) are
     retried after ``policy.wait(1)``, ``policy.wait(2)``, ... seconds (3 s, 9 s, 27 s by
     default: long enough to ride out a provider hiccup); any other 4xx is final. Raises
-    ``RuntimeError`` when giving up.
+    ``FetchError`` (a ``RuntimeError``) for a final 4xx and when giving up.
     """
     retries = policy.retries
     last_err: Exception | None = None
@@ -95,7 +101,7 @@ def get_json(
         except requests.HTTPError as err:
             status = getattr(err.response, "status_code", None)
             if status is not None and status < 500 and status not in RETRYABLE_4XX:
-                raise RuntimeError(f"{url} returned HTTP {status}") from err
+                raise FetchError(f"{url} returned HTTP {status}") from err
             last_err = err
         except Exception as err:
             last_err = err
@@ -111,7 +117,7 @@ def get_json(
             wait,
         )
         sleep(wait)
-    raise RuntimeError(f"giving up on {url} after {retries} attempts: {last_err}")
+    raise FetchError(f"giving up on {url} after {retries} attempts: {last_err}")
 
 
 def _describe(resp: Any) -> str:

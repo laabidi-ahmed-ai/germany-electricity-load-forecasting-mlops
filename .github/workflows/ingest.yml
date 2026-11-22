@@ -56,9 +56,12 @@ jobs:
         with:
           requirements: requirements/ingest.txt
 
+      # --gap-scan daily: the run starting in the 02:00 UTC hour also re-fetches holes older
+      # than the overlap window, within a 2-minute budget (README §16.14). Only this workflow
+      # scans: the refresh steps of forecast and monitor-retrain do not pass the flag.
       - name: Ingest (incremental)
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.mode == 'incremental' }}
-        run: python -m src.data.ingest --sources "${{ inputs.sources || 'smard,weather' }}"
+        run: python -m src.data.ingest --gap-scan daily --sources "${{ inputs.sources || 'smard,weather' }}"
 
       - name: Ingest (backfill)
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'backfill' }}

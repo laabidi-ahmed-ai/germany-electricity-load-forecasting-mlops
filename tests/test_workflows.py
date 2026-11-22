@@ -247,7 +247,14 @@ def test_ingest_workflow_installs_only_the_lean_requirements() -> None:
     (job,) = wf["jobs"].values()
     assert job["env"]["PYTHONPATH"] == "."
     assert "python -m src.data.ingest --backfill" in text
-    assert "python -m src.data.ingest --sources" in text
+    assert "python -m src.data.ingest --gap-scan daily --sources" in text
+
+
+def test_only_the_hourly_ingest_runs_the_gap_scan() -> None:
+    """The forecast and monitor refreshes must not spend the scan's budget (README §16.14)."""
+    assert "--gap-scan daily" in run_lines(load("ingest.yml"))
+    for name in ("forecast.yml", "monitor_retrain.yml", "bootstrap.yml"):
+        assert "--gap-scan" not in run_lines(load(name)), name
 
 
 def test_heavy_workflows_install_the_project_and_run_the_right_entrypoints() -> None:

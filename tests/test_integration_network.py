@@ -30,10 +30,18 @@ def test_smard_dst_week_is_contiguous_in_utc() -> None:
     assert set(df["timestamp_utc"].diff().dropna()) == {pd.Timedelta(hours=1)}
 
 
+def test_smard_autumn_week_keeps_its_169th_hour() -> None:
+    """2024-10-27T22:00Z is the last hour of the 169-hour week file (fix plan Step 12)."""
+    df = SmardClient().fetch_load("2024-10-27T22:00", "2024-10-27T23:00")
+    assert list(df["timestamp_utc"]) == list(
+        pd.date_range("2024-10-27T22:00Z", periods=2, freq="h")
+    )
+
+
 def test_open_meteo_archive_two_days_one_city() -> None:
     client = WeatherClient(cities=GERMAN_CITIES[:1])
     df = client.fetch_historical("2024-01-08", "2024-01-09")
-    validate_weather(df, min_rows=48)
+    validate_weather(df, min_rows=48, expected_cities=[GERMAN_CITIES[0].name])
     assert len(df) == 48
     assert df["temperature_2m"].between(-30, 40).all()
 
@@ -41,7 +49,7 @@ def test_open_meteo_archive_two_days_one_city() -> None:
 def test_open_meteo_forecast_one_city() -> None:
     client = WeatherClient(cities=GERMAN_CITIES[:1])
     df = client.fetch_forecast(past_days=1, forecast_days=2)
-    validate_weather(df, min_rows=48)
+    validate_weather(df, min_rows=48, expected_cities=[GERMAN_CITIES[0].name])
     assert df["timestamp_utc"].max() > pd.Timestamp.now(tz="UTC")
 
 

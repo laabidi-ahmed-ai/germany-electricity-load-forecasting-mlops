@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -17,6 +18,7 @@ from sqlalchemy import event
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from src.data import db
+from src.data._http import FetchError
 from src.data.weather_client import WEATHER_VARS, City
 from src.features.build_features import TARGET, build_features
 from src.features.horizons import D_PLUS_1, DAY_AHEAD, HORIZONS, NOWCAST, select_features
@@ -30,6 +32,7 @@ from src.serving.forecast import (
     fill_short_gaps,
     forecast_window,
     make_day_ahead_forecast,
+    missing_weather,
     store_forecast,
     target_window,
 )
@@ -263,6 +266,118 @@ def test_ensure_weather_fetches_forecast_only_when_missing(seeded) -> None:
     # A past window already covered by the archive never triggers a fetch.
     ensure_weather(seeded, forecast_window(pd.Timestamp("2024-01-10T23:00Z")), client)
     assert len(client.calls) == 1
+
+
+class EditedWeatherClient(FakeWeatherClient):
+    """``FakeWeatherClient`` whose answer is passed through ``edit`` first."""
+
+    def __init__(self, start: pd.Timestamp, edit) -> None:
+        super().__init__(start)
+        self.edit = edit
+
+    def fetch_forecast(self, *, past_days: int = 2, forecast_days: int = 3) -> pd.DataFrame:
+        return self.edit(super().fetch_forecast(past_days=past_days, forecast_days=forecast_days))
+
+
+def test_ensure_weather_checks_city_names_not_row_counts(seeded) -> None:
+    """Two rows per target hour used to count as complete, whatever the cities were."""
+    target = forecast_window(LAST_ACTUAL)
+    wrong = _weather_rows(target, "forecast")
+    wrong["city"] = wrong["city"].replace({"B": "Elsewhere"})  # still 2 cities per hour
+    db.upsert_dataframe(seeded, db.WeatherHourly, wrong)
+    assert missing_weather(seeded, target, ["A", "B"]) == 24
+
+    client = FakeWeatherClient(start=LAST_ACTUAL)
+    ensure_weather(seeded, target, client)
+    assert len(client.calls) == 1
+    assert missing_weather(seeded, target, ["A", "B"]) == 0
+
+
+def test_ensure_weather_refetches_rows_without_usable_values(seeded) -> None:
+    target = forecast_window(LAST_ACTUAL)
+    rows = _weather_rows(target, "forecast")
+    rows.loc[rows.index[:3], "cloud_cover"] = np.nan
+    db.upsert_dataframe(seeded, db.WeatherHourly, rows)
+    assert missing_weather(seeded, target, ["A", "B"]) == 3
+
+    client = FakeWeatherClient(start=LAST_ACTUAL)
+    ensure_weather(seeded, target, client)
+    assert len(client.calls) == 1 and missing_weather(seeded, target, ["A", "B"]) == 0
+
+
+@pytest.mark.parametrize(
+    ("edit", "match"),
+    [
+        (lambda df: df[df["city"] != "B"], r"city set differs: missing \['B'\]"),
+        (lambda df: df.assign(temperature_2m=99.0), "temperature_2m values outside"),
+        (  # ends 12 h before the last target hour
+            lambda df: df[df["timestamp_utc"] <= LAST_ACTUAL + pd.Timedelta(hours=12)],
+            "stale or cut off",
+        ),
+    ],
+    ids=["missing-city", "out-of-range", "cut-off"],
+)
+def test_an_invalid_forecast_fetch_is_logged_and_writes_nothing(
+    seeded, edit, match, caplog
+) -> None:
+    target = forecast_window(LAST_ACTUAL)
+    before = db.count_rows(seeded, db.WeatherHourly)
+    with caplog.at_level(logging.WARNING, logger="src.serving.forecast"):
+        ensure_weather(seeded, target, EditedWeatherClient(LAST_ACTUAL, edit))  # no raise
+    assert db.count_rows(seeded, db.WeatherHourly) == before
+    assert "weather forecast refused, nothing written" in caplog.text
+    assert re.search(match, caplog.text)
+
+
+def failing_fetch(self, **kwargs):
+    raise FetchError("giving up on https://api.open-meteo.test after 2 attempts: timeout")
+
+
+def test_a_failed_forecast_fetch_is_logged_not_raised(seeded, caplog) -> None:
+    client = FakeWeatherClient(LAST_ACTUAL)
+    client.fetch_forecast = failing_fetch.__get__(client)
+    with caplog.at_level(logging.WARNING, logger="src.serving.forecast"):
+        ensure_weather(seeded, forecast_window(LAST_ACTUAL), client)
+    assert "weather forecast fetch failed; using stored weather" in caplog.text
+
+
+def test_a_weather_problem_never_stops_the_forecast(seeded, day_ahead_features) -> None:
+    """Invalid weather: the forecast is made with NaN weather, as before validation existed."""
+    model = fake_model(day_ahead_features)
+    cut_off = EditedWeatherClient(LAST_ACTUAL, lambda df: df[df["city"] != "B"])
+    result = make_day_ahead_forecast(seeded, model, weather_client=cut_off)
+    assert len(result.frame) == 24 and np.isfinite(result.frame["forecast_mw"]).all()
+    assert result.weather.empty  # nothing stored for the target hours, nothing read
+
+    down = FakeWeatherClient(LAST_ACTUAL)
+    down.fetch_forecast = failing_fetch.__get__(down)
+    assert len(make_day_ahead_forecast(seeded, model, weather_client=down).frame) == 24
+
+
+def test_batch_forecast_survives_a_weather_outage(seeded, day_ahead_features, monkeypatch) -> None:
+    monkeypatch.setattr(
+        batch_forecast, "load_champion", lambda engine: fake_model(day_ahead_features)
+    )
+    monkeypatch.setattr(FakeWeatherClient, "fetch_forecast", failing_fetch)
+    monkeypatch.setattr(batch_forecast, "WeatherClient", lambda: FakeWeatherClient(LAST_ACTUAL))
+    assert batch_forecast.main(["--database-url", str(seeded.url)]) == 0
+    assert db.count_rows(seeded, db.LoadForecastModel) == 24
+
+
+def test_archive_nulls_count_as_present_so_requests_do_not_refetch(seeded, caplog) -> None:
+    """A forecast upsert can never replace an archive row (archive rows win)."""
+    target = forecast_window(LAST_ACTUAL)
+    archive = _weather_rows(target, "archive")
+    archive.loc[archive.index[:2], "shortwave_radiation"] = np.nan
+    db.upsert_dataframe(seeded, db.WeatherHourly, archive)
+    with caplog.at_level(logging.WARNING, logger="src.serving.forecast"):
+        assert missing_weather(seeded, target, ["A", "B"]) == 0
+    assert "2 archive weather row(s) of the target hours have NULL values" in caplog.text
+
+    client = FakeWeatherClient(start=LAST_ACTUAL)
+    ensure_weather(seeded, target, client)
+    ensure_weather(seeded, target, client)
+    assert client.calls == []  # no fetch, however often it is asked
 
 
 def test_forecast_weather_does_not_overwrite_archive(seeded) -> None:
@@ -806,6 +921,24 @@ def test_forecast_endpoint_returns_24_hours(client) -> None:
     stamps = pd.to_datetime([p["timestamp_utc"] for p in pts], utc=True)
     assert list(stamps) == list(forecast_window(LAST_ACTUAL))
     assert all(30_000 < p["forecast_mw"] < 90_000 for p in pts)
+
+
+def test_forecast_endpoint_survives_a_weather_outage(client, monkeypatch) -> None:
+    monkeypatch.setattr(FakeWeatherClient, "fetch_forecast", failing_fetch)
+    r = client.get("/forecast")
+    assert r.status_code == 200 and len(r.json()["forecast"]) == 24
+
+
+def test_forecast_endpoint_survives_an_invalid_weather_answer(client, monkeypatch) -> None:
+    original = FakeWeatherClient.fetch_forecast
+
+    def cut_off(self, **kwargs):
+        df = original(self, **kwargs)
+        return df[df["timestamp_utc"] <= LAST_ACTUAL + pd.Timedelta(hours=6)]
+
+    monkeypatch.setattr(FakeWeatherClient, "fetch_forecast", cut_off)
+    r = client.get("/forecast")
+    assert r.status_code == 200 and len(r.json()["forecast"]) == 24
 
 
 def test_forecast_endpoint_hours_param(client) -> None:

@@ -12,14 +12,21 @@ Checks on hourly load frames (``[timestamp_utc, load_mw]``):
 
 Gaps are measured on the UTC axis, so the 23-hour / 25-hour local DST days
 are *not* gaps or duplicates - only genuinely missing hours are.
+
+Per-city weather frames (``validate_weather``) are checked for the expected city set, the
+share of missing values per variable, plausible ranges for every variable and, for
+forecast rows, whether they reach far enough ahead.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Collection
 from dataclasses import dataclass, field
 
 import pandas as pd
+
+from src.data.weather_client import GERMAN_CITIES, SOURCE_FORECAST
 
 log = logging.getLogger(__name__)
 
@@ -27,6 +34,19 @@ log = logging.getLogger(__name__)
 LOAD_MIN_MW = 20_000.0
 LOAD_MAX_MW = 90_000.0
 ONE_HOUR = pd.Timedelta(hours=1)
+
+# Plausible hourly values in Germany, inclusive; anything outside is a unit or data error.
+WEATHER_RANGES: dict[str, tuple[float, float]] = {
+    "temperature_2m": (-40.0, 50.0),  # °C; German records -37.8 / +41.2
+    "wind_speed_10m": (0.0, 200.0),  # km/h, hourly value at 10 m
+    "shortwave_radiation": (0.0, 1200.0),  # W/m²; ~1361 at the top of the atmosphere
+    "cloud_cover": (0.0, 100.0),  # %
+    "relative_humidity_2m": (0.0, 100.0),  # %
+}
+# A dropped variable is 100 % missing, a missing city 20 % (of five); a few hours where
+# one variable ends earlier than the others stay well below this.
+WEATHER_MAX_NAN_SHARE = 0.10
+CITY_NAMES: tuple[str, ...] = tuple(c.name for c in GERMAN_CITIES)
 
 
 class DataValidationError(ValueError):
@@ -176,26 +196,96 @@ def _finish(report: ValidationReport, raise_on_error: bool) -> ValidationReport:
     return report
 
 
-def validate_weather(df: pd.DataFrame, *, min_rows: int = 1, raise_on_error: bool = True) -> None:
-    """Light checks on a per-city weather frame (non-empty, UTC, unique keys, sane temps)."""
-    errors: list[str] = []
+@dataclass
+class WeatherReport:
+    rows: int = 0
+    nan_share: dict[str, float] = field(default_factory=dict)  # per variable, on the grid
+    errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not self.errors
+
+
+def validate_weather(
+    df: pd.DataFrame,
+    *,
+    expected_cities: Collection[str] | None = None,
+    forecast_until: pd.Timestamp | None = None,
+    min_rows: int = 1,
+    max_nan_share: float = WEATHER_MAX_NAN_SHARE,
+    raise_on_error: bool = True,
+) -> WeatherReport:
+    """Validate a per-city weather frame (long format, ``CITY_COLUMNS``) before it is stored.
+
+    Errors: no rows; timestamps not UTC; duplicate ``(timestamp_utc, city)``; city names
+    that are not exactly ``expected_cities`` (default: ``GERMAN_CITIES``); a variable whose
+    NaN share exceeds ``max_nan_share``; any value outside ``WEATHER_RANGES``; and, with
+    ``forecast_until``, ``source=forecast`` rows that end before that hour (a stale or cut-off
+    forecast). Any NaN at all is a warning.
+
+    The NaN share is counted on the grid of every hour from the batch's own first to last
+    hour times every expected city, a missing row counting as NaN in every variable. An
+    answer that ends earlier than requested is therefore not "missing": lateness is judged
+    by the archive's age (``src.data.ingest``), not here.
+    """
+    cities = set(expected_cities if expected_cities is not None else CITY_NAMES)
+    report = WeatherReport(rows=len(df))
     if df.empty or len(df) < min_rows:
-        errors.append(f"expected at least {min_rows} weather rows, got {len(df)}")
-    else:
-        ts = df["timestamp_utc"]
-        if getattr(ts.dt, "tz", None) is None or str(ts.dt.tz) != "UTC":
-            errors.append("weather timestamp_utc must be tz-aware UTC")
-        dups = int(df.duplicated(subset=["timestamp_utc", "city"]).sum())
-        if dups:
-            errors.append(f"{dups} duplicate (timestamp_utc, city) rows")
-        if "temperature_2m" in df:
-            temp = pd.to_numeric(df["temperature_2m"], errors="coerce")
-            bad = int(((temp < -40) | (temp > 50)).sum())
-            if bad:
-                errors.append(f"{bad} implausible temperature_2m values")
-    if errors:
-        log.error("weather validation failed: %s", "; ".join(errors))
+        report.errors.append(f"expected at least {min_rows} weather rows, got {len(df)}")
+        return _finish_weather(report, raise_on_error)
+
+    ts = df["timestamp_utc"]
+    if getattr(ts.dt, "tz", None) is None or str(ts.dt.tz) != "UTC":
+        report.errors.append("weather timestamp_utc must be tz-aware UTC")
+        return _finish_weather(report, raise_on_error)
+    dups = int(df.duplicated(subset=["timestamp_utc", "city"]).sum())
+    if dups:
+        report.errors.append(f"{dups} duplicate (timestamp_utc, city) rows")
+
+    got = set(df["city"].unique())
+    if got != cities:
+        missing, unknown = sorted(cities - got), sorted(got - cities)
+        report.errors.append(f"city set differs: missing {missing}, unknown {unknown}")
+
+    hours = pd.date_range(ts.min(), ts.max(), freq="h", name="timestamp_utc")
+    grid = pd.MultiIndex.from_product([hours, sorted(cities)], names=["timestamp_utc", "city"])
+    known = df[df["city"].isin(cities)].drop_duplicates(subset=["timestamp_utc", "city"])
+    known = known.set_index(["timestamp_utc", "city"]).reindex(grid)
+    for var, (lo, hi) in WEATHER_RANGES.items():
+        values = (
+            pd.to_numeric(known[var], errors="coerce")
+            if var in known
+            else pd.Series(float("nan"), index=grid)
+        )
+        share = float(values.isna().mean())
+        report.nan_share[var] = share
+        if share > max_nan_share:
+            report.errors.append(f"{var}: {share:.1%} missing (limit {max_nan_share:.0%})")
+        elif share > 0:
+            report.warnings.append(f"{var}: {share:.1%} missing")
+        bad = int(((values < lo) | (values > hi)).sum())
+        if bad:
+            report.errors.append(f"{bad} {var} values outside [{lo:g}, {hi:g}]")
+
+    if forecast_until is not None and "source" in df:
+        forecast_ts = ts[df["source"] == SOURCE_FORECAST]
+        last = forecast_ts.max() if not forecast_ts.empty else None
+        if last is None or last < forecast_until:
+            report.errors.append(
+                f"forecast rows end at {last}, before {forecast_until} (stale or cut off)"
+            )
+    return _finish_weather(report, raise_on_error)
+
+
+def _finish_weather(report: WeatherReport, raise_on_error: bool) -> WeatherReport:
+    for warning in report.warnings:
+        log.warning("weather validation: %s", warning)
+    if report.errors:
+        log.error("weather validation failed: %s", "; ".join(report.errors))
         if raise_on_error:
-            raise DataValidationError("; ".join(errors))
+            raise DataValidationError("; ".join(report.errors))
     else:
-        log.info("weather validation ok: %d rows", len(df))
+        log.info("weather validation ok: %d rows", report.rows)
+    return report

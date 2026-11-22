@@ -18,8 +18,9 @@ Predictions are never fed back in as lags to reach further.
 Per request / batch run: read the last ``HISTORY_HOURS`` of load, bridge gaps of at
 most ``MAX_FILLED_GAP_HOURS`` missing hours by linear interpolation (a late SMARD
 publication otherwise breaks a lag feature and stops the whole forecast), make sure
-per-city weather covers the target hours (fetching the Open-Meteo forecast if not;
-archive rows always win), append the target hours with NaN load, build the frame with
+per-city weather covers the target hours - every expected city by name, every variable
+filled - (fetching and validating the Open-Meteo forecast if not; archive rows always
+win), append the target hours with NaN load, build the frame with
 ``dropna=False``, select the day-ahead features and predict. Interpolated hours live
 only in the served frame - they are never written back to ``load_actual`` - and a
 longer gap that reaches a lag feature still raises ``NoDataError``.
@@ -41,7 +42,14 @@ from sqlalchemy.engine import Engine
 
 from src.data import db
 from src.data.db import SOURCE_SMARD
-from src.data.weather_client import WeatherClient, national_average
+from src.data.validation import DataValidationError, validate_weather
+from src.data.weather_client import (
+    GERMAN_CITIES,
+    SOURCE_ARCHIVE,
+    WEATHER_VARS,
+    WeatherClient,
+    national_average,
+)
 from src.features.build_features import LOCAL_TZ, TARGET, WEATHER_COLUMNS, build_feature_frame
 from src.features.horizons import (
     DAY_AHEAD,
@@ -164,17 +172,41 @@ def target_window(
     return target
 
 
+def missing_weather(engine: Engine, target: pd.DatetimeIndex, cities: list[str]) -> int:
+    """Target (hour, city) pairs a forecast fetch could still improve: no row for that city,
+    or a *forecast* row with any weather variable NULL. Cities are matched by name, not
+    counted. An archive row with a NULL counts as present - a forecast upsert can never
+    replace it (archive rows win, ``db.weather_update_where``), so re-fetching for it would
+    repeat on every request; it is logged instead."""
+    have = db.read_table(engine, db.WeatherHourly, start=target.min(), end=target.max())
+    grid = pd.MultiIndex.from_product([target, cities], names=["timestamp_utc", "city"])
+    if have.empty:
+        return len(grid)
+    has_null = have[list(WEATHER_VARS)].isna().any(axis=1)
+    archive_nulls = has_null & (have["source"] == SOURCE_ARCHIVE)
+    if archive_nulls.any():
+        log.warning(
+            "%d archive weather row(s) of the target hours have NULL values; kept as they are "
+            "(the model handles NaN)",
+            int(archive_nulls.sum()),
+        )
+    usable = have[~has_null | archive_nulls].set_index(["timestamp_utc", "city"]).index
+    return int((~grid.isin(usable)).sum())
+
+
 def ensure_weather(
     engine: Engine, target: pd.DatetimeIndex, weather_client: WeatherClient | None
 ) -> None:
-    """Fetch + upsert the Open-Meteo forecast if the DB lacks weather for any target hour."""
-    have = db.read_table(engine, db.WeatherHourly, start=target.min(), end=target.max())
-    expected_cities = len(weather_client.cities) if weather_client else 0
-    complete = (
-        not have.empty
-        and have.groupby("timestamp_utc").size().reindex(target).fillna(0).ge(expected_cities).all()
-    )
-    if complete:
+    """Fetch, validate and upsert the Open-Meteo forecast unless every target hour already has
+    usable weather for every expected city.
+
+    The fetch is validated like the ingest's (city set, missing values, ranges) and must
+    reach the last target hour. Weather never stops a forecast: a failed fetch or an invalid
+    answer is logged, nothing is written, and the forecast goes on with the stored weather
+    (NaN where missing; the model handles NaN) - as before validation existed.
+    """
+    cities = [c.name for c in (weather_client.cities if weather_client else GERMAN_CITIES)]
+    if not missing_weather(engine, target, cities):
         return
     if weather_client is None:
         log.warning(
@@ -186,9 +218,20 @@ def ensure_weather(
     days_ahead = (
         int(np.ceil((target.max() - pd.Timestamp.now(tz="UTC")) / pd.Timedelta(days=1))) + 1
     )
-    fresh = weather_client.fetch_forecast(past_days=2, forecast_days=max(1, min(days_ahead, 7)))
+    try:
+        fresh = weather_client.fetch_forecast(past_days=2, forecast_days=max(1, min(days_ahead, 7)))
+        validate_weather(fresh, expected_cities=cities, forecast_until=target.max())
+    except DataValidationError as err:
+        log.warning("weather forecast refused, nothing written; using stored weather: %s", err)
+        return
+    except Exception as err:  # a provider outage must not stop the forecast
+        log.warning("weather forecast fetch failed; using stored weather: %s", err)
+        return
     n = db.upsert_dataframe(engine, db.WeatherHourly, fresh, update_where=db.weather_update_where)
     log.info("weather forecast refreshed: %d rows upserted", n)
+    left = missing_weather(engine, target, cities)
+    if left:
+        log.warning("%d target (hour, city) pairs still lack usable weather; using NaN", left)
 
 
 def build_serving_features(
