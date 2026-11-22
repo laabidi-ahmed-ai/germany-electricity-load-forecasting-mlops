@@ -608,6 +608,35 @@ def _timestamp_bound(
     return None if value is None else to_utc(value)
 
 
+def covered_hours(
+    engine: Engine,
+    model: type[Base],
+    *,
+    start: pd.Timestamp | None = None,
+    end: pd.Timestamp | None = None,
+    cities: Sequence[str] | None = None,
+    **filters: Any,
+) -> pd.DatetimeIndex:
+    """The hours in ``[start, end]`` that have a row - with ``cities``, a row for every one.
+
+    One grouped query, returning only timestamps: the gap scan's view of a whole table.
+    """
+    stmt = select(model.timestamp_utc).group_by(model.timestamp_utc)
+    if start is not None:
+        stmt = stmt.where(model.timestamp_utc >= to_utc(start).to_pydatetime())
+    if end is not None:
+        stmt = stmt.where(model.timestamp_utc <= to_utc(end).to_pydatetime())
+    for col, val in filters.items():
+        stmt = stmt.where(getattr(model, col) == val)
+    if cities is not None:
+        stmt = stmt.where(model.city.in_(list(cities))).having(
+            func.count(func.distinct(model.city)) == len(set(cities))
+        )
+    with engine.connect() as conn:
+        values = list(conn.execute(stmt).scalars())
+    return pd.DatetimeIndex(pd.to_datetime(values, utc=True), name="timestamp_utc").sort_values()
+
+
 def count_rows(engine: Engine, model: type[Base], **filters: Any) -> int:
     stmt = select(func.count()).select_from(model)
     for col, val in filters.items():

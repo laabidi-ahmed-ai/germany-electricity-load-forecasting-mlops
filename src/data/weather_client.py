@@ -2,8 +2,14 @@
 
 Two endpoints feed the system:
 
-* archive (``archive-api.open-meteo.com/v1/archive``) - reanalysis history,
-  available from 1940 up to a few days ago. Used for the backfill.
+* archive (``archive-api.open-meteo.com/v1/archive``) - history from 1940. Used for the
+  backfill and, re-reading the last 7 days, by every incremental run. Measured on 21 Nov
+  2026 (and in the 17 Sep backfill): it returned values for every hour up to 23:00 UTC of
+  the current day, so its rows arrive the same day. Open-Meteo's docs
+  (https://open-meteo.com/en/docs/historical-weather-api, read 21 Nov 2026) say the
+  default Best Match "combines IFS HRES, ERA5 and ERA5-Land", list ERA5 / ERA5-Land as
+  updated "daily with 5 days delay" and ECMWF IFS "every 6 hours with no delay"; they do
+  not say recent values are later replaced - that is our reading of the table.
 * forecast (``api.open-meteo.com/v1/forecast``) - recent observations plus the
   next days' forecast (``past_days`` / ``forecast_days``). Used for incremental
   updates and for building the day-ahead feature rows. Tried twice with short timeouts
@@ -193,8 +199,14 @@ class WeatherClient:
         return items
 
     # -------------------------------------------------------------- history
-    def fetch_historical(self, start: DateLike, end: DateLike | None = None) -> pd.DataFrame:
-        """Hourly reanalysis weather for ``[start, end]`` (dates, inclusive) per city."""
+    def fetch_historical(
+        self,
+        start: DateLike,
+        end: DateLike | None = None,
+        *,
+        policy: RetryPolicy = OPEN_METEO_RETRY,
+    ) -> pd.DataFrame:
+        """Hourly archive weather for ``[start, end]`` (dates, inclusive) per city."""
         start_d = pd.Timestamp(start).date()
         end_d = pd.Timestamp(end).date() if end is not None else pd.Timestamp.now(tz="UTC").date()
         if end_d < start_d:
@@ -209,7 +221,7 @@ class WeatherClient:
             "hourly": ",".join(WEATHER_VARS),
             "timezone": "UTC",
         }
-        payloads = self._get_all_cities(self.archive_url, params)
+        payloads = self._get_all_cities(self.archive_url, params, policy=policy)
         df = _finalise(
             [
                 _hourly_payload_to_frame(payload, city, SOURCE_ARCHIVE)

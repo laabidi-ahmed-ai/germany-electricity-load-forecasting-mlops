@@ -15,6 +15,7 @@ import yaml
 import src.data.weather_client as wc
 from config.settings import PROJECT_ROOT
 from src.data import _http
+from src.data.ingest import GAP_SCAN_RETRY, gap_scan_worst_case_seconds
 from src.data.weather_client import (
     CITY_COLUMNS,
     GERMAN_CITIES,
@@ -284,6 +285,9 @@ def test_open_meteo_policy_worst_case() -> None:
     # the forecast's first host: 2 attempts x (5 s connect + 10 s read) + one 1 s wait
     assert OPEN_METEO_PRIMARY_RETRY.worst_case_seconds() == 2 * 15 + 1
     assert forecast_worst_case_seconds() == 31 + 279
+    # the gap scan: a 120 s budget, then one SMARD window (index + 2 week files) of 2 x 15 + 3 s
+    assert GAP_SCAN_RETRY.worst_case_seconds() == 2 * 15 + 3
+    assert gap_scan_worst_case_seconds() == 120 + 3 * 33
 
 
 @pytest.mark.parametrize(
@@ -298,12 +302,16 @@ def test_open_meteo_stalls_fit_well_inside_the_job_timeout(
     workflow: str, archive_calls: int, forecast_calls: int
 ) -> None:
     """Every Open-Meteo call stalling until it gives up - for the forecast, on both hosts -
-    still leaves half the job's time."""
+    plus, where the workflow runs it, the whole gap scan (its SMARD requests too) still
+    leaves half the job's time."""
     text = (PROJECT_ROOT / ".github" / "workflows" / workflow).read_text(encoding="utf-8")
     (job,) = yaml.safe_load(text)["jobs"].values()
+    scans = "--gap-scan" in text
+    assert scans == (workflow == "ingest.yml")
     worst = (
         archive_calls * OPEN_METEO_RETRY.worst_case_seconds()
         + forecast_calls * forecast_worst_case_seconds()
+        + (gap_scan_worst_case_seconds() if scans else 0)
     )
     assert worst <= job["timeout-minutes"] * 60 / 2
 
