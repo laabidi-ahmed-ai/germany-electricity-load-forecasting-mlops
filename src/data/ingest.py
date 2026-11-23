@@ -8,16 +8,20 @@ Sources: ``smard`` (actual load and the official day-ahead load forecast) and
 ``weather`` (Open-Meteo), both keyless. Each source is validated before it is written
 and runs independently, so one failing source never blocks the others. Every value the
 official forecast has had is kept (``db.store_official_forecast``). With
-``DD_API_KEY`` set, each run also reports rows per step, failed steps and the age of
-the newest actual load, weather archive hour and model forecast to Datadog
-(``src.observability``), and whether the weather forecast came from Open-Meteo's
-fallback host.
+``DD_API_KEY`` set, each run also reports rows per step, failed steps, the age of the
+newest actual load, weather archive hour and model forecast, how far ahead the stored
+weather forecast reaches, and whether the weather forecast came from Open-Meteo's fallback
+host to Datadog (``src.observability``).
 
 A failed weather-archive *fetch* (``FetchError``: an HTTP error, a timeout, a connection
 error, the retries giving up) in an incremental run is a warning, not a failure, while the
 newest stored archive hour is at most ``WEATHER_ARCHIVE_MAX_AGE`` old: the next run re-reads
 the last 7 days anyway. Anything else - a failed validation, an answer of an unexpected
-shape, a database error - stays a failure.
+shape, a database error - stays a failure. The weather-*forecast* fetch gets the same
+treatment while the stored forecast rows still reach the end of tomorrow (Berlin), the hour
+the forecast validation requires (``tolerate_forecast_failure``). So a green
+``weather_forecast`` step always means the stored forecast reaches the end of tomorrow,
+which is what the next D+1 forecast needs.
 
 ``--gap-scan daily`` (the hourly ingest workflow) runs the gap scan in the run that starts in
 the ``GAP_SCAN_HOUR_UTC`` hour; ``--gap-scan now`` runs it at once. The scan looks at the
@@ -65,7 +69,12 @@ from src.data.validation import (
     validate_load,
     validate_weather,
 )
-from src.data.weather_client import OPEN_METEO_RETRY, SOURCE_ARCHIVE, WeatherClient
+from src.data.weather_client import (
+    OPEN_METEO_RETRY,
+    SOURCE_ARCHIVE,
+    SOURCE_FORECAST,
+    WeatherClient,
+)
 from src.observability import JobMetrics, job_metrics
 
 log = logging.getLogger(__name__)
@@ -322,6 +331,57 @@ def tolerate_archive_failure(
     return result
 
 
+def forecast_cover(engine: Engine, now: pd.Timestamp) -> pd.Timedelta | None:
+    """How far the newest stored weather-forecast hour lies after ``now``, or None.
+
+    Archive rows replace forecast rows (``db.weather_update_where``), but they never go past
+    23:00 UTC of the current day, while a fetch stores forecast hours up to 23:00 UTC two
+    days ahead. So the newest ``source = forecast`` hour is the newest forecast fetched.
+    """
+    latest = db.latest_timestamp(engine, db.WeatherHourly, source=SOURCE_FORECAST)
+    return None if latest is None else latest - db.to_utc(now)
+
+
+def tolerate_forecast_failure(
+    engine: Engine, result: IngestResult, now: pd.Timestamp
+) -> IngestResult:
+    """Turn a failed forecast *fetch* into a warning while the stored forecast still reaches
+    the end of tomorrow (Berlin) - the hour the forecast validation requires.
+
+    Only ``FetchError`` counts: an HTTP error, a timeout, a connection error, the retries
+    giving up. Any error of api.open-meteo.com sends the request to the fallback host, and
+    the fallback's error is the one judged (``WeatherClient.fetch_forecast``). A failed
+    validation, an answer of an unexpected shape, a database error, and a stored forecast
+    that ends earlier (or none at all) stay failures. So a green step means the stored
+    forecast reaches the end of tomorrow, which is what the next D+1 forecast needs.
+    """
+    if not result.failed or result.error_kind != ERROR_FETCH:
+        return result
+    until = end_of_next_local_day(now)
+    cover = forecast_cover(engine, now)
+    if cover is None or db.to_utc(now) + cover < until:
+        shown = (
+            "no forecast stored"
+            if cover is None
+            else f"stored forecast ends {db.to_utc(now) + cover}"
+        )
+        log.error(
+            "weather_forecast: fetch failed and %s, before the end of tomorrow %s", shown, until
+        )
+        result.message = f"{shown}, before the end of tomorrow {until}: {result.message}"
+        return result
+    cover_h = cover / pd.Timedelta(hours=1)
+    log.warning(
+        "weather_forecast: fetch failed, but the stored forecast covers %.1f h, reaching the end "
+        "of tomorrow %s - warning only; the next run fetches it again",
+        cover_h,
+        until,
+    )
+    result.status = "warning"
+    result.message = f"fetch failed, stored forecast covers {cover_h:.1f} h: {result.message}"
+    return result
+
+
 def _resume_from(
     engine: Engine,
     model: type[db.Base],
@@ -420,9 +480,10 @@ def run_incremental(
             "weather_archive", ingest_weather_history, engine, clients.weather, start, now_ts
         )
         results.append(tolerate_archive_failure(engine, archive, now_ts))
-        results.append(
-            _guard("weather_forecast", ingest_weather_forecast, engine, clients.weather, now=now_ts)
+        forecast = _guard(
+            "weather_forecast", ingest_weather_forecast, engine, clients.weather, now=now_ts
         )
+        results.append(tolerate_forecast_failure(engine, forecast, now_ts))
 
     if scan:
         try:
@@ -703,13 +764,15 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def report_metrics(metrics: JobMetrics, engine: Engine, results: Sequence[IngestResult]) -> None:
-    """Rows per step, failed steps, each step's extra gauges (tagged with the step), and how
-    old the newest actual load, weather archive hour and forecast are.
+    """Rows per step, failed steps, each step's extra gauges (tagged with the step), how
+    old the newest actual load, weather archive hour and forecast are, and how far ahead the
+    stored weather forecast reaches.
 
     The hourly ingest doubles as a watchdog for the daily forecast: alerting on the
     forecast's age catches a forecast job that never started, which the job itself
     cannot report. The archive's age is what still shows a real archive outage now that
-    a single failed fetch is only a warning.
+    a single failed fetch is only a warning; the forecast cover does the same for the
+    weather forecast.
     """
     for r in results:
         metrics.gauge("ingest.rows", r.rows, step=r.source)
@@ -726,6 +789,9 @@ def report_metrics(metrics: JobMetrics, engine: Engine, results: Sequence[Ingest
     archive = archive_age(engine, now)
     if archive is not None:
         metrics.gauge("weather.archive_age_hours", archive / pd.Timedelta(hours=1))
+    cover = forecast_cover(engine, now)
+    if cover is not None:
+        metrics.gauge("weather.forecast_cover_hours", cover / pd.Timedelta(hours=1))
     issued = db.latest_issued_at(engine)
     if issued is not None:
         age = (now - issued) / pd.Timedelta(hours=1)

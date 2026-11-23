@@ -1,5 +1,5 @@
 """End-to-end ingestion tests (backfill + incremental) with fake clients and SQLite, plus the
-archive-failure rule and the gap scan."""
+archive- and forecast-failure rules and the gap scan."""
 
 from __future__ import annotations
 
@@ -324,6 +324,151 @@ def test_a_forecast_that_does_not_cover_tomorrow_is_refused(engine) -> None:
     assert "stale or cut off" in results["weather_forecast"].message
 
 
+# --- forecast fetch failures: a warning while tomorrow is covered (22 Nov follow-up) ---
+# After seeded_weather the stored forecast ends 2021-04-07T23:00Z. "Tomorrow" ends at
+# 04-07T21:00Z until Berlin midnight (04-06T22:00Z), then at 04-08T21:00Z.
+LAST_COVERED = pd.Timestamp("2021-04-06T21:59Z")
+FIRST_UNCOVERED = pd.Timestamp("2021-04-06T22:00Z")
+
+
+def refuse_forecast(session: FakeSession) -> None:
+    """Both Open-Meteo forecast hosts answer HTTP 404 (final, so no retry waits)."""
+    session.routes.pop(f"{FORECAST_BASE}/forecast")
+    session.routes.pop(FALLBACK, None)
+
+
+def forecast_step(engine, clients, now: pd.Timestamp) -> ingest.IngestResult:
+    results = ingest.run_incremental(engine, clients, sources=("weather",), now=now)
+    return by_source(results)["weather_forecast"]
+
+
+def test_failed_forecast_fetch_is_a_warning_while_tomorrow_is_covered(engine, caplog) -> None:
+    clients, session = seeded_weather(engine)
+    refuse_forecast(session)
+    with caplog.at_level(logging.WARNING, logger="src.data.ingest"):
+        results = by_source(ingest.run_incremental(engine, clients, sources=("weather",), now=NOW))
+
+    forecast = results["weather_forecast"]
+    assert forecast.status == "warning" and not forecast.failed
+    assert forecast.error_kind == ingest.ERROR_FETCH
+    assert forecast.message.startswith("fetch failed, stored forecast covers 71.0 h:")
+    assert "HTTP 404" in forecast.message
+    assert "warning only" in caplog.text
+    assert results["weather_archive"].status == "ok"
+    assert not any(r.failed for r in results.values())
+
+
+def test_forecast_http_429_on_both_hosts_is_a_warning(engine, monkeypatch) -> None:
+    """Ingest #1209 (22 Nov 2026): rate limited on api.open-meteo.com and on the fallback."""
+    import src.data.weather_client as weather_mod
+
+    clients, session = seeded_weather(engine)
+    original = weather_mod.get_json
+    monkeypatch.setattr(
+        weather_mod,
+        "get_json",
+        lambda s, u, p=None, **kw: original(s, u, p, sleep=lambda _: None, **kw),
+    )
+    limited = [FakeResponse({"error": True}, status_code=429)] * 10
+    session.routes[f"{FORECAST_BASE}/forecast"] = list(limited)
+    session.routes[FALLBACK] = list(limited)
+    forecast = forecast_step(engine, clients, NOW)
+    assert forecast.status == "warning" and forecast.error_kind == ingest.ERROR_FETCH
+    assert "giving up" in forecast.message
+    assert {u for u, _ in session.calls} >= {f"{FORECAST_BASE}/forecast", FALLBACK}
+
+
+def test_failed_forecast_fetch_fails_once_tomorrow_is_not_covered(engine) -> None:
+    clients, session = seeded_weather(engine)
+    refuse_forecast(session)
+    assert forecast_step(engine, clients, LAST_COVERED).status == "warning"
+
+    late = forecast_step(engine, clients, FIRST_UNCOVERED)  # Berlin midnight: a new tomorrow
+    assert late.failed and late.error_kind == ingest.ERROR_FETCH
+    assert late.message.startswith(
+        "stored forecast ends 2021-04-07 23:00:00+00:00, before the end of tomorrow "
+        "2021-04-08 21:00:00+00:00:"
+    )
+
+
+def test_a_stored_forecast_ending_exactly_at_the_end_of_tomorrow_is_enough(engine) -> None:
+    clients, session = seeded_weather(engine)
+    after = pd.date_range("2021-04-07T22:00Z", "2021-04-07T23:00Z", freq="h")
+    drop_hours(engine, db.WeatherHourly, after, source="forecast")
+    refuse_forecast(session)
+    # the newest stored hour is now 04-07T21:00Z, exactly the end of tomorrow
+    assert ingest.forecast_cover(engine, LAST_COVERED) == pd.Timedelta(minutes=23 * 60 + 1)
+    assert forecast_step(engine, clients, LAST_COVERED).status == "warning"
+
+
+def test_failed_forecast_fetch_with_no_forecast_stored_fails(engine) -> None:
+    clients, session = make_clients()
+    refuse_forecast(session)
+    forecast = forecast_step(engine, clients, NOW)
+    assert forecast.failed
+    assert forecast.message.startswith("no forecast stored, before the end of tomorrow")
+
+
+def test_an_invalid_forecast_stays_a_failure_while_tomorrow_is_covered(engine) -> None:
+    clients, session = seeded_weather(engine)
+    good = session.routes[f"{FORECAST_BASE}/forecast"]
+
+    def hot(url, params):
+        payloads = good(url, params)
+        for payload in payloads:
+            payload["hourly"]["temperature_2m"] = [99.0] * len(payload["hourly"]["time"])
+        return payloads
+
+    session.routes[f"{FORECAST_BASE}/forecast"] = hot
+    forecast = forecast_step(engine, clients, NOW)
+    assert forecast.failed and forecast.message.startswith("validation: ")
+
+
+@pytest.mark.parametrize("answer", unexpected_answers(), ids=["no-hourly", "location-id"])
+def test_an_unexpected_forecast_answer_stays_a_failure(engine, answer) -> None:
+    """Both hosts send it: the fallback's error is the one raised (``fetch_forecast``)."""
+    clients, session = seeded_weather(engine)
+    session.routes[f"{FORECAST_BASE}/forecast"] = answer
+    session.routes[FALLBACK] = answer
+    forecast = forecast_step(engine, clients, NOW)
+    assert forecast.failed and forecast.error_kind == ingest.ERROR_OTHER
+
+
+def test_a_forecast_write_error_stays_a_failure(engine, monkeypatch) -> None:
+    clients, _ = seeded_weather(engine)
+    original = ingest.db.upsert_dataframe
+
+    def failing_upsert(eng, model, df, **kwargs):
+        if model is db.WeatherHourly and (df["source"] == "forecast").all():
+            raise OperationalError("INSERT ...", {}, Exception("disk full"))
+        return original(eng, model, df, **kwargs)
+
+    monkeypatch.setattr(ingest.db, "upsert_dataframe", failing_upsert)
+    forecast = forecast_step(engine, clients, NOW)
+    assert forecast.failed and forecast.error_kind == ingest.ERROR_OTHER
+
+
+def test_cli_exits_0_when_only_a_covered_forecast_fetch_failed(tmp_path, monkeypatch) -> None:
+    """main() uses the real clock: store a forecast hour three days from now."""
+    clients, session = make_clients()
+    url = f"sqlite:///{(tmp_path / 'fc.db').as_posix()}"
+    eng = db.get_engine(url)
+    ingest.run_backfill(eng, clients, start="2021-03-21", end="2021-04-05", sources=("weather",))
+    far = pd.Timestamp.now(tz="UTC").floor("h") + pd.Timedelta(days=3)
+    rows = pd.DataFrame(
+        {
+            "timestamp_utc": [far] * len(CITIES),
+            "city": [c.name for c in CITIES],
+            "source": "forecast",
+            **{var: 10.0 for var in WEATHER_VARS},
+        }
+    )
+    db.upsert_dataframe(eng, db.WeatherHourly, rows, update_where=db.weather_update_where)
+    refuse_forecast(session)
+    monkeypatch.setattr(ingest, "Clients", lambda: clients)
+    assert ingest.main(["--sources", "weather", "--database-url", url]) == 0
+
+
 def test_end_of_next_local_day_is_dst_aware() -> None:
     summer = ingest.end_of_next_local_day(pd.Timestamp("2021-04-05T00:00Z"))
     assert summer == pd.Timestamp("2021-04-06T21:00Z")  # CEST
@@ -347,7 +492,28 @@ def test_metrics_report_archive_age_and_no_failure_for_a_warning(engine) -> None
     assert value("ingest.step_failed", "step:weather_archive") == 0
     assert value("ingest.gap_hours", "step:smard_gaps") == 3
     assert value("weather.archive_age_hours") > 24 * 365  # the 2021 archive is old by now
+    assert value("weather.forecast_cover_hours") < -24 * 365  # so is the 2021 forecast
     assert metrics.status == "ok"
+
+
+def test_metrics_report_forecast_cover_and_no_failure_for_a_forecast_warning(engine) -> None:
+    clients, session = seeded_weather(engine)
+    refuse_forecast(session)
+    results = ingest.run_incremental(engine, clients, sources=("weather",), now=NOW)
+    metrics = JobMetrics("ingest")
+    ingest.report_metrics(metrics, engine, results)
+    series = {(s["metric"], tuple(s["tags"])): s["points"][0]["value"] for s in metrics._series}
+    base = ("job:ingest", "runner:local")
+    assert ("germany_load.weather.forecast_cover_hours", base) in series
+    assert series[("germany_load.ingest.step_failed", (*base, "step:weather_forecast"))] == 0
+    assert metrics.status == "ok"
+
+
+def test_no_forecast_cover_metric_without_forecast_rows(engine) -> None:
+    metrics = JobMetrics("ingest")
+    ingest.report_metrics(metrics, engine, [])
+    names = {s["metric"] for s in metrics._series}
+    assert "germany_load.weather.forecast_cover_hours" not in names
 
 
 # --- gap scan (Step 12) ---

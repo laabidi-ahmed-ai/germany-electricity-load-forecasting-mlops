@@ -21,6 +21,7 @@ and `runner:github` (or `runner:local` from a laptop — filter on `runner:githu
 | `ingest.rows` (tag `step`) | ingest | rows written per step (`smard`, `smard_forecast`, `weather_archive`, `weather_forecast`) |
 | `ingest.step_failed` (tag `step`) | ingest | 1 if that step failed |
 | `weather.forecast_fallback` (tag `step:weather_forecast`) | ingest | 1 if the weather forecast came from the fallback host (previous-runs-api.open-meteo.com), 0 if from api.open-meteo.com; sent only when the forecast fetch succeeded (`docs/operations.md`) |
+| `weather.forecast_cover_hours` | ingest | hours from now to the newest stored weather-forecast hour; normally just over 47 to 71 (each fetch stores up to 23:00 UTC two days ahead). A failed forecast fetch is only a warning while the stored forecast reaches the end of tomorrow (Berlin), so this is what shows a forecast that keeps failing |
 | `ingest.gap_hours` (tag `step:smard_gaps|smard_forecast_gaps|weather_archive_gaps`) | ingest | missing hours older than the overlap window that the daily gap scan found, before re-fetching them; sent only by the scanning run (02:00 UTC hour). 0 is normal; the same non-zero value every day is a hole the provider cannot fill (`docs/operations.md`) |
 | `data.freshness_hours` | ingest | hours since the newest actual load hour |
 | `weather.archive_age_hours` | ingest | hours since the newest stored weather-archive hour; normally −23 to +1 (archive-api returns rows up to 23:00 UTC of the current day). A failed archive fetch is only a warning up to 24, so this is what shows a real archive outage |
@@ -84,8 +85,9 @@ so the alert e-mails you. Create them in this order.
 | 6 | Drift check unavailable | `max(last_1d):max:germany_load.drift.unavailable{runner:github} > 0.5` | above 0.5 | off |
 | 7 | Champion rolled back | `max(last_1d):max:germany_load.retrain.rolled_back{runner:github} > 0.5` | above 0.5 | off |
 | 8 | Weather archive is behind (optional) | `min(last_2h):max:germany_load.weather.archive_age_hours{runner:github} > 24` | above 24 (warning 12) | off |
+| 9 | Weather forecast running out (optional) | `max(last_2h):max:germany_load.weather.forecast_cover_hours{runner:github} < 24` | below 24 (warning 36) | off |
 
-Why these eight:
+Why these nine:
 1. **Ingest stopped** — the external scheduler or the token broke; nothing else notices.
    No metrics at all for 3 h is itself the alert (the "no data" option).
 2. **Stale data** — ingest runs but SMARD stopped publishing (or a step keeps failing).
@@ -118,6 +120,19 @@ Why these eight:
    (a 500, a 429 from the shared GitHub runner IPs) no longer turn `ingest` red. Above 24 h
    the step fails again and monitor 5 fires anyway; this monitor names the cause, and its
    warning at 12 h comes earlier. Normal values are −23 to +1 h.
+9. **Weather forecast running out** (optional) — a failed weather-forecast fetch is only a
+   warning while the stored forecast still reaches the end of tomorrow (Berlin), the hour
+   the forecast validation requires (README §16.14). So a green `weather_forecast` step
+   still means the next D+1 forecast has its weather, but a provider that keeps refusing
+   shows only as warnings until that runs out. Normal values are just over 47 to 71 h:
+   each successful fetch stores up to 23:00 UTC two days ahead. The end of tomorrow is at
+   least 24 h away except in the last hour of a Berlin day (two hours on the night of the
+   spring clock change), and at midnight it moves a day ahead. So below 24 h the step is
+   failing, or fails at the next Berlin midnight at the latest unless a fetch succeeds;
+   monitor 5 fires then too, and this monitor names the cause. The warning at 36 h means
+   at least 11 hours without a successful forecast fetch while the step may still be
+   green. `max(last_2h)` alerts only when every value of the last 2 hours was low, so one
+   successful fetch clears it.
 
 Use **Test Notifications** (bottom of the monitor page) once to check the e-mail arrives.
 
@@ -138,6 +153,7 @@ widgets (*Add widgets* → type → paste the query in the code editor):
 | Model vs official MAPE (30 d) | Timeseries | same with `window:30d` |
 | Data freshness (h) | Query Value | `max:germany_load.data.freshness_hours{runner:github}` |
 | Weather archive age (h) | Query Value | `max:germany_load.weather.archive_age_hours{runner:github}` |
+| Weather forecast cover (h) | Query Value | `min:germany_load.weather.forecast_cover_hours{runner:github}` |
 | Gap-scan missing hours | Timeseries (bars) | `max:germany_load.ingest.gap_hours{runner:github} by {step}` |
 | Forecast age (h) | Query Value | `max:germany_load.forecast.age_hours{runner:github}` |
 | Forecast deadline margin (h) | Timeseries | `min:germany_load.forecast.deadline_margin_hours{runner:github}` |
